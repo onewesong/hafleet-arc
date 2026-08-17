@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _runtime(output_dir: Path) -> Any:
+    # The submission vendors the ARC-Bench runtime. The runner normally installs
+    # it from requirements.txt; direct source-tree runs use this local fallback.
+    local_sdk_src = Path(__file__).resolve().parent / "arcbench-agent-runtime" / "src"
+    if local_sdk_src.is_dir() and str(local_sdk_src) not in sys.path:
+        sys.path.insert(0, str(local_sdk_src))
     try:
         from arcbench_agent_runtime import AgentRuntime
     except ImportError as exc:

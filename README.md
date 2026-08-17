@@ -12,6 +12,10 @@ ARC-Bench runs the submission as:
 python3 main.py /path/to/requirements --output-dir /path/to/output --type web
 ```
 
+The ARC-Bench runtime SDK is vendored under `arcbench-agent-runtime/`. Direct
+source-tree runs discover it automatically, so no external checkout or manual
+`PYTHONPATH` is needed.
+
 The runner supplies `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `MODEL`, and all
 `ARCBENCH_*` runtime paths. The requirement bundle must contain a ROOT
 `requirements.yaml`.
@@ -38,5 +42,5 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q main.py hafleet_arc tests
 ```
 
-For submission, keep `main.py`, `hafleet_arc/`, `requirements.txt`, and optional
-`skills/` at the ZIP root. ARC-Bench injects its runtime SDK through `PYTHONPATH`.
+For submission, keep `main.py`, `hafleet_arc/`, `arcbench-agent-runtime/`,
+`requirements.txt`, and optional `skills/` at the ZIP root.
