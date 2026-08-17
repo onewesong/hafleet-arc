@@ -3,10 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from hafleet_arc.checkpoint import CheckpointStore
 from hafleet_arc.models import RequirementModule
 from hafleet_arc.orchestrator import FleetOrchestrator
+from hafleet_arc.postflight import PostflightError
 
 
 class FakeDriver:
@@ -15,6 +17,10 @@ class FakeDriver:
 
     def run(self, role: str, prompt: str) -> None:
         self.calls.append((role, prompt))
+        if role == "planner" and "exactly:" in prompt:
+            plan_path = Path(prompt.rsplit("exactly:", 1)[1].strip().splitlines()[0])
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.write_text("# Plan\n", encoding="utf-8")
 
 
 class FakeEvents:
@@ -61,7 +67,8 @@ class OrchestratorTests(unittest.TestCase):
                 output_dir=root,
                 task_type="web",
             )
-            orchestrator.run([self._module(1, "REQ-1"), self._module(2, "REQ-2")])
+            with mock.patch.dict("os.environ", {"HAFLEET_POSTFLIGHT": "0"}, clear=False):
+                orchestrator.run([self._module(1, "REQ-1"), self._module(2, "REQ-2")])
 
             roles = [role for role, _ in driver.calls]
             self.assertEqual(roles, ["planner", "implementer", "reviewer", "planner", "implementer", "reviewer", "reviewer"])
@@ -82,9 +89,45 @@ class OrchestratorTests(unittest.TestCase):
                 output_dir=root,
                 task_type="web",
             )
-            orchestrator.run([self._module(1, "REQ-1"), self._module(2, "REQ-2")])
+            with mock.patch.dict("os.environ", {"HAFLEET_POSTFLIGHT": "0"}, clear=False):
+                orchestrator.run([self._module(1, "REQ-1"), self._module(2, "REQ-2")])
 
             self.assertEqual([role for role, _ in driver.calls], ["planner", "implementer", "reviewer", "reviewer"])
+
+    def test_postflight_failure_prevents_final_completion_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            runtime = FakeRuntime()
+            orchestrator = FleetOrchestrator(
+                driver=FakeDriver(),
+                runtime=runtime,
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            with (
+                mock.patch.dict(
+                    "os.environ",
+                    {
+                        "HAFLEET_FINAL_REVIEW": "0",
+                        "HAFLEET_POSTFLIGHT": "1",
+                        "HAFLEET_POSTFLIGHT_REPAIRS": "0",
+                    },
+                    clear=False,
+                ),
+                mock.patch(
+                    "hafleet_arc.orchestrator.rehearse_web_app",
+                    side_effect=PostflightError("broken build"),
+                ),
+                self.assertRaisesRegex(PostflightError, "broken build"),
+            ):
+                orchestrator.run([self._module(1, "REQ-1")])
+
+            self.assertEqual(checkpoint.read()["completed"], ["REQ-1"])
+            self.assertFalse(checkpoint.read()["final_review_completed"])
+            self.assertNotIn("ROOT: final HAFleet integration review", runtime.git.messages)
 
 
 if __name__ == "__main__":

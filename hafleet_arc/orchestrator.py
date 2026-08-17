@@ -9,10 +9,11 @@ from typing import Protocol
 
 from .checkpoint import CheckpointStore
 from .models import RequirementModule
+from .postflight import PostflightError, rehearse_web_app
 
 
 class FleetDriver(Protocol):
-    def run(self, role: str, prompt: str) -> None: ...
+    def run(self, role: str, prompt: str) -> object: ...
 
 
 class RuntimeEvents(Protocol):
@@ -65,6 +66,7 @@ class FleetOrchestrator:
         requirements_dir: Path,
         output_dir: Path,
         task_type: str,
+        smoke_port: int = 3100,
     ) -> None:
         self.driver = driver
         self.runtime = runtime
@@ -72,6 +74,7 @@ class FleetOrchestrator:
         self.requirements_dir = requirements_dir
         self.output_dir = output_dir
         self.task_type = task_type
+        self.smoke_port = smoke_port
         self.plan_dir = output_dir / ".arc" / "hafleet" / "plans"
         configured_pause = os.environ.get("ARCBENCH_PAUSE_REQUEST_PATH", "").strip()
         self.pause_request_path = Path(configured_pause) if configured_pause else output_dir / ".arc" / "pause-request"
@@ -120,6 +123,18 @@ class FleetOrchestrator:
                     "planner",
                     base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
                 )
+                if not plan_path.is_file() or not plan_path.read_text(
+                    encoding="utf-8", errors="ignore"
+                ).strip():
+                    self.driver.run(
+                        "planner",
+                        base_prompt
+                        + f"\n\nThe required plan file was not created. Write a concrete plan now to exactly: {plan_path}",
+                    )
+                if not plan_path.is_file() or not plan_path.read_text(
+                    encoding="utf-8", errors="ignore"
+                ).strip():
+                    raise RuntimeError(f"planner did not create required plan: {plan_path}")
             except Exception:
                 self.runtime.events.mark_design_failed(module.node_id, "HAFleet planner failed")
                 raise
@@ -157,19 +172,67 @@ class FleetOrchestrator:
             "false",
             "no",
         }
-        if modules and final_review_enabled and not bool(self.checkpoint.read().get("final_review_completed")):
+        if modules and not bool(self.checkpoint.read().get("final_review_completed")):
             self._check_pause(None, "final-review")
             module_ids = ", ".join(item.node_id for item in modules)
-            self.driver.run(
-                "reviewer",
-                textwrap.dedent(
-                    f"""
-                    Perform the final integration review for ARC-Bench task type {self.task_type}.
-                    Completed ROOT modules: {module_ids}.
-                    Inspect the whole project, run the build and practical tests, fix regressions and
-                    integration gaps, and leave the application runnable. Do not start a long-running server.
-                    """
-                ).strip(),
-            )
+            if final_review_enabled:
+                self.driver.run(
+                    "reviewer",
+                    textwrap.dedent(
+                        f"""
+                        Perform the final integration review for ARC-Bench task type {self.task_type}.
+                        Completed ROOT modules: {module_ids}.
+                        Inspect the whole project, run the build and practical tests, fix regressions and
+                        integration gaps, and leave the application runnable. For web smoke tests use only
+                        port {self.smoke_port}, stop every server afterward, and never bind the grading port.
+                        """
+                    ).strip(),
+                )
+            self._run_postflight(module_ids)
             self.runtime.git.commit("ROOT: final HAFleet integration review")
             self.checkpoint.mark_final_review_completed()
+
+    def _run_postflight(self, module_ids: str) -> None:
+        enabled = os.environ.get("HAFLEET_POSTFLIGHT", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        if not enabled or self.task_type != "web":
+            return
+        try:
+            repair_attempts = max(int(os.environ.get("HAFLEET_POSTFLIGHT_REPAIRS", "2")), 0)
+        except ValueError:
+            repair_attempts = 2
+
+        for attempt in range(repair_attempts + 1):
+            self._check_pause(None, "postflight")
+            try:
+                rehearse_web_app(self.output_dir, self.smoke_port)
+                print(
+                    f"[hafleet] Web postflight passed on smoke port {self.smoke_port}",
+                    flush=True,
+                )
+                return
+            except PostflightError as exc:
+                if attempt >= repair_attempts:
+                    raise
+                print(
+                    f"[hafleet] Web postflight failed; repair {attempt + 1}/{repair_attempts}: {exc}",
+                    flush=True,
+                )
+                self.driver.run(
+                    "reviewer",
+                    textwrap.dedent(
+                        f"""
+                        The ARC-Bench web delivery postflight failed after modules {module_ids}.
+                        Repair the project now, then verify it on smoke port {self.smoke_port}.
+                        The grader requires frontend/package.json with `npm run build` and
+                        backend/package.json with `npm run start`; the backend must read PORT and
+                        serve the built frontend. Do not bind the grading port. Stop all servers.
+
+                        Exact postflight error:
+                        {exc}
+                        """
+                    ).strip(),
+                )

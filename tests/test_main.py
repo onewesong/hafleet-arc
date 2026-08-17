@@ -63,8 +63,12 @@ class FakeFleet:
     def __exit__(self, *_args) -> None:
         pass
 
-    def run(self, role: str, _prompt: str) -> None:
+    def run(self, role: str, prompt: str) -> None:
         self.calls.append(role)
+        if role == "planner" and "exactly:" in prompt:
+            plan_path = Path(prompt.rsplit("exactly:", 1)[1].strip().splitlines()[0])
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.write_text("# Plan\n", encoding="utf-8")
 
 
 class EntrypointSmokeTests(unittest.TestCase):
@@ -82,7 +86,11 @@ class EntrypointSmokeTests(unittest.TestCase):
             with (
                 mock.patch.object(entrypoint, "_runtime", return_value=runtime),
                 mock.patch.object(entrypoint, "CodexFleet", FakeFleet),
-                mock.patch.dict("os.environ", {"HAFLEET_FINAL_REVIEW": "0"}, clear=False),
+                mock.patch.dict(
+                    "os.environ",
+                    {"HAFLEET_FINAL_REVIEW": "0", "HAFLEET_POSTFLIGHT": "0"},
+                    clear=False,
+                ),
             ):
                 result = entrypoint.main(
                     [str(requirements), "--output-dir", str(output), "--type", "web"]
@@ -93,6 +101,8 @@ class EntrypointSmokeTests(unittest.TestCase):
             self.assertEqual(runtime.traceability.tree["id"], "ROOT")
             self.assertIn("mark_run_completed", runtime.events.states)
             self.assertTrue((output / ".arc" / "checkpoint.json").is_file())
+            self.assertTrue((output / "frontend" / "package.json").is_file())
+            self.assertTrue((output / "backend" / "package.json").is_file())
 
 
 if __name__ == "__main__":

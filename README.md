@@ -9,7 +9,7 @@ does not start the HAFleet backend, tmux, Matrix, or dashboard services.
 ARC-Bench runs the submission as:
 
 ```bash
-python3 main.py /path/to/requirements --output-dir /path/to/output --type web
+python3 main.py /path/to/requirements --output-dir /path/to/output --type web --web-port 3000
 ```
 
 The ARC-Bench runtime SDK is vendored under `arcbench-agent-runtime/`. Direct
@@ -45,8 +45,12 @@ flowchart TD
     E --> L
     L -- "Yes" --> D
     L -- "No" --> M["Run final integration review"]
-    M --> N["Create final git checkpoint"]
-    N --> O["Mark run completed"]
+    M --> N["Build and start rehearsal on smoke port"]
+    N --> O{"Postflight passed?"}
+    O -- "No" --> P["Reviewer repairs exact failure"]
+    P --> N
+    O -- "Yes" --> Q["Create final git checkpoint"]
+    Q --> R["Mark run completed and exit"]
 ```
 
 ### 1. Initialize the workspace
@@ -55,8 +59,8 @@ The entrypoint validates that the requirement bundle contains a
 `requirements.yaml` whose root node has `id: ROOT` and at least one child. It
 then:
 
-- copies optional starter files from `template/` without overwriting resumed
-  work;
+- copies the task-specific starter from `template/<type>/` without overwriting
+  resumed work;
 - initializes the ARC-Bench traceability store and records the requirement
   tree;
 - ensures that the output directory is a git repository;
@@ -129,6 +133,47 @@ ROOT: final HAFleet integration review
 
 Set `HAFLEET_FINAL_REVIEW=0` to disable this pass for cheaper local experiments.
 
+### 8. Validate the delivery and exit
+
+For web tasks, HAFleet ARC does not report completion immediately after the
+final review. It first verifies the required `frontend/` and `backend/`
+structure, runs the same npm install and frontend build sequence as the grader,
+then starts the backend on the isolated smoke port and waits for an HTTP
+response. A failed postflight is sent back to the reviewer with the exact error
+for up to two repair passes.
+
+Only a successful postflight creates the final git checkpoint, marks the
+checkpoint complete, emits the run-completed event, and exits with status `0`.
+All rehearsal processes are stopped before exit.
+
+## Reliability controls
+
+Each Codex turn has a finite timeout. Transient overload, authentication,
+connection, streaming, and timeout failures are retried with a fresh role
+thread. A successful turn with neither a response nor project file changes is
+treated as an empty turn and retried as well.
+
+During web generation, commands launched by Codex inherit the smoke port
+(default `3100`). A workspace-scoped guard stops only this submission's
+processes if they bind the grading port (default `3000`); it never kills a
+foreign listener on a shared runner.
+
+| Environment variable | Default | Purpose |
+| --- | ---: | --- |
+| `HAFLEET_MAX_ATTEMPTS` | `3` | Maximum attempts for one Codex role turn |
+| `HAFLEET_RETRY_DELAYS` | `30,60` | Comma-separated retry delays in seconds |
+| `HAFLEET_TURN_TIMEOUT` | `1200` | Maximum seconds for one Codex turn |
+| `HAFLEET_SMOKE_PORT` | `3100` | Safe generation-time application port |
+| `HAFLEET_POSTFLIGHT_REPAIRS` | `2` | Reviewer repair attempts after failed rehearsal |
+| `HAFLEET_NPM_TIMEOUT` | `600` | Timeout for each postflight npm command |
+| `HAFLEET_READY_TIMEOUT` | `45` | Backend readiness timeout during rehearsal |
+| `HAFLEET_FINAL_REVIEW` | `1` | Enable the whole-project reviewer pass |
+| `HAFLEET_POSTFLIGHT` | `1` | Enable the mandatory delivery rehearsal |
+
+`HAFLEET_FINAL_REVIEW=0` skips the optional model review but still runs the
+deterministic postflight. `HAFLEET_POSTFLIGHT=0` is intended only for cheap
+local harness tests; disabling it removes the runnable-delivery guarantee.
+
 ## Local checks
 
 ```bash
@@ -137,4 +182,4 @@ python3 -m compileall -q main.py hafleet_arc tests
 ```
 
 For submission, keep `main.py`, `hafleet_arc/`, `arcbench-agent-runtime/`,
-`requirements.txt`, and optional `skills/` at the ZIP root.
+`template/`, `requirements.txt`, and optional `skills/` at the ZIP root.
