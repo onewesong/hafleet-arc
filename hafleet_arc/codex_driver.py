@@ -9,6 +9,8 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
+from .log import log
+
 ROLE_INSTRUCTIONS = {
     "planner": """
 You are the planning agent in a finite HAFleet run. Analyze the supplied requirement
@@ -213,7 +215,7 @@ ARC-Bench web delivery contract:
                 try:
                     handle.interrupt()
                 except Exception as interrupt_error:  # noqa: BLE001 - best-effort SDK interrupt
-                    print(
+                    log(
                         f"[hafleet] Failed to interrupt timed-out {role} turn: {interrupt_error}",
                         flush=True,
                     )
@@ -246,6 +248,10 @@ ARC-Bench web delivery contract:
         delays = self._retry_delays()
         for attempt in range(1, attempts + 1):
             before = _workspace_fingerprint(self.output_dir)
+            log(
+                f"[hafleet] {role} turn started (attempt {attempt}/{attempts}, timeout={timeout_s}s)",
+                flush=True,
+            )
             try:
                 result = self._run_once(role, prompt, timeout_s)
                 error = getattr(result, "error", None)
@@ -256,13 +262,16 @@ ARC-Bench web delivery contract:
                     self.output_dir
                 ):
                     raise RuntimeError(f"{role} empty turn: no response and no project file changes")
+                changed = len(_workspace_fingerprint(self.output_dir)) - len(before)
+                log(f"[hafleet] {role} turn finished; file-count delta={changed:+d}", flush=True)
                 return result
             except Exception as exc:
+                log(f"[hafleet] {role} turn failed: {exc}", flush=True)
                 if attempt >= attempts or not self._transient(exc):
                     raise
                 self._threads.pop(role, None)
                 delay = delays[min(attempt - 1, len(delays) - 1)]
-                print(
+                log(
                     f"[hafleet] Transient {role} failure; retrying "
                     f"{attempt + 1}/{attempts} after {delay:g}s: {exc}",
                     flush=True,

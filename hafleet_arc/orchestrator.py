@@ -4,12 +4,14 @@ import json
 import os
 import shutil
 import textwrap
+import time
 from pathlib import Path
 from typing import Protocol
 
 from .checkpoint import CheckpointStore
 from .models import RequirementModule
 from .postflight import PostflightError, rehearse_web_app
+from .log import log
 
 
 class FleetDriver(Protocol):
@@ -103,21 +105,34 @@ class FleetOrchestrator:
         ).strip()
 
     def run(self, modules: list[RequirementModule]) -> None:
+        run_started = time.monotonic()
         state = self.checkpoint.read()
         completed_ids = list(state["completed"])
         completed_set = set(completed_ids)
         self.plan_dir.mkdir(parents=True, exist_ok=True)
+        log(
+            f"[hafleet] orchestrator ready: {len(modules)} module(s), "
+            f"already completed={len(completed_ids)}",
+            flush=True,
+        )
 
         for module in modules:
             if module.node_id in completed_set:
-                print(f"[hafleet] Skipping completed module {module.node_id}", flush=True)
+                log(f"[hafleet] Skipping completed module {module.node_id}", flush=True)
                 continue
+            module_started = time.monotonic()
+            log(
+                f"[hafleet] Module {module.index}/{module.total} started: "
+                f"{module.node_id} - {module.name}",
+                flush=True,
+            )
             plan_path = self.plan_dir / f"{module.node_id}.md"
             base_prompt = self._base_prompt(module, completed_ids, plan_path)
 
             self._check_pause(module, "design")
             self.checkpoint.mark_module_started(module.node_id, "design")
             self.runtime.events.mark_design_started(module.node_id, "HAFleet planner started")
+            log(f"[hafleet]   planner started -> {plan_path}", flush=True)
             try:
                 self.driver.run(
                     "planner",
@@ -139,10 +154,12 @@ class FleetOrchestrator:
                 self.runtime.events.mark_design_failed(module.node_id, "HAFleet planner failed")
                 raise
             self.runtime.events.mark_design_done(module.node_id, "HAFleet plan completed")
+            log(f"[hafleet]   planner finished ({plan_path.stat().st_size} bytes)", flush=True)
 
             self._check_pause(module, "implement")
             self.checkpoint.mark_module_started(module.node_id, "implement")
             self.runtime.events.mark_implementation_started(module.node_id, "HAFleet implementer started")
+            log(f"[hafleet]   implementer started: {module.node_id}", flush=True)
             try:
                 self.driver.run(
                     "implementer",
@@ -150,6 +167,7 @@ class FleetOrchestrator:
                 )
                 self._check_pause(module, "review")
                 self.checkpoint.mark_module_started(module.node_id, "review")
+                log(f"[hafleet]   reviewer started: {module.node_id}", flush=True)
                 self.driver.run(
                     "reviewer",
                     base_prompt + "\n\nReview the current implementation, run checks, and directly repair every issue found.",
@@ -161,11 +179,20 @@ class FleetOrchestrator:
                 raise
 
             self.runtime.events.mark_implementation_done(module.node_id, "Implementation reviewed and repaired")
-            self.runtime.git.commit(f"{module.node_id}: implement and review {module.name}")
+            checkpoint_message = f"{module.node_id}: implement and review {module.name}"
+            committed = self.runtime.git.commit(checkpoint_message)
+            log(
+                f"[hafleet]   checkpoint {'created' if committed else 'skipped'}: {checkpoint_message}",
+                flush=True,
+            )
             self.checkpoint.mark_module_completed(module.node_id, module.index)
             completed_ids.append(module.node_id)
             completed_set.add(module.node_id)
-            print(f"[hafleet] Completed {module.index}/{module.total}: {module.node_id}", flush=True)
+            log(
+                f"[hafleet] Completed {module.index}/{module.total}: {module.node_id} "
+                f"({time.monotonic() - module_started:.1f}s)",
+                flush=True,
+            )
 
         final_review_enabled = os.environ.get("HAFLEET_FINAL_REVIEW", "1").strip().lower() not in {
             "0",
@@ -176,6 +203,7 @@ class FleetOrchestrator:
             self._check_pause(None, "final-review")
             module_ids = ", ".join(item.node_id for item in modules)
             if final_review_enabled:
+                log("[hafleet] Final integration review started", flush=True)
                 self.driver.run(
                     "reviewer",
                     textwrap.dedent(
@@ -188,9 +216,23 @@ class FleetOrchestrator:
                         """
                     ).strip(),
                 )
+            log(
+                f"[hafleet] Final review {'enabled' if final_review_enabled else 'disabled'}; "
+                "running delivery postflight",
+                flush=True,
+            )
             self._run_postflight(module_ids)
-            self.runtime.git.commit("ROOT: final HAFleet integration review")
+            final_checkpoint = "ROOT: final HAFleet integration review"
+            committed = self.runtime.git.commit(final_checkpoint)
+            log(
+                f"[hafleet] Final checkpoint {'created' if committed else 'skipped'}: {final_checkpoint}",
+                flush=True,
+            )
             self.checkpoint.mark_final_review_completed()
+            log(
+                f"[hafleet] Final integration completed ({time.monotonic() - run_started:.1f}s)",
+                flush=True,
+            )
 
     def _run_postflight(self, module_ids: str) -> None:
         enabled = os.environ.get("HAFLEET_POSTFLIGHT", "1").strip().lower() not in {
@@ -199,6 +241,8 @@ class FleetOrchestrator:
             "no",
         }
         if not enabled or self.task_type != "web":
+            reason = "disabled by HAFLEET_POSTFLIGHT" if not enabled else f"task type is {self.task_type}"
+            log(f"[hafleet] Web postflight skipped ({reason})", flush=True)
             return
         try:
             repair_attempts = max(int(os.environ.get("HAFLEET_POSTFLIGHT_REPAIRS", "2")), 0)
@@ -207,9 +251,14 @@ class FleetOrchestrator:
 
         for attempt in range(repair_attempts + 1):
             self._check_pause(None, "postflight")
+            log(
+                f"[hafleet] Web postflight attempt {attempt + 1}/{repair_attempts + 1} "
+                f"on smoke port {self.smoke_port}",
+                flush=True,
+            )
             try:
                 rehearse_web_app(self.output_dir, self.smoke_port)
-                print(
+                log(
                     f"[hafleet] Web postflight passed on smoke port {self.smoke_port}",
                     flush=True,
                 )
@@ -217,7 +266,7 @@ class FleetOrchestrator:
             except PostflightError as exc:
                 if attempt >= repair_attempts:
                     raise
-                print(
+                log(
                     f"[hafleet] Web postflight failed; repair {attempt + 1}/{repair_attempts}: {exc}",
                     flush=True,
                 )

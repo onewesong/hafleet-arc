@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,13 @@ from hafleet_arc.checkpoint import CheckpointStore
 from hafleet_arc.codex_driver import CodexFleet
 from hafleet_arc.orchestrator import copy_template_contents
 from hafleet_arc.postflight import WorkspacePortGuard
+from hafleet_arc.log import log
+
+
+def _console(message: str) -> None:
+    """Print a flushed, human-readable lifecycle message for local runs."""
+
+    log(f"[hafleet-arc] {message}")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -71,6 +79,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     requirements_dir = Path(args.requirement_path).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
+    started_at = time.monotonic()
+    _console(
+        f"starting: requirements={requirements_dir} output={output_dir} "
+        f"type={args.task_type} grading_port={args.web_port} smoke_port={args.smoke_port}"
+    )
     if not requirements_dir.is_dir():
         raise FileNotFoundError(f"Requirement directory not found: {requirements_dir}")
     if args.web_port <= 0 or args.smoke_port <= 0:
@@ -81,13 +94,17 @@ def main(argv: list[str] | None = None) -> int:
     agent_root = Path(__file__).resolve().parent
     output_dir.mkdir(parents=True, exist_ok=True)
     copy_template_contents(agent_root / "template" / args.task_type, output_dir)
+    _console("template copied (existing files preserved)")
     requirement_tree = load_requirement_tree(requirements_dir)
     modules = plan_modules(requirement_tree)
+    _console(f"loaded requirement tree ROOT with {len(modules)} top-level module(s)")
+    _console("module order: " + ", ".join(f"{item.node_id} ({item.name})" for item in modules))
     runtime = _runtime(output_dir)
     runtime.traceability.init_store()
     runtime.traceability.store_requirement_tree(requirement_tree)
     runtime.git.ensure_repo()
     runtime.events.mark_run_started(f"HAFleet ARC started with {len(modules)} modules")
+    _console("runtime initialized; entering planner/implementer/reviewer pipeline")
 
     skills_dir = agent_root / "skills"
     try:
@@ -114,12 +131,15 @@ def main(argv: list[str] | None = None) -> int:
             ).run(modules)
     except PauseRequested as exc:
         runtime.events.mark_run_paused(str(exc))
+        _console(f"paused: {exc}")
         return 130
     except Exception as exc:
         runtime.events.mark_run_failed(str(exc))
+        _console(f"FAILED after {time.monotonic() - started_at:.1f}s: {exc}")
         raise
 
     runtime.events.mark_run_completed("HAFleet ARC completed")
+    _console(f"completed successfully in {time.monotonic() - started_at:.1f}s")
     return 0
 
 

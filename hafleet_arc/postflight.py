@@ -12,6 +12,8 @@ from typing import Self
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
+from .log import log
+
 
 class PostflightError(RuntimeError):
     """The generated project does not satisfy the ARC-Bench delivery contract."""
@@ -164,7 +166,7 @@ class WorkspacePortGuard:
             while not self._stop.wait(5):
                 killed = cleanup_workspace_port(self.grading_port, self.output_dir)
                 if killed:
-                    print(
+                    log(
                         f"[hafleet] Stopped workspace listener(s) on grading port "
                         f"{self.grading_port}: {killed}",
                         flush=True,
