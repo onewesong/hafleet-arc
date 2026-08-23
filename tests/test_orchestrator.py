@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -15,7 +16,7 @@ class FakeDriver:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
 
-    def run(self, role: str, prompt: str) -> None:
+    def run(self, role: str, prompt: str, workspace_dir: Path | None = None) -> None:
         self.calls.append((role, prompt))
         if role == "architect":
             marker = "Architecture document path: "
@@ -43,6 +44,11 @@ class FakeDriver:
             plan_path = Path(prompt.rsplit("exactly:", 1)[1].strip().splitlines()[0])
             plan_path.parent.mkdir(parents=True, exist_ok=True)
             plan_path.write_text("# Plan\n", encoding="utf-8")
+        if workspace_dir is not None and role in {"implementer", "reviewer"}:
+            module_id = Path(
+                prompt.split("Coordinator plan path:", 1)[1].splitlines()[0].strip()
+            ).stem
+            (workspace_dir / f"{module_id}.txt").write_text("implemented\n", encoding="utf-8")
 
 
 class FakeEvents:
@@ -236,6 +242,40 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(checkpoint.read()["completed"], ["REQ-1"])
             self.assertFalse(checkpoint.read()["final_review_completed"])
             self.assertNotIn("ROOT: final HAFleet integration review", runtime.git.messages)
+
+    def test_parallel_modules_use_worktrees_and_merge_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            (root / ".gitignore").write_text(".arc/\n", encoding="utf-8")
+            (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root, check=True)
+
+            driver = FakeDriver()
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+                parallel=True,
+                max_workers=2,
+            )
+            with mock.patch.dict("os.environ", {"HAFLEET_POSTFLIGHT": "0"}, clear=False):
+                orchestrator.run([self._module(1, "REQ-1"), self._module(2, "REQ-2")])
+
+            self.assertTrue((root / "REQ-1.txt").is_file())
+            self.assertTrue((root / "REQ-2.txt").is_file())
+            self.assertTrue((root / ".arc" / "hafleet" / "plans" / "REQ-1.md").is_file())
+            self.assertTrue((root / ".arc" / "hafleet" / "plans" / "REQ-2.md").is_file())
+            self.assertFalse((root / ".arc" / "hafleet" / "worktrees" / "REQ-1").exists())
+            self.assertTrue(checkpoint.read()["parallel_mode"])
+            self.assertEqual(checkpoint.read()["completed"], ["REQ-1", "REQ-2"])
 
 
 if __name__ == "__main__":

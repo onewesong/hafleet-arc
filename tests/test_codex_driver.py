@@ -30,6 +30,25 @@ class FakeCodex:
 
 
 class CodexFleetRetryTests(unittest.TestCase):
+    def test_workspace_dir_uses_distinct_codex_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "one"
+            second = root / "two"
+            first.mkdir()
+            second.mkdir()
+            fleet = CodexFleet(root)
+            codex = FakeCodex(
+                [
+                    SimpleNamespace(error=None, final_response="one"),
+                    SimpleNamespace(error=None, final_response="two"),
+                ]
+            )
+            fleet._codex = codex
+            fleet.run("implementer", "implement", workspace_dir=first)
+            fleet.run("implementer", "implement", workspace_dir=second)
+            self.assertEqual(codex.starts, 2)
+
     def test_retries_transient_failure_with_fresh_role_thread(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fleet = CodexFleet(Path(temporary))

@@ -76,6 +76,21 @@ ROOT requirement tree, writes `.arc/hafleet/architecture.md`, and creates or ref
 a modular project scaffold. Its checkpoint is `ROOT: architecture scaffold`, and the
 `architecture_completed` flag makes the phase resumable without repeating it.
 
+架构完成后也可以开启并行 worktree 模式，为相互独立的 ROOT 模块分别派发 agent：
+
+```bash
+python3 main.py /path/to/requirements \
+  --output-dir /path/to/output \
+  --type web \
+  --parallel \
+  --max-workers 2
+```
+
+并行模式默认关闭，也可以通过 `HAFLEET_PARALLEL=1` 和
+`HAFLEET_MAX_WORKERS=2` 开启。每个模块在独立 worktree 中完成 planner、
+implementer、reviewer 后，主工作区按依赖顺序 cherry-pick；成功 worktree 会清理，
+失败或冲突 worktree 会保留在 `.arc/hafleet/worktrees/`。
+
 ### 3. Build the module execution plan
 
 Each direct child of `ROOT` becomes one module. Modules are processed in stable,
@@ -177,6 +192,8 @@ foreign listener on a shared runner.
 | `HAFLEET_READY_TIMEOUT` | `45` | Backend readiness timeout during rehearsal |
 | `HAFLEET_FINAL_REVIEW` | `1` | Enable the whole-project reviewer pass |
 | `HAFLEET_POSTFLIGHT` | `1` | Enable the mandatory delivery rehearsal |
+| `HAFLEET_PARALLEL` | `0` | Enable independent ROOT module worktrees |
+| `HAFLEET_MAX_WORKERS` | `2` | Maximum concurrent parallel module worktrees |
 
 `HAFLEET_FINAL_REVIEW=0` skips the optional model review but still runs the
 deterministic postflight. `HAFLEET_POSTFLIGHT=0` is intended only for cheap

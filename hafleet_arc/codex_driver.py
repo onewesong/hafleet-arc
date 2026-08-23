@@ -130,7 +130,8 @@ class CodexFleet:
         self.grading_port = grading_port
         self.smoke_port = smoke_port
         self._codex: Any = None
-        self._threads: dict[str, Any] = {}
+        self._threads: dict[tuple[str, str], Any] = {}
+        self._thread_lock = threading.Lock()
 
     def __enter__(self) -> Self:
         try:
@@ -171,9 +172,11 @@ class CodexFleet:
         if self._codex is not None:
             self._codex.__exit__(exc_type, exc, traceback)
 
-    def _thread(self, role: str) -> Any:
-        if role in self._threads:
-            return self._threads[role]
+    def _thread(self, role: str, workspace_dir: Path | None = None) -> Any:
+        cwd = (workspace_dir or self.output_dir).resolve()
+        key = (role, str(cwd))
+        if key in self._threads:
+            return self._threads[key]
         if role not in ROLE_INSTRUCTIONS:
             raise ValueError(f"unknown fleet role: {role}")
         from openai_codex import ApprovalMode, Sandbox
@@ -199,22 +202,29 @@ ARC-Bench web delivery contract:
   validation messages, and avoid rendering the same test-targeted value more than once.
 """
         thread = self._codex.thread_start(
-            cwd=str(self.output_dir),
+            cwd=str(cwd),
             sandbox=Sandbox.full_access,
             approval_mode=ApprovalMode.deny_all,
             model=model,
             developer_instructions=ROLE_INSTRUCTIONS[role].strip() + delivery_note + skill_note,
         )
-        self._threads[role] = thread
+        self._threads[key] = thread
         return thread
 
-    def _run_once(self, role: str, prompt: str, timeout_s: int) -> Any:
+    def _run_once(
+        self,
+        role: str,
+        prompt: str,
+        timeout_s: int,
+        workspace_dir: Path | None = None,
+    ) -> Any:
         results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
         active: dict[str, Any] = {}
 
         def target() -> None:
             try:
-                thread = self._thread(role)
+                with self._thread_lock:
+                    thread = self._thread(role, workspace_dir)
                 if hasattr(thread, "turn"):
                     handle = thread.turn(prompt)
                     active["handle"] = handle
@@ -262,34 +272,34 @@ ARC-Bench web delivery contract:
                 continue
         return delays or [30.0, 60.0]
 
-    def run(self, role: str, prompt: str) -> Any:
+    def run(self, role: str, prompt: str, workspace_dir: Path | None = None) -> Any:
         attempts = _positive_int_env("HAFLEET_MAX_ATTEMPTS", 3)
         timeout_s = _positive_int_env("HAFLEET_TURN_TIMEOUT", 1200)
         delays = self._retry_delays()
+        workspace = (workspace_dir or self.output_dir).resolve()
         for attempt in range(1, attempts + 1):
-            before = _workspace_fingerprint(self.output_dir)
+            before = _workspace_fingerprint(workspace)
             log(
-                f"[hafleet] {role} turn started (attempt {attempt}/{attempts}, timeout={timeout_s}s)",
+                f"[hafleet] {role} turn started in {workspace} "
+                f"(attempt {attempt}/{attempts}, timeout={timeout_s}s)",
                 flush=True,
             )
             try:
-                result = self._run_once(role, prompt, timeout_s)
+                result = self._run_once(role, prompt, timeout_s, workspace)
                 error = getattr(result, "error", None)
                 if error is not None:
                     raise RuntimeError(f"{role} agent failed: {error}")
                 final_response = getattr(result, "final_response", None)
-                if not str(final_response or "").strip() and before == _workspace_fingerprint(
-                    self.output_dir
-                ):
+                if not str(final_response or "").strip() and before == _workspace_fingerprint(workspace):
                     raise RuntimeError(f"{role} empty turn: no response and no project file changes")
-                changed = len(_workspace_fingerprint(self.output_dir)) - len(before)
+                changed = len(_workspace_fingerprint(workspace)) - len(before)
                 log(f"[hafleet] {role} turn finished; file-count delta={changed:+d}", flush=True)
                 return result
             except Exception as exc:
                 log(f"[hafleet] {role} turn failed: {exc}", flush=True)
                 if attempt >= attempts or not self._transient(exc):
                     raise
-                self._threads.pop(role, None)
+                self._threads.pop((role, str(workspace)), None)
                 delay = delays[min(attempt - 1, len(delays) - 1)]
                 log(
                     f"[hafleet] Transient {role} failure; retrying "

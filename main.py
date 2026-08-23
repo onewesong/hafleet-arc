@@ -59,6 +59,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=int(os.environ.get("HAFLEET_SMOKE_PORT", "3100")),
         help="Safe port used for generation-time startup checks.",
     )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        default=os.environ.get("HAFLEET_PARALLEL", "0").strip().lower() in {"1", "true", "yes"},
+        help="Run independent ROOT modules in separate git worktrees.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=int(os.environ.get("HAFLEET_MAX_WORKERS", "2")),
+        help="Maximum concurrent module worktrees in parallel mode.",
+    )
     return parser.parse_args(argv)
 
 
@@ -88,6 +100,8 @@ def main(argv: list[str] | None = None) -> int:
         raise FileNotFoundError(f"Requirement directory not found: {requirements_dir}")
     if args.web_port <= 0 or args.smoke_port <= 0:
         raise ValueError("web and smoke ports must be positive")
+    if args.max_workers < 1:
+        raise ValueError("max-workers must be at least 1")
     if args.task_type == "web" and args.web_port == args.smoke_port:
         raise ValueError("smoke port must differ from the ARC-Bench grading port")
 
@@ -104,7 +118,10 @@ def main(argv: list[str] | None = None) -> int:
     runtime.traceability.store_requirement_tree(requirement_tree)
     runtime.git.ensure_repo()
     runtime.events.mark_run_started(f"HAFleet ARC started with {len(modules)} modules")
-    _console("runtime initialized; entering architect/planner/implementer/reviewer pipeline")
+    _console(
+        "runtime initialized; entering architect/planner/implementer/reviewer pipeline "
+        f"(parallel={args.parallel}, max_workers={args.max_workers})"
+    )
 
     skills_dir = agent_root / "skills"
     try:
@@ -129,6 +146,8 @@ def main(argv: list[str] | None = None) -> int:
                 task_type=args.task_type,
                 smoke_port=args.smoke_port,
                 requirement_tree=requirement_tree,
+                parallel=args.parallel,
+                max_workers=args.max_workers,
             ).run(modules)
     except PauseRequested as exc:
         runtime.events.mark_run_paused(str(exc))

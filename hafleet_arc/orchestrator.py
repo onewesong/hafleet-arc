@@ -5,6 +5,7 @@ import os
 import shutil
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -12,10 +13,11 @@ from .checkpoint import CheckpointStore
 from .models import RequirementModule
 from .postflight import PostflightError, rehearse_web_app, validate_web_structure
 from .log import log
+from .worktree import WorktreeConflict, WorktreeManager
 
 
 class FleetDriver(Protocol):
-    def run(self, role: str, prompt: str) -> object: ...
+    def run(self, role: str, prompt: str, workspace_dir: Path | None = None) -> object: ...
 
 
 class RuntimeEvents(Protocol):
@@ -70,6 +72,8 @@ class FleetOrchestrator:
         task_type: str,
         smoke_port: int = 3100,
         requirement_tree: dict[str, Any] | None = None,
+        parallel: bool = False,
+        max_workers: int = 2,
     ) -> None:
         self.driver = driver
         self.runtime = runtime
@@ -79,6 +83,8 @@ class FleetOrchestrator:
         self.task_type = task_type
         self.smoke_port = smoke_port
         self.requirement_tree = requirement_tree
+        self.parallel = bool(parallel)
+        self.max_workers = max(int(max_workers), 1)
         self.plan_dir = output_dir / ".arc" / "hafleet" / "plans"
         self.architecture_path = output_dir / ".arc" / "hafleet" / "architecture.md"
         configured_pause = os.environ.get("ARCBENCH_PAUSE_REQUEST_PATH", "").strip()
@@ -114,8 +120,25 @@ class FleetOrchestrator:
             """
         ).strip()
 
-    def _base_prompt(self, module: RequirementModule, completed_ids: list[str], plan_path: Path) -> str:
+    def _base_prompt(
+        self,
+        module: RequirementModule,
+        completed_ids: list[str],
+        plan_path: Path,
+        workspace_dir: Path | None = None,
+        branch: str | None = None,
+    ) -> str:
         completed = ", ".join(completed_ids) if completed_ids else "none"
+        workspace_note = ""
+        if workspace_dir is not None:
+            workspace_note = textwrap.dedent(
+                f"""
+                Module worktree: {workspace_dir}
+                Module branch: {branch or 'unknown'}
+                This is an isolated parallel worktree. Modify only this worktree; do not
+                modify the main output workspace or depend on other unmerged modules.
+                """
+            )
         return textwrap.dedent(
             f"""
             ARC-Bench task type: {self.task_type}
@@ -130,6 +153,7 @@ class FleetOrchestrator:
             appending business logic to frontend/src/app.js or backend/server.js.
             Preserve existing APIs, persisted data, and visible behavior. If a small
             architecture extension is necessary, update the architecture document.
+            {workspace_note}
 
             Complete requirement subtree:
             ```json
@@ -155,6 +179,13 @@ class FleetOrchestrator:
                 "id": "ROOT",
                 "children": [module.subtree for module in modules],
             }
+        active_worktrees = state.get("active_worktrees") or {}
+        if active_worktrees and not self.parallel:
+            raise RuntimeError(
+                "checkpoint contains active parallel worktrees; resume with --parallel "
+                "to inspect or complete them"
+            )
+        self.checkpoint.configure_parallel(self.parallel, self.max_workers)
         if not bool(state.get("architecture_completed")):
             self._run_architecture()
             state = self.checkpoint.read()
@@ -164,7 +195,10 @@ class FleetOrchestrator:
                 flush=True,
             )
 
-        for module in modules:
+        if self.parallel:
+            self._run_parallel(modules, completed_ids, completed_set)
+
+        for module in ([] if self.parallel else modules):
             if module.node_id in completed_set:
                 log(f"[hafleet] Skipping completed module {module.node_id}", flush=True)
                 continue
@@ -282,6 +316,193 @@ class FleetOrchestrator:
                 f"[hafleet] Final integration completed ({time.monotonic() - run_started:.1f}s)",
                 flush=True,
             )
+
+    def _run_parallel_module(
+        self,
+        module: RequirementModule,
+        workspace: Path,
+        branch: str,
+        completed_ids: list[str],
+    ) -> Path:
+        plan_path = workspace / ".arc" / "hafleet" / "plans" / f"{module.node_id}.md"
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        base_prompt = self._base_prompt(module, completed_ids, plan_path, workspace, branch)
+        self.driver.run(
+            "planner",
+            base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
+            workspace_dir=workspace,
+        )
+        if not plan_path.is_file() or not plan_path.read_text(encoding="utf-8", errors="ignore").strip():
+            self.driver.run(
+                "planner",
+                base_prompt
+                + f"\n\nThe required plan file was not created. Write a concrete plan now to exactly: {plan_path}",
+                workspace_dir=workspace,
+            )
+        if not plan_path.is_file() or not plan_path.read_text(encoding="utf-8", errors="ignore").strip():
+            raise RuntimeError(f"planner did not create required plan: {plan_path}")
+        self.driver.run(
+            "implementer",
+            base_prompt + "\n\nRead the coordinator plan, then implement and verify the complete subtree now.",
+            workspace_dir=workspace,
+        )
+        self.driver.run(
+            "reviewer",
+            base_prompt + "\n\nReview the current implementation, run checks, and directly repair every issue found.",
+            workspace_dir=workspace,
+        )
+        return plan_path
+
+    def _run_parallel(
+        self,
+        modules: list[RequirementModule],
+        completed_ids: list[str],
+        completed_set: set[str],
+    ) -> None:
+        manager = WorktreeManager(self.output_dir)
+        pending = [module for module in modules if module.node_id not in completed_set]
+        direct_ids = {module.node_id for module in modules}
+        log(
+            f"[hafleet] parallel mode enabled: max_workers={self.max_workers}, "
+            f"pending={len(pending)}",
+            flush=True,
+        )
+
+        while pending:
+            ready = [
+                module
+                for module in pending
+                if all(
+                    dependency not in direct_ids or dependency in completed_set
+                    for dependency in module.dependencies
+                    if dependency != module.node_id
+                )
+            ]
+            if not ready:
+                self.checkpoint.mark_paused("ROOT", "parallel")
+                raise PauseRequested("parallel dependency graph has no ready module")
+            batch = ready[: self.max_workers]
+            base_commit = manager.current_head()
+            workspaces: dict[str, tuple[Path, str, str]] = {}
+            for module in batch:
+                existing = (self.checkpoint.read().get("active_worktrees") or {}).get(module.node_id)
+                existing_path = Path(existing["path"]) if existing and existing.get("path") else None
+                if existing_path is not None and not existing_path.exists():
+                    raise RuntimeError(
+                        f"recorded worktree is missing for {module.node_id}: {existing_path}"
+                    )
+                module_base = str(existing.get("base_commit") or base_commit) if existing else base_commit
+                workspace, branch = manager.create_or_reuse(module.node_id, module_base, existing_path)
+                workspace_architecture = workspace / ".arc" / "hafleet" / "architecture.md"
+                workspace_architecture.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(self.architecture_path, workspace_architecture)
+                workspaces[module.node_id] = (workspace, branch, module_base)
+                self.checkpoint.set_active_worktree(
+                    module.node_id,
+                    {
+                        "path": str(workspace),
+                        "branch": branch,
+                        "base_commit": module_base,
+                        "phase": "planner",
+                    },
+                )
+                self.runtime.events.mark_design_started(module.node_id, "HAFleet parallel planner started")
+                self.runtime.events.mark_implementation_started(
+                    module.node_id, "HAFleet parallel implementer started"
+                )
+                log(
+                    f"[hafleet] dispatching {module.node_id} to {workspace} ({branch})",
+                    flush=True,
+                )
+            failures: dict[str, BaseException] = {}
+            module_by_id = {module.node_id: module for module in batch}
+            with ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix="hafleet-module") as pool:
+                future_map = {
+                    pool.submit(
+                        self._run_parallel_module,
+                        module_by_id[module_id],
+                        workspace,
+                        branch,
+                        list(completed_ids),
+                    ): module_by_id[module_id]
+                    for module_id, (workspace, branch, _base) in workspaces.items()
+                }
+                for future in as_completed(future_map):
+                    module = future_map[future]
+                    try:
+                        future.result()
+                        self.checkpoint.update_active_worktree(module.node_id, phase="merge")
+                    except BaseException as exc:  # noqa: BLE001 - preserve worker failure for checkpointing
+                        failures[module.node_id] = exc
+
+            blocked = False
+            for module in modules:
+                if module not in batch:
+                    continue
+                workspace, branch, module_base = workspaces[module.node_id]
+                if module.node_id in failures:
+                    blocked = True
+                    self.runtime.events.mark_design_failed(module.node_id, "HAFleet parallel worker failed")
+                    self.runtime.events.mark_implementation_failed(
+                        module.node_id, "HAFleet parallel worker failed"
+                    )
+                    self.checkpoint.update_active_worktree(module.node_id, phase="failed")
+                    self.checkpoint.mark_parallel_failure(module.node_id)
+                    log(f"[hafleet] parallel module failed {module.node_id}: {failures[module.node_id]}", flush=True)
+                    continue
+                try:
+                    commit = manager.ensure_commit(
+                        workspace,
+                        f"{module.node_id}: implement and review {module.name}",
+                    )
+                    commits = manager.commits_since(workspace, module_base)
+                    if not commits:
+                        raise RuntimeError(f"parallel module produced no commit: {commit}")
+                    source_plan = workspace / ".arc" / "hafleet" / "plans" / f"{module.node_id}.md"
+                    destination_plan = self.plan_dir / f"{module.node_id}.md"
+                    destination_plan.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_plan, destination_plan)
+                    manager.cherry_pick(commits)
+                    self.runtime.events.mark_design_done(module.node_id, "HAFleet plan completed")
+                    self.runtime.events.mark_implementation_done(
+                        module.node_id, "Implementation reviewed and repaired"
+                    )
+                    try:
+                        manager.remove_successful(workspace, branch)
+                    except Exception as cleanup_error:  # noqa: BLE001 - merged code is still valid
+                        log(
+                            f"[hafleet] merged {module.node_id} but could not clean worktree: {cleanup_error}",
+                            flush=True,
+                        )
+                    self.checkpoint.clear_active_worktree(module.node_id)
+                    self.checkpoint.mark_module_completed(module.node_id, module.index)
+                    completed_set.add(module.node_id)
+                    completed_ids.append(module.node_id)
+                    log(f"[hafleet] parallel module merged: {module.node_id}", flush=True)
+                except WorktreeConflict as exc:
+                    blocked = True
+                    self.runtime.events.mark_implementation_failed(
+                        module.node_id, "HAFleet parallel cherry-pick conflict"
+                    )
+                    self.checkpoint.update_active_worktree(module.node_id, phase="conflict")
+                    self.checkpoint.mark_parallel_conflict(module.node_id)
+                    log(f"[hafleet] cherry-pick conflict for {module.node_id}: {exc}", flush=True)
+                except BaseException as exc:  # noqa: BLE001 - retain worktree for diagnosis
+                    blocked = True
+                    self.runtime.events.mark_implementation_failed(
+                        module.node_id, "HAFleet parallel merge failed"
+                    )
+                    self.checkpoint.update_active_worktree(module.node_id, phase="merge-failed")
+                    self.checkpoint.mark_parallel_failure(module.node_id)
+                    log(f"[hafleet] parallel merge failed for {module.node_id}: {exc}", flush=True)
+
+            pending = [module for module in pending if module.node_id not in completed_set]
+            if blocked:
+                self.checkpoint.mark_paused("ROOT", "parallel")
+                raise PauseRequested("parallel module failure or merge conflict")
+            if self.pause_request_path.exists() and pending:
+                self.checkpoint.mark_paused("ROOT", "parallel")
+                raise PauseRequested("ARC-Bench pause requested")
 
     def _run_architecture(self) -> None:
         """Run the one-time global architecture and scaffold phase."""

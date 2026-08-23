@@ -19,6 +19,11 @@ class CheckpointStore:
         default = {
             "version": 1,
             "architecture_completed": False,
+            "parallel_mode": False,
+            "max_workers": 2,
+            "active_worktrees": {},
+            "failed_modules": [],
+            "conflicted_modules": [],
             "last_completed_index": 0,
             "completed": [],
             "paused": False,
@@ -37,6 +42,11 @@ class CheckpointStore:
         payload["last_completed_index"] = max(int(payload.get("last_completed_index", 0) or 0), 0)
         payload.setdefault("version", 1)
         payload.setdefault("architecture_completed", False)
+        payload.setdefault("parallel_mode", False)
+        payload.setdefault("max_workers", 2)
+        payload.setdefault("active_worktrees", {})
+        payload.setdefault("failed_modules", [])
+        payload.setdefault("conflicted_modules", [])
         payload.setdefault("paused", False)
         payload.setdefault("final_review_completed", False)
         return payload
@@ -63,6 +73,56 @@ class CheckpointStore:
                 "current_phase": None,
             }
         )
+        self.write(payload)
+        return payload
+
+    def configure_parallel(self, enabled: bool, max_workers: int) -> dict[str, Any]:
+        payload = self.read()
+        payload.update({"parallel_mode": bool(enabled), "max_workers": int(max_workers)})
+        self.write(payload)
+        return payload
+
+    def set_active_worktree(self, module_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        payload = self.read()
+        active = dict(payload.get("active_worktrees") or {})
+        active[module_id] = dict(metadata)
+        payload["active_worktrees"] = active
+        self.write(payload)
+        return payload
+
+    def update_active_worktree(self, module_id: str, **updates: Any) -> dict[str, Any]:
+        payload = self.read()
+        active = dict(payload.get("active_worktrees") or {})
+        item = dict(active.get(module_id) or {})
+        item.update(updates)
+        active[module_id] = item
+        payload["active_worktrees"] = active
+        self.write(payload)
+        return payload
+
+    def clear_active_worktree(self, module_id: str) -> dict[str, Any]:
+        payload = self.read()
+        active = dict(payload.get("active_worktrees") or {})
+        active.pop(module_id, None)
+        payload["active_worktrees"] = active
+        self.write(payload)
+        return payload
+
+    def mark_parallel_failure(self, module_id: str) -> dict[str, Any]:
+        payload = self.read()
+        values = list(payload.get("failed_modules") or [])
+        if module_id not in values:
+            values.append(module_id)
+        payload["failed_modules"] = values
+        self.write(payload)
+        return payload
+
+    def mark_parallel_conflict(self, module_id: str) -> dict[str, Any]:
+        payload = self.read()
+        values = list(payload.get("conflicted_modules") or [])
+        if module_id not in values:
+            values.append(module_id)
+        payload["conflicted_modules"] = values
         self.write(payload)
         return payload
 

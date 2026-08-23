@@ -63,7 +63,7 @@ class FakeFleet:
     def __exit__(self, *_args) -> None:
         pass
 
-    def run(self, role: str, prompt: str) -> None:
+    def run(self, role: str, prompt: str, workspace_dir: Path | None = None) -> None:
         self.calls.append(role)
         if role == "architect":
             marker = "Architecture document path: "
@@ -77,6 +77,11 @@ class FakeFleet:
 
 
 class EntrypointSmokeTests(unittest.TestCase):
+    def test_parallel_arguments_are_parsed(self) -> None:
+        args = entrypoint.parse_args(["requirements", "--parallel", "--max-workers", "3"])
+        self.assertTrue(args.parallel)
+        self.assertEqual(args.max_workers, 3)
+
     def test_arcbench_command_contract_runs_to_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
