@@ -65,6 +65,11 @@ class FakeFleet:
 
     def run(self, role: str, prompt: str) -> None:
         self.calls.append(role)
+        if role == "architect":
+            marker = "Architecture document path: "
+            architecture_path = Path(prompt.split(marker, 1)[1].splitlines()[0].strip())
+            architecture_path.parent.mkdir(parents=True, exist_ok=True)
+            architecture_path.write_text("# Architecture\n", encoding="utf-8")
         if role == "planner" and "exactly:" in prompt:
             plan_path = Path(prompt.rsplit("exactly:", 1)[1].strip().splitlines()[0])
             plan_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +102,10 @@ class EntrypointSmokeTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, 0)
-            self.assertEqual(FakeFleet.instances[-1].calls, ["planner", "implementer", "reviewer"])
+            self.assertEqual(
+                FakeFleet.instances[-1].calls,
+                ["architect", "planner", "implementer", "reviewer"],
+            )
             self.assertEqual(runtime.traceability.tree["id"], "ROOT")
             self.assertIn("mark_run_completed", runtime.events.states)
             self.assertTrue((output / ".arc" / "checkpoint.json").is_file())

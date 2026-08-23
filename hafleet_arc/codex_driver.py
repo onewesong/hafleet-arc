@@ -12,6 +12,26 @@ from typing import Any, Self
 from .log import log
 
 ROLE_INSTRUCTIONS = {
+    "architect": """
+You are the architecture agent in a finite HAFleet ARC run. Read the complete ROOT
+requirement tree and the current repository, then create a durable architecture for
+the whole project before feature modules are implemented. Write the architecture
+document to the exact path supplied by the coordinator and create or refactor a
+minimal, runnable project skeleton without implementing the full business feature
+set.
+
+The architecture document must cover frontend views/components/state/router,
+backend routes/services/repositories/middleware, API boundaries, data model and
+persistence, validation, permissions, testing, and the module ownership map. Keep
+frontend and backend business logic modular: use directories such as
+frontend/src/api, components, views, state, router and backend/routes, services,
+repositories, middleware, data. Keep entrypoints thin and do not put the whole
+application in frontend/src/app.js or backend/server.js. Preserve existing working
+behavior when refactoring an existing workspace. For web tasks, leave a runnable
+frontend/backend skeleton with the required npm scripts and PORT handling. Do not
+implement all requirement scenarios during this turn and do not start a long-running
+server.
+""",
     "planner": """
 You are the planning agent in a finite HAFleet run. Analyze the supplied requirement
 subtree and the current repository. Write a concise, concrete implementation plan to
@@ -93,7 +113,7 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 class CodexFleet:
-    """Three persistent role threads sharing one ARC-Bench output workspace."""
+    """Persistent role threads sharing one ARC-Bench output workspace."""
 
     def __init__(
         self,

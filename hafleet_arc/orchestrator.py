@@ -6,11 +6,11 @@ import shutil
 import textwrap
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from .checkpoint import CheckpointStore
 from .models import RequirementModule
-from .postflight import PostflightError, rehearse_web_app
+from .postflight import PostflightError, rehearse_web_app, validate_web_structure
 from .log import log
 
 
@@ -69,6 +69,7 @@ class FleetOrchestrator:
         output_dir: Path,
         task_type: str,
         smoke_port: int = 3100,
+        requirement_tree: dict[str, Any] | None = None,
     ) -> None:
         self.driver = driver
         self.runtime = runtime
@@ -77,7 +78,9 @@ class FleetOrchestrator:
         self.output_dir = output_dir
         self.task_type = task_type
         self.smoke_port = smoke_port
+        self.requirement_tree = requirement_tree
         self.plan_dir = output_dir / ".arc" / "hafleet" / "plans"
+        self.architecture_path = output_dir / ".arc" / "hafleet" / "architecture.md"
         configured_pause = os.environ.get("ARCBENCH_PAUSE_REQUEST_PATH", "").strip()
         self.pause_request_path = Path(configured_pause) if configured_pause else output_dir / ".arc" / "pause-request"
 
@@ -86,6 +89,30 @@ class FleetOrchestrator:
             return
         self.checkpoint.mark_paused(module.node_id if module else None, phase)
         raise PauseRequested("ARC-Bench pause requested")
+
+    def _architecture_prompt(self, requirement_tree: dict[str, object]) -> str:
+        return textwrap.dedent(
+            f"""
+            ARC-Bench task type: {self.task_type}
+            Requirement source directory: {self.requirements_dir}
+            Output workspace: {self.output_dir}
+            Architecture document path: {self.architecture_path}
+
+            Complete ROOT requirement tree:
+            ```json
+            {json.dumps(requirement_tree, ensure_ascii=False, indent=2)}
+            ```
+
+            Write the architecture document exactly to {self.architecture_path}, then
+            create or refactor the project skeleton in the workspace. Preserve any
+            existing working behavior and do not overwrite user data unnecessarily.
+            The document and source tree must define clear frontend/backend module
+            boundaries. For web tasks, keep frontend/ and backend/ at the project root,
+            provide npm run build and npm run start, read process.env.PORT, and use only
+            smoke port {self.smoke_port} for any short verification. Do not implement
+            the full requirement tree yet.
+            """
+        ).strip()
 
     def _base_prompt(self, module: RequirementModule, completed_ids: list[str], plan_path: Path) -> str:
         completed = ", ".join(completed_ids) if completed_ids else "none"
@@ -96,6 +123,13 @@ class FleetOrchestrator:
             Requirement source directory: {self.requirements_dir}
             Previously completed ROOT modules: {completed}
             Coordinator plan path: {plan_path}
+            Global architecture document: {self.architecture_path}
+
+            Before changing files, read {self.architecture_path}. Follow its module
+            boundaries. Put new behavior in the appropriate modules instead of
+            appending business logic to frontend/src/app.js or backend/server.js.
+            Preserve existing APIs, persisted data, and visible behavior. If a small
+            architecture extension is necessary, update the architecture document.
 
             Complete requirement subtree:
             ```json
@@ -115,6 +149,20 @@ class FleetOrchestrator:
             f"already completed={len(completed_ids)}",
             flush=True,
         )
+
+        if self.requirement_tree is None:
+            self.requirement_tree = {
+                "id": "ROOT",
+                "children": [module.subtree for module in modules],
+            }
+        if not bool(state.get("architecture_completed")):
+            self._run_architecture()
+            state = self.checkpoint.read()
+        else:
+            log(
+                f"[hafleet] Skipping completed architecture: {self.architecture_path}",
+                flush=True,
+            )
 
         for module in modules:
             if module.node_id in completed_set:
@@ -210,6 +258,7 @@ class FleetOrchestrator:
                         f"""
                         Perform the final integration review for ARC-Bench task type {self.task_type}.
                         Completed ROOT modules: {module_ids}.
+                        Read {self.architecture_path} and preserve its module boundaries.
                         Inspect the whole project, run the build and practical tests, fix regressions and
                         integration gaps, and leave the application runnable. For web smoke tests use only
                         port {self.smoke_port}, stop every server afterward, and never bind the grading port.
@@ -233,6 +282,57 @@ class FleetOrchestrator:
                 f"[hafleet] Final integration completed ({time.monotonic() - run_started:.1f}s)",
                 flush=True,
             )
+
+    def _run_architecture(self) -> None:
+        """Run the one-time global architecture and scaffold phase."""
+
+        if self.pause_request_path.exists():
+            self.checkpoint.mark_paused("ROOT", "architecture")
+            raise PauseRequested("ARC-Bench pause requested")
+
+        self.checkpoint.mark_module_started("ROOT", "architecture")
+        log(
+            f"[hafleet] architecture started -> {self.architecture_path}",
+            flush=True,
+        )
+        requirement_tree = self.requirement_tree
+        if requirement_tree is None:
+            raise RuntimeError("architecture requirement tree is unavailable")
+        try:
+            self.driver.run("architect", self._architecture_prompt(requirement_tree))
+            if self.pause_request_path.exists():
+                self.checkpoint.mark_paused("ROOT", "architecture")
+                raise PauseRequested("ARC-Bench pause requested")
+            if not self.architecture_path.is_file() or not self.architecture_path.read_text(
+                encoding="utf-8", errors="ignore"
+            ).strip():
+                raise RuntimeError(
+                    f"architect did not create required architecture document: {self.architecture_path}"
+                )
+            if self.task_type == "web":
+                violations = validate_web_structure(self.output_dir)
+                if violations:
+                    raise RuntimeError(
+                        "architect scaffold failed web delivery contract:\n- "
+                        + "\n- ".join(violations)
+                    )
+            checkpoint_message = "ROOT: architecture scaffold"
+            committed = self.runtime.git.commit(checkpoint_message)
+            self.checkpoint.mark_architecture_completed()
+            log(
+                f"[hafleet] architecture document created ({self.architecture_path.stat().st_size} bytes)",
+                flush=True,
+            )
+            log(
+                f"[hafleet] architecture scaffold checkpoint "
+                f"{'created' if committed else 'skipped'}: {checkpoint_message}",
+                flush=True,
+            )
+        except PauseRequested:
+            raise
+        except Exception:
+            log("[hafleet] architecture failed; feature modules will not start", flush=True)
+            raise
 
     def _run_postflight(self, module_ids: str) -> None:
         enabled = os.environ.get("HAFLEET_POSTFLIGHT", "1").strip().lower() not in {

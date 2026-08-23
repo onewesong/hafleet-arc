@@ -1,7 +1,7 @@
 # HAFleet ARC
 
 HAFleet ARC is a finite-lifecycle multi-role coding agent for ARC-Bench. It keeps
-HAFleet's planner, implementer, reviewer, task-state, and checkpoint concepts but
+HAFleet's architect, planner, implementer, reviewer, task-state, and checkpoint concepts but
 does not start the HAFleet backend, tmux, Matrix, or dashboard services.
 
 ## Entrypoint
@@ -26,31 +26,32 @@ hosts may expose a read-only home directory.
 ## Fleet workflow
 
 HAFleet ARC runs a finite, resumable pipeline over the requirement tree. The
-three Codex roles share the same output workspace and keep persistent role
+four Codex roles share the same output workspace and keep persistent role
 threads for the duration of the run.
 
 ```mermaid
 flowchart TD
     A["Read requirements.yaml"] --> B["Load and validate ROOT requirement tree"]
-    B --> C["Order direct ROOT children by dependencies"]
-    C --> D{"Module already completed?"}
-    D -- "Yes" --> E["Skip module"]
-    D -- "No" --> F["Planner: write implementation plan"]
-    F --> G["Implementer: implement requirement subtree"]
-    G --> H["Reviewer: test, review, and repair"]
-    H --> I["Emit events and update traceability"]
-    I --> J["Create git checkpoint"]
-    J --> K["Update checkpoint.json"]
-    K --> L{"More modules?"}
-    E --> L
-    L -- "Yes" --> D
-    L -- "No" --> M["Run final integration review"]
-    M --> N["Build and start rehearsal on smoke port"]
-    N --> O{"Postflight passed?"}
-    O -- "No" --> P["Reviewer repairs exact failure"]
-    P --> N
-    O -- "Yes" --> Q["Create final git checkpoint"]
-    Q --> R["Mark run completed and exit"]
+    B --> C["Architect: create global modular scaffold"]
+    C --> D["Order direct ROOT children by dependencies"]
+    D --> E{"Module already completed?"}
+    E -- "Yes" --> F["Skip module"]
+    E -- "No" --> G["Planner: write implementation plan"]
+    G --> H["Implementer: implement requirement subtree"]
+    H --> I["Reviewer: test, review, and repair"]
+    I --> J["Emit events and update traceability"]
+    J --> K["Create git checkpoint"]
+    K --> L["Update checkpoint.json"]
+    L --> M{"More modules?"}
+    F --> M
+    M -- "Yes" --> E
+    M -- "No" --> N["Run final integration review"]
+    N --> O["Build and start rehearsal on smoke port"]
+    O --> P{"Postflight passed?"}
+    P -- "No" --> Q["Reviewer repairs exact failure"]
+    Q --> O
+    P -- "Yes" --> R["Create final git checkpoint"]
+    R --> S["Mark run completed and exit"]
 ```
 
 ### 1. Initialize the workspace
@@ -68,14 +69,21 @@ then:
 - isolates Codex state under `.arc/hafleet/codex-home` so the runner does not
   need a writable user home directory.
 
-### 2. Build the module execution plan
+### 2. Create the global architecture scaffold
+
+Before processing feature modules, the one-time `architect` role reads the complete
+ROOT requirement tree, writes `.arc/hafleet/architecture.md`, and creates or refactors
+a modular project scaffold. Its checkpoint is `ROOT: architecture scaffold`, and the
+`architecture_completed` flag makes the phase resumable without repeating it.
+
+### 3. Build the module execution plan
 
 Each direct child of `ROOT` becomes one module. Modules are processed in stable,
 dependency-aware order. Dependencies on descendants do not constrain this
 top-level ordering, and dependency cycles fall back to source order instead of
 deadlocking the run.
 
-### 3. Plan the module
+### 4. Plan the module
 
 The `planner` receives the complete requirement subtree, task type, previously
 completed module IDs, and current repository context. It writes a concrete
@@ -89,14 +97,14 @@ The plan covers the data model, routes or UI, persistence, validation,
 requirement scenarios, and verification. The planner does not modify project
 files outside the plan.
 
-### 4. Implement the requirement subtree
+### 5. Implement the requirement subtree
 
 The `implementer` reads the coordinator plan and implements the entire subtree
 in the shared output workspace. It must preserve behavior from earlier modules,
 build real persisted behavior rather than static mock screens, and run focused
 checks while working.
 
-### 5. Review and repair
+### 6. Review and repair
 
 The `reviewer` checks the implementation against its scenarios, runs practical
 tests or build checks, and directly repairs every defect it finds. The review
@@ -110,7 +118,7 @@ When the module passes review, the orchestrator:
    `<module-id>: implement and review <module-name>`; and
 3. records the completed module in `.arc/checkpoint.json`.
 
-### 6. Pause and resume
+### 7. Pause and resume
 
 The orchestrator checks for an ARC-Bench pause request at phase boundaries. On
 pause it records the current module and phase, emits a paused event, and exits
@@ -120,7 +128,7 @@ On the next run, modules already listed as completed in the checkpoint are
 skipped. Resume is therefore module-granular: a partially completed module is
 run again, while earlier completed modules are retained.
 
-### 7. Run the final integration review
+### 8. Run the final integration review
 
 After all modules are complete, the `reviewer` performs one whole-project
 integration pass. It runs the build and practical tests, repairs regressions and
@@ -133,7 +141,7 @@ ROOT: final HAFleet integration review
 
 Set `HAFLEET_FINAL_REVIEW=0` to disable this pass for cheaper local experiments.
 
-### 8. Validate the delivery and exit
+### 9. Validate the delivery and exit
 
 For web tasks, HAFleet ARC does not report completion immediately after the
 final review. It first verifies the required `frontend/` and `backend/`

@@ -7,7 +7,7 @@ from unittest import mock
 
 from hafleet_arc.checkpoint import CheckpointStore
 from hafleet_arc.models import RequirementModule
-from hafleet_arc.orchestrator import FleetOrchestrator
+from hafleet_arc.orchestrator import FleetOrchestrator, PauseRequested
 from hafleet_arc.postflight import PostflightError
 
 
@@ -17,6 +17,28 @@ class FakeDriver:
 
     def run(self, role: str, prompt: str) -> None:
         self.calls.append((role, prompt))
+        if role == "architect":
+            marker = "Architecture document path: "
+            architecture_path = Path(
+                prompt.split(marker, 1)[1].splitlines()[0].strip()
+            )
+            architecture_path.parent.mkdir(parents=True, exist_ok=True)
+            architecture_path.write_text("# Architecture\n", encoding="utf-8")
+            if "ARC-Bench task type: web" in prompt:
+                project_root = architecture_path.parents[2]
+                frontend = project_root / "frontend"
+                backend = project_root / "backend"
+                (frontend / "src").mkdir(parents=True, exist_ok=True)
+                (backend / "data").mkdir(parents=True, exist_ok=True)
+                (frontend / "package.json").write_text(
+                    '{"scripts":{"build":"node -e \\\"\\\""}}\n', encoding="utf-8"
+                )
+                (backend / "package.json").write_text(
+                    '{"scripts":{"start":"node server.js"}}\n', encoding="utf-8"
+                )
+                (backend / "server.js").write_text(
+                    'const port = process.env.PORT;\n', encoding="utf-8"
+                )
         if role == "planner" and "exactly:" in prompt:
             plan_path = Path(prompt.rsplit("exactly:", 1)[1].strip().splitlines()[0])
             plan_path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,9 +93,25 @@ class OrchestratorTests(unittest.TestCase):
                 orchestrator.run([self._module(1, "REQ-1"), self._module(2, "REQ-2")])
 
             roles = [role for role, _ in driver.calls]
-            self.assertEqual(roles, ["planner", "implementer", "reviewer", "planner", "implementer", "reviewer", "reviewer"])
+            self.assertEqual(
+                roles,
+                [
+                    "architect",
+                    "planner",
+                    "implementer",
+                    "reviewer",
+                    "planner",
+                    "implementer",
+                    "reviewer",
+                    "reviewer",
+                ],
+            )
             self.assertEqual(checkpoint.read()["completed"], ["REQ-1", "REQ-2"])
-            self.assertEqual(len(runtime.git.messages), 3)
+            self.assertTrue(checkpoint.read()["architecture_completed"])
+            self.assertEqual(len(runtime.git.messages), 4)
+            planner_prompt = next(prompt for role, prompt in driver.calls if role == "planner")
+            self.assertIn("architecture.md", planner_prompt)
+            self.assertIn("frontend/src/app.js", planner_prompt)
 
     def test_resume_skips_completed_modules(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -92,7 +130,77 @@ class OrchestratorTests(unittest.TestCase):
             with mock.patch.dict("os.environ", {"HAFLEET_POSTFLIGHT": "0"}, clear=False):
                 orchestrator.run([self._module(1, "REQ-1"), self._module(2, "REQ-2")])
 
-            self.assertEqual([role for role, _ in driver.calls], ["planner", "implementer", "reviewer", "reviewer"])
+            self.assertEqual(
+                [role for role, _ in driver.calls],
+                ["architect", "planner", "implementer", "reviewer", "reviewer"],
+            )
+
+    def test_completed_architecture_is_skipped_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            checkpoint.mark_architecture_completed()
+            architecture = root / ".arc" / "hafleet" / "architecture.md"
+            architecture.parent.mkdir(parents=True, exist_ok=True)
+            architecture.write_text("# Existing architecture\n", encoding="utf-8")
+            driver = FakeDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            with mock.patch.dict("os.environ", {"HAFLEET_POSTFLIGHT": "0"}, clear=False):
+                orchestrator.run([self._module(1, "REQ-1"), self._module(2, "REQ-2")])
+
+            self.assertNotIn("architect", [role for role, _ in driver.calls])
+
+    def test_architect_failure_does_not_start_feature_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            driver = FakeDriver()
+            driver.run = lambda role, prompt: driver.calls.append((role, prompt)) if role == "architect" else (_ for _ in ()).throw(AssertionError("feature module started"))
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            with self.assertRaisesRegex(RuntimeError, "architecture document"):
+                orchestrator.run([self._module(1, "REQ-1")])
+
+            self.assertFalse(orchestrator.checkpoint.read()["architecture_completed"])
+
+    def test_architecture_pause_records_root_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pause_path = root / ".arc" / "pause-request"
+            pause_path.parent.mkdir(parents=True, exist_ok=True)
+            pause_path.write_text("pause\n", encoding="utf-8")
+            orchestrator = FleetOrchestrator(
+                driver=FakeDriver(),
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"ARCBENCH_PAUSE_REQUEST_PATH": str(pause_path)},
+                clear=False,
+            ):
+                with self.assertRaises(PauseRequested):
+                    orchestrator.run([self._module(1, "REQ-1")])
+
+            state = orchestrator.checkpoint.read()
+            self.assertTrue(state["paused"])
+            self.assertEqual(state["current_node_id"], "ROOT")
+            self.assertEqual(state["current_phase"], "architecture")
 
     def test_postflight_failure_prevents_final_completion_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

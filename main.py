@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime.traceability.store_requirement_tree(requirement_tree)
     runtime.git.ensure_repo()
     runtime.events.mark_run_started(f"HAFleet ARC started with {len(modules)} modules")
-    _console("runtime initialized; entering planner/implementer/reviewer pipeline")
+    _console("runtime initialized; entering architect/planner/implementer/reviewer pipeline")
 
     skills_dir = agent_root / "skills"
     try:
@@ -128,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=output_dir,
                 task_type=args.task_type,
                 smoke_port=args.smoke_port,
+                requirement_tree=requirement_tree,
             ).run(modules)
     except PauseRequested as exc:
         runtime.events.mark_run_paused(str(exc))

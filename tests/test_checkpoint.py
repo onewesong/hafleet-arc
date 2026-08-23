@@ -30,7 +30,15 @@ class CheckpointStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.json"
             path.write_text("not-json", encoding="utf-8")
-            self.assertEqual(CheckpointStore(path).read()["completed"], [])
+            state = CheckpointStore(path).read()
+            self.assertEqual(state["completed"], [])
+            self.assertFalse(state["architecture_completed"])
+
+    def test_architecture_completion_is_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CheckpointStore(Path(temporary) / "checkpoint.json")
+            store.mark_architecture_completed()
+            self.assertTrue(store.read()["architecture_completed"])
 
 
 if __name__ == "__main__":

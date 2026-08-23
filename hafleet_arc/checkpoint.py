@@ -18,6 +18,7 @@ class CheckpointStore:
     def read(self) -> dict[str, Any]:
         default = {
             "version": 1,
+            "architecture_completed": False,
             "last_completed_index": 0,
             "completed": [],
             "paused": False,
@@ -35,6 +36,7 @@ class CheckpointStore:
         payload["completed"] = [str(item) for item in completed] if isinstance(completed, list) else []
         payload["last_completed_index"] = max(int(payload.get("last_completed_index", 0) or 0), 0)
         payload.setdefault("version", 1)
+        payload.setdefault("architecture_completed", False)
         payload.setdefault("paused", False)
         payload.setdefault("final_review_completed", False)
         return payload
@@ -48,6 +50,19 @@ class CheckpointStore:
     def mark_module_started(self, module_id: str, phase: str) -> dict[str, Any]:
         payload = self.read()
         payload.update({"paused": False, "current_node_id": module_id, "current_phase": phase})
+        self.write(payload)
+        return payload
+
+    def mark_architecture_completed(self) -> dict[str, Any]:
+        payload = self.read()
+        payload.update(
+            {
+                "architecture_completed": True,
+                "paused": False,
+                "current_node_id": None,
+                "current_phase": None,
+            }
+        )
         self.write(payload)
         return payload
 
