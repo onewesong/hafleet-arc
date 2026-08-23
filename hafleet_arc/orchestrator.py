@@ -116,7 +116,9 @@ class FleetOrchestrator:
             boundaries. For web tasks, keep frontend/ and backend/ at the project root,
             provide npm run build and npm run start, read process.env.PORT, and use only
             smoke port {self.smoke_port} for any short verification. Do not implement
-            the full requirement tree yet.
+            the full requirement tree yet. Do not put browser-loaded frontend modules
+            under a top-level frontend/src/api path because the backend reserves
+            /api/* for JSON endpoints; use frontend/src/client or frontend/src/services.
             """
         ).strip()
 

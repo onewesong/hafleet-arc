@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import signal
 import subprocess
 import tempfile
 import threading
 import time
+import re
 from pathlib import Path
 from typing import Self
 from urllib.error import HTTPError, URLError
@@ -194,6 +196,42 @@ def _http_ready(port: int) -> bool:
         return False
 
 
+_IMPORT_RE = re.compile(r"(?:from|import)\s*[\(]?\s*[\"']([^\"']+)")
+
+
+def _check_frontend_module_graph(port: int) -> list[str]:
+    """Verify browser-loaded ES modules are actually served by the backend."""
+
+    pending = ["/app.js"]
+    seen: set[str] = set()
+    errors: list[str] = []
+    while pending:
+        path = pending.pop()
+        if path in seen or not path.startswith("/"):
+            continue
+        seen.add(path)
+        try:
+            with urlopen(f"http://127.0.0.1:{port}{path}", timeout=3) as response:
+                if response.status >= 400:
+                    errors.append(f"frontend module {path} returned HTTP {response.status}")
+                    continue
+                body = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            errors.append(f"frontend module {path} returned HTTP {exc.code}")
+            continue
+        except (URLError, TimeoutError, OSError) as exc:
+            errors.append(f"frontend module {path} could not be fetched: {exc}")
+            continue
+        parent = path.rsplit("/", 1)[0]
+        for imported in _IMPORT_RE.findall(body):
+            if imported.startswith("."):
+                resolved = posixpath.normpath(posixpath.join(parent, imported))
+                if not resolved.startswith("/"):
+                    resolved = "/" + resolved
+                pending.append(resolved)
+    return errors
+
+
 def rehearse_web_app(output_dir: Path, smoke_port: int) -> None:
     """Run the same build/start sequence as the grader on a safe smoke port."""
 
@@ -239,6 +277,11 @@ def rehearse_web_app(output_dir: Path, smoke_port: int) -> None:
                         f"backend npm start exited early with code {process.returncode}:\n{output}"
                     )
                 if _http_ready(smoke_port):
+                    module_errors = _check_frontend_module_graph(smoke_port)
+                    if module_errors:
+                        raise PostflightError(
+                            "frontend module graph failed:\n- " + "\n- ".join(module_errors)
+                        )
                     return
                 time.sleep(1)
             log_file.seek(0)

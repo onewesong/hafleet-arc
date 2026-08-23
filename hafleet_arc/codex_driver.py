@@ -24,13 +24,15 @@ The architecture document must cover frontend views/components/state/router,
 backend routes/services/repositories/middleware, API boundaries, data model and
 persistence, validation, permissions, testing, and the module ownership map. Keep
 frontend and backend business logic modular: use directories such as
-frontend/src/api, components, views, state, router and backend/routes, services,
+frontend/src/client, components, views, state, router and backend/routes, services,
 repositories, middleware, data. Keep entrypoints thin and do not put the whole
 application in frontend/src/app.js or backend/server.js. Preserve existing working
 behavior when refactoring an existing workspace. For web tasks, leave a runnable
 frontend/backend skeleton with the required npm scripts and PORT handling. Do not
 implement all requirement scenarios during this turn and do not start a long-running
-server.
+server. Do not place browser-loaded frontend modules under a top-level `api/` path:
+the backend reserves `/api/*` for JSON endpoints, so frontend client modules must use
+paths such as `frontend/src/client/` or `frontend/src/services/`.
 """,
     "planner": """
 You are the planning agent in a finite HAFleet run. Analyze the supplied requirement
