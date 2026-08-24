@@ -118,6 +118,43 @@ class DashboardTests(unittest.TestCase):
             finally:
                 server.stop()
 
+    def test_architect_stays_done_after_pipeline_moves_to_feature_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            arc = root / ".arc"
+            arc.mkdir()
+            (arc / "checkpoint.json").write_text(
+                json.dumps(
+                    {
+                        "architecture_completed": True,
+                        "current_node_id": "REQ-1",
+                        "current_phase": "implement",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (arc / "runner-events.jsonl").write_text(
+                json.dumps({"type": "runner_state", "state": "running"})
+                + "\n"
+                + json.dumps(
+                    {
+                        "type": "requirement_state",
+                        "node_id": "REQ-1",
+                        "phase": "implement",
+                        "status": "running",
+                        "message": "HAFleet implementer started",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            characters = DashboardCollector(root).state()["characters"]
+            by_id = {item["id"]: item for item in characters}
+            self.assertEqual(by_id["architect"]["status"], "success")
+            self.assertEqual(by_id["architect"]["message"], "Architecture scaffold completed")
+            self.assertEqual(by_id["planner"]["status"], "success")
+            self.assertEqual(by_id["implementer"]["status"], "working")
+
 
 if __name__ == "__main__":
     unittest.main()

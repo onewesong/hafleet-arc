@@ -275,8 +275,16 @@ class DashboardCollector:
 
     @staticmethod
     def _status_for_character(
-        runner_state: str, module: dict[str, Any] | None, checkpoint: dict[str, Any]
+        role: str,
+        runner_state: str,
+        module: dict[str, Any] | None,
+        checkpoint: dict[str, Any],
     ) -> str:
+        # Architecture is a one-time global phase and does not have a
+        # requirement_state event.  Its completion is therefore represented
+        # by the checkpoint rather than by the currently active module.
+        if role == "architect" and checkpoint.get("architecture_completed"):
+            return "success"
         if module:
             status = str(module.get("status") or "")
             if status == "running":
@@ -293,6 +301,37 @@ class DashboardCollector:
             return "paused"
         if runner_state == "completed":
             return "success"
+        return "idle"
+
+    @classmethod
+    def _pipeline_status(
+        cls,
+        role: str,
+        runner_state: str,
+        module: dict[str, Any] | None,
+        checkpoint: dict[str, Any],
+    ) -> str:
+        """Map the current pipeline phase to every role's visible status.
+
+        A planner has no current ``design`` event once implementation starts,
+        but it should remain visibly complete.  The same applies to the
+        implementer once review starts.  This keeps the room representing the
+        whole pipeline instead of only the latest requirement event.
+        """
+        direct = cls._status_for_character(role, runner_state, module, checkpoint)
+        if direct in {"failed", "paused"}:
+            return direct
+        if role == "architect":
+            return direct
+
+        phase = str(checkpoint.get("current_phase") or (module or {}).get("phase") or "")
+        phases = {"design": 1, "implement": 2, "review": 3, "postflight": 4, "completed": 5}
+        current_rank = phases.get(phase, 0)
+        role_rank = {"planner": 1, "implementer": 2, "reviewer": 3, "postflight": 4}.get(role, 0)
+        if runner_state == "completed" or current_rank > role_rank:
+            return "success"
+        if current_rank == role_rank:
+            return "working" if direct in {"working", "idle"} else direct
         return "idle"
 
     def _characters(
@@ -325,16 +364,23 @@ class DashboardCollector:
                 snapshot["branch"] = worktree["branch"]
             if worktree.get("path"):
                 snapshot["path"] = worktree["path"]
+            status = self._pipeline_status(role, str(runner.get("state") or ""), module, checkpoint)
+            message = (module or {}).get("message") or ""
+            if not message and role == "architect" and checkpoint.get("architecture_completed"):
+                message = "Architecture scaffold completed"
+            if not message and status == "success":
+                message = f"{label} completed"
+            message = message or "Waiting for work"
             characters.append(
                 {
                     "id": role,
                     "label": label,
-                    "status": self._status_for_character(str(runner.get("state") or ""), module, checkpoint),
+                    "status": status,
                     "phase": phase,
                     "module_id": module_id,
                     "session_id": session.get("id", ""),
                     "workspace": workspace,
-                    "message": (module or {}).get("message") or "Waiting for work",
+                    "message": message,
                     "started_at": session.get("started_at", ""),
                     "updated_at": session.get("updated_at") or (module or {}).get("timestamp", ""),
                     "files_changed": snapshot.get("files_changed", []),
