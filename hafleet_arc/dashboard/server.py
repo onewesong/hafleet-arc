@@ -76,10 +76,10 @@ def _module_id_from_text(text: str) -> str:
 
 def _git_snapshot(workspace: str) -> dict[str, Any]:
     if not workspace:
-        return {"branch": "", "path": "", "files_changed": [], "diff_stat": ""}
+        return {"branch": "", "path": "", "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": ""}
     path = Path(workspace).resolve()
     if not path.is_dir():
-        return {"branch": "", "path": workspace, "files_changed": [], "diff_stat": ""}
+        return {"branch": "", "path": workspace, "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": ""}
 
     def run(args: list[str]) -> str:
         try:
@@ -97,11 +97,18 @@ def _git_snapshot(workspace: str) -> dict[str, Any]:
             return ""
 
     status = run(["status", "--short"])
+    # Keep the dashboard read-only and bounded even when an agent generated a
+    # very large patch.  The recent commit diff covers changes that were
+    # already checkpointed and are therefore no longer in the working tree.
+    diff = run(["diff", "--no-ext-diff", "--unified=3"])
+    commit_diff = run(["diff", "HEAD~1", "HEAD", "--no-ext-diff", "--unified=3"])
     return {
         "branch": run(["branch", "--show-current"]),
         "path": str(path),
         "files_changed": status.splitlines()[:200],
         "diff_stat": run(["diff", "--stat"]),
+        "diff": diff[:120000],
+        "commit_diff": commit_diff[:120000],
     }
 
 
@@ -386,6 +393,8 @@ class DashboardCollector:
                     "files_changed": snapshot.get("files_changed", []),
                     "worktree": {"branch": snapshot.get("branch", ""), "path": snapshot.get("path", "")},
                     "diff_stat": snapshot.get("diff_stat", ""),
+                    "diff": snapshot.get("diff", ""),
+                    "commit_diff": snapshot.get("commit_diff", ""),
                     "errors": session.get("errors", []),
                     "tasks": tasks_by_phase.get(phase, []),
                 }

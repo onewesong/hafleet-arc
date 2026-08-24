@@ -103,6 +103,8 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(any(message["role"] == "tool" for message in detail["messages"]))
             self.assertTrue(any(message["content"] == "Inspecting files." for message in detail["messages"]))
             self.assertEqual(detail["module_id"], "REQ-1")
+            self.assertIn("diff", detail)
+            self.assertIn("commit_diff", detail)
 
     def test_server_exposes_state_and_session_detail(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

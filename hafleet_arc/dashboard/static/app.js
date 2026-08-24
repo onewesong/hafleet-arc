@@ -63,7 +63,10 @@ async function openCharacter(role) {
   if (item.session_id) { try { const response = await fetch(`/api/sessions/${encodeURIComponent(item.session_id)}`); if (response.ok) detail = { ...item, ...(await response.json()) }; } catch {} }
   document.querySelector("#drawer-kicker").textContent = `${labels[role]} · ${item.phase || "idle"}`;
   document.querySelector("#drawer-title").textContent = `${labels[role]} detail`;
-  document.querySelector("#drawer-body").innerHTML = `${detailRows(detail)}<section class="drawer-section"><h3>Latest event</h3><p>${esc(item.message || "Waiting for work")}</p></section><section class="drawer-section"><h3>Files</h3><pre>${esc((detail.files_changed || []).join("\n") || detail.diff_stat || "No uncommitted file changes")}</pre></section><section class="drawer-section"><h3>Conversation</h3>${(detail.messages || []).length ? conversationMessages(detail.messages) : `<p class="subtle">${session ? "Session has no renderable messages yet." : "No session is associated with this worker yet."}</p>`}</section>`;
+  const workingDiff = detail.diff || "";
+  const commitDiff = detail.commit_diff || "";
+  const diffBlock = (title, content, empty) => content ? `<details class="diff-block"><summary>${title}</summary><pre>${esc(content)}</pre></details>` : `<p class="subtle">${empty}</p>`;
+  document.querySelector("#drawer-body").innerHTML = `${detailRows(detail)}<section class="drawer-section"><h3>Latest event</h3><p>${esc(item.message || "Waiting for work")}</p></section><section class="drawer-section"><h3>Files changed</h3><pre>${esc((detail.files_changed || []).join("\n") || detail.diff_stat || "No uncommitted file changes")}</pre>${detail.diff_stat ? `<p class="subtle">${esc(detail.diff_stat)}</p>` : ""}${diffBlock("Working tree diff", workingDiff, "No uncommitted diff")}${diffBlock("Latest commit diff", commitDiff, "No recent commit diff")}</section><section class="drawer-section"><h3>Conversation</h3>${(detail.messages || []).length ? conversationMessages(detail.messages) : `<p class="subtle">${session ? "Session has no renderable messages yet." : "No session is associated with this worker yet."}</p>`}</section>`;
   document.querySelectorAll("#drawer-body .message").forEach((message) => {
     const toggle = () => {
       const expanded = message.classList.toggle("expanded");
