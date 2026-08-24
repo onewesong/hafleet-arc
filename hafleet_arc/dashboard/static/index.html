@@ -3,19 +3,28 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>HAFleet Run Dashboard</title>
+    <title>HAFleet Software Factory</title>
     <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/avatars.css" />
   </head>
   <body>
-    <header><div><p class="eyebrow">HAFLEET ARC</p><h1>Run dashboard</h1></div><div id="runner" class="pill">Loading…</div></header>
+    <header class="topbar">
+      <div><p class="eyebrow">HAFLEET ARC · SOFTWARE FACTORY</p><h1>Run control room</h1><p id="run-message" class="subtle">Loading factory state…</p></div>
+      <div class="topbar-status"><div id="runner" class="pill">Loading…</div><span id="updated" class="subtle"></span></div>
+    </header>
     <main>
-      <section class="pipeline" id="pipeline"></section>
-      <section class="layout">
-        <div class="card"><div class="card-head"><h2>Modules</h2><span id="updated"></span></div><div id="modules"></div></div>
-        <div class="card"><div class="card-head"><h2>Codex sessions</h2><span id="session-count"></span></div><div id="sessions"></div></div>
+      <section class="factory-shell" aria-label="Software factory room">
+        <div class="room-header"><div><span class="room-light"></span><strong>HAFleet Factory Floor</strong></div><span id="session-count" class="subtle"></span></div>
+        <div id="room" class="room"></div>
+        <div id="pipeline" class="pipeline-strip"></div>
       </section>
-      <section class="card detail"><div class="card-head"><h2 id="detail-title">Select a session</h2><button id="close" hidden>Close</button></div><div id="detail-body" class="conversation">Click a session to inspect its conversation.</div></section>
+      <section class="bottom-grid">
+        <div class="card"><div class="card-head"><h2>Module board</h2><span id="module-count" class="subtle"></span></div><div id="modules"></div></div>
+        <div class="card"><div class="card-head"><h2>Recent factory events</h2></div><div id="events" class="event-list"></div></div>
+      </section>
     </main>
+    <aside id="drawer" class="drawer" aria-hidden="true"><div class="drawer-head"><div><p id="drawer-kicker" class="eyebrow">ROLE DETAIL</p><h2 id="drawer-title">Select a worker</h2></div><button id="close" class="icon-button" aria-label="Close">×</button></div><div id="drawer-body" class="drawer-body"></div></aside>
+    <div id="backdrop" class="backdrop" hidden></div>
     <script type="module" src="/app.js"></script>
   </body>
 </html>

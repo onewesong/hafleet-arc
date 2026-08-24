@@ -50,6 +50,18 @@ class DashboardTests(unittest.TestCase):
                 + "\n"
                 + json.dumps(
                     {
+                        "timestamp": "2026-01-01T00:00:00.250Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "developer",
+                            "content": [{"text": "Module: 1/2 - REQ-1 - Demo"}],
+                        },
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
                         "timestamp": "2026-01-01T00:00:00.500Z",
                         "type": "event_msg",
                         "payload": {"type": "agent_message", "message": "Inspecting files."},
@@ -83,12 +95,14 @@ class DashboardTests(unittest.TestCase):
             state = collector.state()
             self.assertEqual(state["runner"]["state"], "running")
             self.assertEqual(state["modules"][0]["node_id"], "REQ-1")
+            self.assertEqual(state["characters"][2]["module_id"], "REQ-1")
             self.assertEqual(state["sessions"][0]["role"], "implementer")
             detail = collector.session("session-1")
             self.assertIsNotNone(detail)
             self.assertTrue(any("Implemented" in message["content"] for message in detail["messages"]))
             self.assertTrue(any(message["role"] == "tool" for message in detail["messages"]))
             self.assertTrue(any(message["content"] == "Inspecting files." for message in detail["messages"]))
+            self.assertEqual(detail["module_id"], "REQ-1")
 
     def test_server_exposes_state_and_session_detail(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -100,7 +114,7 @@ class DashboardTests(unittest.TestCase):
                     state = json.loads(response.read())
                 self.assertEqual(state["output_dir"], str(root.resolve()))
                 with urlopen(f"http://127.0.0.1:{port}/") as response:
-                    self.assertIn(b"HAFleet Run Dashboard", response.read())
+                    self.assertIn(b"HAFleet Factory Floor", response.read())
             finally:
                 server.stop()
 

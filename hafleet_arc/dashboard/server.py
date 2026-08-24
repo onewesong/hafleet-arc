@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +16,20 @@ ROLE_PATTERNS = {
     "planner": re.compile(r"planning agent", re.IGNORECASE),
     "implementer": re.compile(r"implementation agent", re.IGNORECASE),
     "reviewer": re.compile(r"reviewer and repair agent|reviewer", re.IGNORECASE),
+}
+ROLE_LABELS = {
+    "architect": "Architect",
+    "planner": "Planner",
+    "implementer": "Implementer",
+    "reviewer": "Reviewer",
+    "postflight": "Postflight",
+}
+ROLE_PHASES = {
+    "architect": "architecture",
+    "planner": "design",
+    "implementer": "implement",
+    "reviewer": "review",
+    "postflight": "postflight",
 }
 
 
@@ -49,6 +64,45 @@ def _classify_role(text: str) -> str:
         if pattern.search(text):
             return role
     return "unknown"
+
+
+def _module_id_from_text(text: str) -> str:
+    match = re.search(r"Module:\s*[^\n]*?\s-\s([A-Za-z0-9._-]+)", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"(?:worktrees|worktree)[/\\]([A-Za-z0-9._-]+)", text, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _git_snapshot(workspace: str) -> dict[str, Any]:
+    if not workspace:
+        return {"branch": "", "path": "", "files_changed": [], "diff_stat": ""}
+    path = Path(workspace).resolve()
+    if not path.is_dir():
+        return {"branch": "", "path": workspace, "files_changed": [], "diff_stat": ""}
+
+    def run(args: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(path), *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=3,
+                check=False,
+            )
+            return result.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    status = run(["status", "--short"])
+    return {
+        "branch": run(["branch", "--show-current"]),
+        "path": str(path),
+        "files_changed": status.splitlines()[:200],
+        "diff_stat": run(["diff", "--stat"]),
+    }
 
 
 class DashboardCollector:
@@ -87,6 +141,8 @@ class DashboardCollector:
         cwd = ""
         model = ""
         started_at = ""
+        module_id = ""
+        updated_at = ""
         messages: list[dict[str, Any]] = []
         try:
             with path.open(encoding="utf-8", errors="replace") as stream:
@@ -96,6 +152,8 @@ class DashboardCollector:
                     except json.JSONDecodeError:
                         continue
                     timestamp = str(item.get("timestamp", ""))
+                    if timestamp:
+                        updated_at = timestamp
                     payload = item.get("payload") if isinstance(item, dict) else {}
                     if item.get("type") == "session_meta" and isinstance(payload, dict):
                         session_id = str(payload.get("session_id") or payload.get("id") or session_id)
@@ -103,16 +161,21 @@ class DashboardCollector:
                         model = str(payload.get("model_provider") or "")
                         started_at = timestamp
                         role = _classify_role(_text_content(payload.get("base_instructions")))
+                        module_id = _module_id_from_text(_text_content(payload.get("base_instructions")))
                     if isinstance(payload, dict) and item.get("type") == "response_item" and payload.get("type") == "message":
                         message_text = _text_content(payload.get("content"))
                         if payload.get("role") == "developer":
                             detected_role = _classify_role(message_text)
                             if detected_role != "unknown":
                                 role = detected_role
+                            module_id = module_id or _module_id_from_text(message_text)
+                    if isinstance(payload, dict) and item.get("type") == "event_msg" and payload.get("type") == "user_message":
+                        module_id = module_id or _module_id_from_text(_text_content(payload.get("message")))
                     if not detail or not isinstance(payload, dict):
                         continue
                     if item.get("type") == "response_item" and payload.get("type") == "message":
                         content = _text_content(payload.get("content"))
+                        module_id = module_id or _module_id_from_text(content)
                         if content.strip():
                             messages.append(
                                 {
@@ -126,6 +189,7 @@ class DashboardCollector:
                         "agent_message",
                     }:
                         content = _text_content(payload.get("message"))
+                        module_id = module_id or _module_id_from_text(content)
                         if content.strip():
                             messages.append(
                                 {
@@ -174,11 +238,22 @@ class DashboardCollector:
             "role": role,
             "cwd": cwd,
             "model": model,
+            "module_id": module_id,
             "started_at": started_at,
+            "updated_at": updated_at,
+            "workspace": cwd,
             "size": path.stat().st_size if path.exists() else 0,
         }
         if detail:
             result["messages"] = messages[-3000:]
+            snapshot = _git_snapshot(cwd)
+            result.update(snapshot)
+            result["errors"] = [
+                message
+                for message in messages
+                if message.get("role") == "system"
+                or re.search(r"\b(error|failed|failure|conflict|timeout)\b", str(message.get("content", "")), re.IGNORECASE)
+            ][-20:]
         return result
 
     def _module_states(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -193,13 +268,90 @@ class DashboardCollector:
                     "phase": event.get("phase"),
                     "status": event.get("status"),
                     "timestamp": event.get("timestamp"),
-                    "message": event.get("message"),
-                }
+                "message": event.get("message"),
+                "character": next((role for role, phase in ROLE_PHASES.items() if phase == event.get("phase")), ""),
+            }
         return list(latest.values())
+
+    @staticmethod
+    def _status_for_character(
+        runner_state: str, module: dict[str, Any] | None, checkpoint: dict[str, Any]
+    ) -> str:
+        if module:
+            status = str(module.get("status") or "")
+            if status == "running":
+                return "working"
+            if status in {"failed", "error"}:
+                return "failed"
+            if status in {"paused", "waiting"}:
+                return "paused"
+            if status == "completed":
+                return "success"
+        if runner_state in {"failed", "error"}:
+            return "failed"
+        if runner_state == "paused":
+            return "paused"
+        if runner_state == "completed":
+            return "success"
+        return "idle"
+
+    def _characters(
+        self,
+        sessions: list[dict[str, Any]],
+        modules: list[dict[str, Any]],
+        runner: dict[str, Any],
+        checkpoint: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        by_phase = {str(item.get("phase")): item for item in modules}
+        tasks_by_phase: dict[str, list[dict[str, Any]]] = {}
+        for module in modules:
+            tasks_by_phase.setdefault(str(module.get("phase") or ""), []).append(module)
+        by_role: dict[str, dict[str, Any]] = {}
+        for item in sessions:
+            role = str(item.get("role") or "")
+            if role in ROLE_LABELS:
+                by_role[role] = item
+        active = checkpoint.get("active_worktrees") or {}
+        characters: list[dict[str, Any]] = []
+        for role, label in ROLE_LABELS.items():
+            session = by_role.get(role, {})
+            phase = ROLE_PHASES[role]
+            module = by_phase.get(phase)
+            module_id = str(session.get("module_id") or (module or {}).get("node_id") or "")
+            worktree = dict(active.get(module_id) or {})
+            workspace = str(session.get("workspace") or worktree.get("path") or "")
+            snapshot = _git_snapshot(workspace) if workspace else {"branch": "", "path": "", "files_changed": [], "diff_stat": ""}
+            if worktree.get("branch"):
+                snapshot["branch"] = worktree["branch"]
+            if worktree.get("path"):
+                snapshot["path"] = worktree["path"]
+            characters.append(
+                {
+                    "id": role,
+                    "label": label,
+                    "status": self._status_for_character(str(runner.get("state") or ""), module, checkpoint),
+                    "phase": phase,
+                    "module_id": module_id,
+                    "session_id": session.get("id", ""),
+                    "workspace": workspace,
+                    "message": (module or {}).get("message") or "Waiting for work",
+                    "started_at": session.get("started_at", ""),
+                    "updated_at": session.get("updated_at") or (module or {}).get("timestamp", ""),
+                    "files_changed": snapshot.get("files_changed", []),
+                    "worktree": {"branch": snapshot.get("branch", ""), "path": snapshot.get("path", "")},
+                    "diff_stat": snapshot.get("diff_stat", ""),
+                    "errors": session.get("errors", []),
+                    "tasks": tasks_by_phase.get(phase, []),
+                }
+            )
+        return characters
 
     def state(self) -> dict[str, Any]:
         events = self._events()
         runner = next((item for item in reversed(events) if item.get("type") == "runner_state"), {})
+        checkpoint = _read_json(self.checkpoint_path, {})
+        modules = self._module_states(events)
+        sessions = [self._parse_session(path) for path in self._session_files()]
         return {
             "output_dir": str(self.output_dir),
             "runner": {
@@ -207,10 +359,11 @@ class DashboardCollector:
                 "timestamp": runner.get("timestamp"),
                 "message": runner.get("message"),
             },
-            "checkpoint": _read_json(self.checkpoint_path, {}),
-            "modules": self._module_states(events),
+            "checkpoint": checkpoint,
+            "modules": modules,
             "events": events[-200:],
-            "sessions": [self._parse_session(path) for path in self._session_files()],
+            "sessions": sessions,
+            "characters": self._characters(sessions, modules, runner, checkpoint),
             "generated_at": datetime.now().astimezone().isoformat(),
         }
 
@@ -270,6 +423,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             content_type = "text/javascript; charset=utf-8"
         elif target.suffix == ".css":
             content_type = "text/css; charset=utf-8"
+        elif target.suffix == ".svg":
+            content_type = "image/svg+xml"
         self._send(200, target.read_bytes(), content_type)
 
     def log_message(self, _format: str, *_args: Any) -> None:

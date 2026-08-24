@@ -1,0 +1,21 @@
+.character-art {
+  width: 104px;
+  height: 96px;
+  display: block;
+  object-fit: contain;
+  margin: 0 auto 0;
+  filter: drop-shadow(0 8px 5px #08132688);
+}
+
+.worker-tag {
+  position: relative;
+  z-index: 2;
+}
+
+.working .character-art {
+  animation: bob 1.5s ease-in-out infinite;
+}
+
+.failed .character-art {
+  filter: grayscale(.35) saturate(1.3) drop-shadow(0 8px 5px #08132688);
+}
