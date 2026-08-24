@@ -23,13 +23,46 @@ class FakeCodex:
     def __init__(self, outcomes: list[object]) -> None:
         self.outcomes = list(outcomes)
         self.starts = 0
+        self.start_kwargs: list[dict[str, object]] = []
 
-    def thread_start(self, **_kwargs):
+    def thread_start(self, **kwargs):
         self.starts += 1
+        self.start_kwargs.append(kwargs)
         return FakeThread(self.outcomes.pop(0))
 
 
 class CodexFleetRetryTests(unittest.TestCase):
+    def test_role_model_overrides_global_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fleet = CodexFleet(Path(temporary))
+            codex = FakeCodex([SimpleNamespace(error=None, final_response="architect")])
+            fleet._codex = codex
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "MODEL": "global-model",
+                    "HAFLEET_ARCHITECT_MODEL": "architect-model",
+                },
+                clear=False,
+            ):
+                fleet.run("architect", "design")
+
+            self.assertEqual(codex.start_kwargs[0]["model"], "architect-model")
+
+    def test_role_model_falls_back_to_global_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fleet = CodexFleet(Path(temporary))
+            codex = FakeCodex([SimpleNamespace(error=None, final_response="planner")])
+            fleet._codex = codex
+            with mock.patch.dict(
+                "os.environ",
+                {"MODEL": "global-model", "HAFLEET_PLANNER_MODEL": ""},
+                clear=False,
+            ):
+                fleet.run("planner", "plan")
+
+            self.assertEqual(codex.start_kwargs[0]["model"], "global-model")
+
     def test_workspace_dir_uses_distinct_codex_threads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

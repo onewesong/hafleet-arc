@@ -135,6 +135,13 @@ class CodexFleet:
         self._threads: dict[tuple[str, str], Any] = {}
         self._thread_lock = threading.Lock()
 
+    @staticmethod
+    def _model_for_role(role: str) -> str | None:
+        """Resolve a role-specific model, falling back to the global MODEL."""
+
+        role_model = os.environ.get(f"HAFLEET_{role.upper()}_MODEL", "").strip()
+        return role_model or os.environ.get("MODEL", "").strip() or None
+
     def __enter__(self) -> Self:
         try:
             from openai_codex import Codex, CodexConfig
@@ -188,7 +195,7 @@ class CodexFleet:
             if self.skills_dir
             else ""
         )
-        model = os.environ.get("MODEL", "").strip() or None
+        model = self._model_for_role(role)
         delivery_note = ""
         if self.task_type == "web":
             delivery_note = f"""

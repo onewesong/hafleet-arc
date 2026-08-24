@@ -76,7 +76,8 @@ ROOT requirement tree, writes `.arc/hafleet/architecture.md`, and creates or ref
 a modular project scaffold. Its checkpoint is `ROOT: architecture scaffold`, and the
 `architecture_completed` flag makes the phase resumable without repeating it.
 
-架构完成后也可以开启并行 worktree 模式，为相互独立的 ROOT 模块分别派发 agent：
+After the architecture scaffold is complete, independent ROOT modules can also be
+dispatched to separate worktrees:
 
 ```bash
 python3 main.py /path/to/requirements \
@@ -86,10 +87,11 @@ python3 main.py /path/to/requirements \
   --max-workers 2
 ```
 
-并行模式默认关闭，也可以通过 `HAFLEET_PARALLEL=1` 和
-`HAFLEET_MAX_WORKERS=2` 开启。每个模块在独立 worktree 中完成 planner、
-implementer、reviewer 后，主工作区按依赖顺序 cherry-pick；成功 worktree 会清理，
-失败或冲突 worktree 会保留在 `.arc/hafleet/worktrees/`。
+Parallel mode is disabled by default. It can also be enabled with
+`HAFLEET_PARALLEL=1` and `HAFLEET_MAX_WORKERS=2`. Each module runs its planner,
+implementer, and reviewer in an isolated worktree; the main workspace cherry-picks
+modules in dependency order. Successful worktrees are removed, while failed or
+conflicted worktrees remain under `.arc/hafleet/worktrees/`.
 
 ### 3. Build the module execution plan
 
@@ -194,6 +196,22 @@ foreign listener on a shared runner.
 | `HAFLEET_POSTFLIGHT` | `1` | Enable the mandatory delivery rehearsal |
 | `HAFLEET_PARALLEL` | `0` | Enable independent ROOT module worktrees |
 | `HAFLEET_MAX_WORKERS` | `2` | Maximum concurrent parallel module worktrees |
+
+Codex roles use the global `MODEL` environment variable by default. Each role can
+override it with a role-specific variable, which takes precedence over `MODEL`:
+
+```bash
+export MODEL=gpt-5.6-terra
+export HAFLEET_ARCHITECT_MODEL=gpt-5.6-sol
+export HAFLEET_PLANNER_MODEL=gpt-5.6-sol
+export HAFLEET_IMPLEMENTER_MODEL=gpt-5.6-terra
+export HAFLEET_REVIEWER_MODEL=gpt-5.6-terra
+```
+
+Supported variables are `HAFLEET_ARCHITECT_MODEL`, `HAFLEET_PLANNER_MODEL`,
+`HAFLEET_IMPLEMENTER_MODEL`, and `HAFLEET_REVIEWER_MODEL`. If a role-specific
+variable is unset or empty, the role falls back to `MODEL`; if neither is set, the
+Codex SDK selects its default model.
 
 `HAFLEET_FINAL_REVIEW=0` skips the optional model review but still runs the
 deterministic postflight. `HAFLEET_POSTFLIGHT=0` is intended only for cheap
