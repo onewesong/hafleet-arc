@@ -71,6 +71,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=int(os.environ.get("HAFLEET_MAX_WORKERS", "2")),
         help="Maximum concurrent module worktrees in parallel mode.",
     )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        default=os.environ.get("HAFLEET_DASHBOARD", "0").strip().lower() in {"1", "true", "yes"},
+        help="Start the optional local HAFleet run dashboard.",
+    )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=int(os.environ.get("HAFLEET_DASHBOARD_PORT", "3200")),
+        help="Port for the optional local HAFleet run dashboard.",
+    )
     return parser.parse_args(argv)
 
 
@@ -102,6 +114,10 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("web and smoke ports must be positive")
     if args.max_workers < 1:
         raise ValueError("max-workers must be at least 1")
+    if args.dashboard_port <= 0:
+        raise ValueError("dashboard port must be positive")
+    if args.dashboard and args.dashboard_port in {args.web_port, args.smoke_port}:
+        raise ValueError("dashboard port must differ from web and smoke ports")
     if args.task_type == "web" and args.web_port == args.smoke_port:
         raise ValueError("smoke port must differ from the ARC-Bench grading port")
 
@@ -122,6 +138,13 @@ def main(argv: list[str] | None = None) -> int:
         "runtime initialized; entering architect/planner/implementer/reviewer pipeline "
         f"(parallel={args.parallel}, max_workers={args.max_workers})"
     )
+
+    dashboard = None
+    if args.dashboard:
+        from hafleet_arc.dashboard import DashboardServer
+
+        dashboard = DashboardServer(output_dir, port=args.dashboard_port).start()
+        _console(f"dashboard enabled: http://127.0.0.1:{args.dashboard_port}")
 
     skills_dir = agent_root / "skills"
     try:
@@ -149,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
                 parallel=args.parallel,
                 max_workers=args.max_workers,
             ).run(modules)
+        runtime.events.mark_run_completed("HAFleet ARC completed")
+        _console(f"completed successfully in {time.monotonic() - started_at:.1f}s")
     except PauseRequested as exc:
         runtime.events.mark_run_paused(str(exc))
         _console(f"paused: {exc}")
@@ -157,9 +182,9 @@ def main(argv: list[str] | None = None) -> int:
         runtime.events.mark_run_failed(str(exc))
         _console(f"FAILED after {time.monotonic() - started_at:.1f}s: {exc}")
         raise
-
-    runtime.events.mark_run_completed("HAFleet ARC completed")
-    _console(f"completed successfully in {time.monotonic() - started_at:.1f}s")
+    finally:
+        if dashboard is not None:
+            dashboard.stop()
     return 0
 
 

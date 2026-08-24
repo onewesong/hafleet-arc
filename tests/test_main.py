@@ -82,6 +82,11 @@ class EntrypointSmokeTests(unittest.TestCase):
         self.assertTrue(args.parallel)
         self.assertEqual(args.max_workers, 3)
 
+    def test_dashboard_arguments_are_parsed(self) -> None:
+        args = entrypoint.parse_args(["requirements", "--dashboard", "--dashboard-port", "3210"])
+        self.assertTrue(args.dashboard)
+        self.assertEqual(args.dashboard_port, 3210)
+
     def test_arcbench_command_contract_runs_to_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

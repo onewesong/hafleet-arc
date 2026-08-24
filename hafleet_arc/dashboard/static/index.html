@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HAFleet Run Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header><div><p class="eyebrow">HAFLEET ARC</p><h1>Run dashboard</h1></div><div id="runner" class="pill">Loading…</div></header>
+    <main>
+      <section class="pipeline" id="pipeline"></section>
+      <section class="layout">
+        <div class="card"><div class="card-head"><h2>Modules</h2><span id="updated"></span></div><div id="modules"></div></div>
+        <div class="card"><div class="card-head"><h2>Codex sessions</h2><span id="session-count"></span></div><div id="sessions"></div></div>
+      </section>
+      <section class="card detail"><div class="card-head"><h2 id="detail-title">Select a session</h2><button id="close" hidden>Close</button></div><div id="detail-body" class="conversation">Click a session to inspect its conversation.</div></section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

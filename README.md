@@ -93,6 +93,32 @@ implementer, and reviewer in an isolated worktree; the main workspace cherry-pic
 modules in dependency order. Successful worktrees are removed, while failed or
 conflicted worktrees remain under `.arc/hafleet/worktrees/`.
 
+## Optional run dashboard
+
+The standalone local dashboard observes one output directory without changing the
+execution pipeline. It reads `runner-events.jsonl`, `checkpoint.json`, module plans,
+and Codex session JSONL files. Enable it explicitly with:
+
+```bash
+python3 main.py /path/to/requirements \
+  --output-dir /path/to/output \
+  --type web \
+  --dashboard \
+  --dashboard-port 3200
+```
+
+It is also configurable with `HAFLEET_DASHBOARD=1` and
+`HAFLEET_DASHBOARD_PORT=3200`. Open `http://127.0.0.1:3200` to see the pipeline,
+module state, Codex sessions, and clickable conversation details. The dashboard is
+bound to localhost and is disabled by default.
+
+To inspect an existing output directory after the run has finished, serve it as a
+standalone read-only dashboard:
+
+```bash
+PYTHONPATH=. python3 -m hafleet_arc.dashboard /path/to/output --port 3200
+```
+
 ### 3. Build the module execution plan
 
 Each direct child of `ROOT` becomes one module. Modules are processed in stable,
