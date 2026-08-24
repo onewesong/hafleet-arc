@@ -53,6 +53,9 @@ function render(data) {
 function characterById(id) { return (state.data?.characters || []).find((item) => item.id === id) || { id, label: labels[id], status: "idle", phase: "idle", message: "Waiting for work" }; }
 function sessionById(id) { return (state.data?.sessions || []).find((item) => item.id === id); }
 function detailRows(item) { return `<div class="detail-grid"><span>Status</span><strong class="status ${esc(item.status)}">${esc(statusText(item.status))}</strong><span>Phase</span><strong>${esc(item.phase)}</strong><span>Module</span><strong>${esc(item.module_id || "—")}</strong><span>Workspace</span><strong class="path">${esc(item.workspace || item.worktree?.path || "—")}</strong><span>Branch</span><strong>${esc(item.worktree?.branch || "—")}</strong><span>Changed files</span><strong>${(item.files_changed || []).length}</strong></div>`; }
+function conversationMessages(messages) {
+  return messages.map((message) => `<article class="message ${esc(message.role)}" tabindex="0" role="button" aria-expanded="false"><div class="message-meta"><strong>${esc(message.role)}</strong>${message.name ? ` · ${esc(message.name)}` : ""}<time>${esc(message.timestamp)}</time></div><pre>${esc(message.content)}</pre><span class="message-hint">Click to expand</span></article>`).join("");
+}
 
 async function openCharacter(role) {
   const item = characterById(role); const session = item.session_id ? sessionById(item.session_id) : null;
@@ -60,7 +63,17 @@ async function openCharacter(role) {
   if (item.session_id) { try { const response = await fetch(`/api/sessions/${encodeURIComponent(item.session_id)}`); if (response.ok) detail = { ...item, ...(await response.json()) }; } catch {} }
   document.querySelector("#drawer-kicker").textContent = `${labels[role]} · ${item.phase || "idle"}`;
   document.querySelector("#drawer-title").textContent = `${labels[role]} detail`;
-  document.querySelector("#drawer-body").innerHTML = `${detailRows(detail)}<section class="drawer-section"><h3>Latest event</h3><p>${esc(item.message || "Waiting for work")}</p></section><section class="drawer-section"><h3>Files</h3><pre>${esc((detail.files_changed || []).join("\n") || detail.diff_stat || "No uncommitted file changes")}</pre></section><section class="drawer-section"><h3>Conversation</h3>${(detail.messages || []).map((message) => `<article class="message ${esc(message.role)}"><div class="message-meta"><strong>${esc(message.role)}</strong>${message.name ? ` · ${esc(message.name)}` : ""}<time>${esc(message.timestamp)}</time></div><pre>${esc(message.content)}</pre></article>`).join("") || `<p class="subtle">${session ? "Session has no renderable messages yet." : "No session is associated with this worker yet."}</p>`}</section>`;
+  document.querySelector("#drawer-body").innerHTML = `${detailRows(detail)}<section class="drawer-section"><h3>Latest event</h3><p>${esc(item.message || "Waiting for work")}</p></section><section class="drawer-section"><h3>Files</h3><pre>${esc((detail.files_changed || []).join("\n") || detail.diff_stat || "No uncommitted file changes")}</pre></section><section class="drawer-section"><h3>Conversation</h3>${(detail.messages || []).length ? conversationMessages(detail.messages) : `<p class="subtle">${session ? "Session has no renderable messages yet." : "No session is associated with this worker yet."}</p>`}</section>`;
+  document.querySelectorAll("#drawer-body .message").forEach((message) => {
+    const toggle = () => {
+      const expanded = message.classList.toggle("expanded");
+      message.setAttribute("aria-expanded", String(expanded));
+    };
+    message.addEventListener("click", toggle);
+    message.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(); }
+    });
+  });
   document.querySelector("#drawer").classList.add("open"); document.querySelector("#drawer").setAttribute("aria-hidden", "false"); document.querySelector("#backdrop").hidden = false;
 }
 function closeDrawer() { document.querySelector("#drawer").classList.remove("open"); document.querySelector("#drawer").setAttribute("aria-hidden", "true"); document.querySelector("#backdrop").hidden = true; }
