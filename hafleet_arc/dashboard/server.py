@@ -281,6 +281,61 @@ class DashboardCollector:
         return list(latest.values())
 
     @staticmethod
+    def _module_tasks(
+        events: list[dict[str, Any]],
+        modules: list[dict[str, Any]],
+        checkpoint: dict[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Build role task cards from the full phase history, not only latest state.
+
+        A module's latest event becomes ``implement`` after review completes,
+        which otherwise makes its earlier planner/reviewer work disappear from
+        the corresponding workstation.
+        """
+        history: dict[str, dict[str, dict[str, Any]]] = {}
+        for event in events:
+            if event.get("type") != "requirement_state":
+                continue
+            node_id = str(event.get("node_id") or "")
+            phase = str(event.get("phase") or "")
+            if node_id and phase:
+                history.setdefault(node_id, {})[phase] = {
+                    "node_id": node_id,
+                    "phase": phase,
+                    "status": event.get("status"),
+                    "timestamp": event.get("timestamp"),
+                    "message": event.get("message"),
+                }
+        tasks: dict[str, list[dict[str, Any]]] = {role: [] for role in ROLE_LABELS}
+        current_node = str(checkpoint.get("current_node_id") or "")
+        current_phase = str(checkpoint.get("current_phase") or "")
+        for module in modules:
+            node_id = str(module.get("node_id") or "")
+            phases = history.get(node_id, {})
+            if "design" in phases:
+                tasks["planner"].append(dict(phases["design"]))
+            if "implement" in phases:
+                tasks["implementer"].append(dict(phases["implement"]))
+                if phases["implement"].get("status") == "completed":
+                    reviewer_task = dict(phases["implement"])
+                    reviewer_task["phase"] = "review"
+                    reviewer_task["message"] = "Reviewer completed"
+                    tasks["reviewer"].append(reviewer_task)
+            if node_id == current_node and current_phase == "review" and node_id not in {
+                str(item.get("node_id")) for item in tasks["reviewer"]
+            }:
+                tasks["reviewer"].append(
+                    {
+                        "node_id": node_id,
+                        "phase": "review",
+                        "status": "running",
+                        "timestamp": module.get("timestamp"),
+                        "message": "Reviewer started",
+                    }
+                )
+        return tasks
+
+    @staticmethod
     def _status_for_character(
         role: str,
         runner_state: str,
@@ -349,9 +404,7 @@ class DashboardCollector:
         checkpoint: dict[str, Any],
     ) -> list[dict[str, Any]]:
         by_phase = {str(item.get("phase")): item for item in modules}
-        tasks_by_phase: dict[str, list[dict[str, Any]]] = {}
-        for module in modules:
-            tasks_by_phase.setdefault(str(module.get("phase") or ""), []).append(module)
+        tasks_by_role = self._module_tasks(self._events(), modules, checkpoint)
         by_role: dict[str, dict[str, Any]] = {}
         for item in sessions:
             role = str(item.get("role") or "")
@@ -396,7 +449,7 @@ class DashboardCollector:
                     "diff": snapshot.get("diff", ""),
                     "commit_diff": snapshot.get("commit_diff", ""),
                     "errors": session.get("errors", []),
-                    "tasks": tasks_by_phase.get(phase, []),
+                    "tasks": tasks_by_role.get(role, []),
                 }
             )
         return characters

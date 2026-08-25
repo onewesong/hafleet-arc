@@ -150,6 +150,21 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('process.env.DASHBOARD_API_URL', vite_config)
         self.assertIn('process.env.VITE_PORT', vite_config)
 
+    def test_role_task_cards_keep_completed_module_history(self) -> None:
+        modules = [
+            {"node_id": "REQ-1", "phase": "implement", "status": "completed"},
+            {"node_id": "REQ-2", "phase": "implement", "status": "completed"},
+        ]
+        events = [
+            {"type": "requirement_state", "node_id": "REQ-1", "phase": "design", "status": "completed"},
+            {"type": "requirement_state", "node_id": "REQ-1", "phase": "implement", "status": "completed"},
+            {"type": "requirement_state", "node_id": "REQ-2", "phase": "design", "status": "completed"},
+            {"type": "requirement_state", "node_id": "REQ-2", "phase": "implement", "status": "completed"},
+        ]
+        tasks = DashboardCollector._module_tasks(events, modules, {})
+        self.assertEqual([item["node_id"] for item in tasks["planner"]], ["REQ-1", "REQ-2"])
+        self.assertEqual([item["node_id"] for item in tasks["reviewer"]], ["REQ-1", "REQ-2"])
+
     def test_architect_stays_done_after_pipeline_moves_to_feature_module(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
