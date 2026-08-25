@@ -34,3 +34,25 @@
 .diff-block { margin-top: 10px; border: 1px solid #2c405b; border-radius: 8px; background: #0b1423; }
 .diff-block summary { cursor: pointer; padding: 9px 11px; color: #b8d4f5; font-size: 12px; }
 .diff-block pre { max-height: 420px; overflow: auto; margin: 0; border-top: 1px solid #2c405b; white-space: pre; color: #dbe9f7; font: 11px/1.5 ui-monospace, monospace; padding: 12px; }
+.change-summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 10px; color: #8da1bd; font-size: 11px; }
+.change-summary span { padding: 5px 8px; border: 1px solid #2c405b; border-radius: 6px; background: #0b1423; }
+.change-summary b { color: #dbe9f7; margin-left: 3px; }
+.file-change-list { display: grid; gap: 7px; }
+.file-change { border: 1px solid #2c405b; border-radius: 8px; overflow: hidden; background: #0b1423; }
+.file-change.expanded { border-color: #70b8ff; }
+.file-change-trigger { width: 100%; display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; align-items: center; gap: 8px; padding: 9px 10px; border: 0; color: #edf4ff; background: transparent; text-align: left; cursor: pointer; }
+.file-change-trigger:hover, .file-change-trigger:focus-visible { background: #162942; outline: none; }
+.change-status { min-width: 62px; padding: 3px 5px; border-radius: 4px; color: #c5d7ed; background: #304761; font-size: 9px; text-align: center; text-transform: uppercase; letter-spacing: .04em; }
+.change-status.status-A, .change-status[data-status="??"] { color: #66e3a1; background: #174b3a; }
+.change-status.status-D { color: #ff9ca4; background: #542631; }
+.change-status.status-R { color: #c79cff; background: #3d2b58; }
+.file-change-main { min-width: 0; }
+.file-change-main strong, .file-change-main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-change-main strong { color: #dbe9f7; font: 11px ui-monospace, monospace; }
+.file-change-main small { margin-top: 3px; color: #7188a6; font-size: 9px; }
+.change-source { color: #8da1bd; font-size: 9px; white-space: nowrap; }
+.change-stat { color: #66e3a1; font: 10px ui-monospace, monospace; white-space: nowrap; }
+.change-stat em { color: #ff9ca4; font-style: normal; }
+.file-change-diff { border-top: 1px solid #2c405b; padding: 8px; }
+.file-change-diff pre { max-height: 360px; overflow: auto; margin: 0; padding: 10px; white-space: pre; word-break: normal; color: #dbe9f7; background: #07101d; font: 10px/1.5 ui-monospace, monospace; }
+.change-stat-summary { margin-top: 8px; font: 10px ui-monospace, monospace; }

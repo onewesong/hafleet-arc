@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,9 +10,35 @@ from urllib.request import urlopen
 
 from hafleet_arc.dashboard import DashboardServer
 from hafleet_arc.dashboard.server import DashboardCollector
+from hafleet_arc.dashboard.server import _git_snapshot
 
 
 class DashboardTests(unittest.TestCase):
+    def test_git_snapshot_exposes_file_level_worktree_and_commit_diffs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def git(*args: str) -> None:
+                subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+            git("init", "-q")
+            git("config", "user.email", "test@example.com")
+            git("config", "user.name", "Dashboard Test")
+            (root / "tracked.txt").write_text("before\n", encoding="utf-8")
+            git("add", "tracked.txt")
+            git("commit", "-qm", "initial")
+            (root / "tracked.txt").write_text("after\n", encoding="utf-8")
+            (root / "new.txt").write_text("new line\n", encoding="utf-8")
+            snapshot = _git_snapshot(str(root))
+            paths = {(item["source"], item["path"]): item for item in snapshot["file_changes"]}
+            self.assertIn(("working_tree", "tracked.txt"), paths)
+            self.assertIn(("working_tree", "new.txt"), paths)
+            self.assertIn("after", paths[("working_tree", "tracked.txt")]["diff"])
+            self.assertIn("new line", paths[("working_tree", "new.txt")]["diff"])
+            (root / "committed.txt").write_text("committed\n", encoding="utf-8")
+            git("add", "committed.txt")
+            git("commit", "-qm", "second")
+            committed = _git_snapshot(str(root))["file_changes"]
+            self.assertTrue(any(item["source"] == "latest_commit" and item["path"] == "committed.txt" for item in committed))
+
     def test_collector_reads_events_checkpoint_and_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -149,6 +176,12 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("127.0.0.1:3200", vite_config)
         self.assertIn('process.env.DASHBOARD_API_URL', vite_config)
         self.assertIn('process.env.VITE_PORT', vite_config)
+        app = (frontend / ".." / "static" / "app.js").resolve().read_text(encoding="utf-8")
+        styles = (frontend / ".." / "static" / "styles.css").resolve().read_text(encoding="utf-8")
+        self.assertIn("file_changes", app)
+        self.assertIn("file-change-trigger", app)
+        self.assertIn("file-change-diff", styles)
+        self.assertIn("conversation-message-", app)
 
     def test_role_task_cards_keep_completed_module_history(self) -> None:
         modules = [

@@ -76,10 +76,10 @@ def _module_id_from_text(text: str) -> str:
 
 def _git_snapshot(workspace: str) -> dict[str, Any]:
     if not workspace:
-        return {"branch": "", "path": "", "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": ""}
+        return {"branch": "", "path": "", "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": "", "file_changes": []}
     path = Path(workspace).resolve()
     if not path.is_dir():
-        return {"branch": "", "path": workspace, "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": ""}
+        return {"branch": "", "path": workspace, "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": "", "file_changes": []}
 
     def run(args: list[str]) -> str:
         try:
@@ -96,12 +96,85 @@ def _git_snapshot(workspace: str) -> dict[str, Any]:
         except (OSError, subprocess.TimeoutExpired):
             return ""
 
+    def file_diff(args: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(path), *args], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=3, check=False,
+            )
+            return result.stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    def parse_name_status(output: str) -> list[tuple[str, str, str]]:
+        records: list[tuple[str, str, str]] = []
+        for line in output.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            status = parts[0][:1] or "M"
+            if status == "R" and len(parts) >= 3:
+                records.append((status, parts[2], parts[1]))
+            else:
+                records.append((status, parts[-1], ""))
+        return records
+
+    def numstat(args: list[str]) -> tuple[int, int]:
+        command = list(args)
+        marker = command.index("--") if "--" in command else len(command)
+        command.insert(marker, "--numstat")
+        line = file_diff(command).splitlines()[:1]
+        if not line:
+            return 0, 0
+        fields = line[0].split("\t")
+        if len(fields) < 2 or fields[0] == "-" or fields[1] == "-":
+            return 0, 0
+        try:
+            return int(fields[0]), int(fields[1])
+        except ValueError:
+            return 0, 0
+
+    def build_file_changes(source: str, names: list[tuple[str, str, str]], base_args: list[str]) -> list[dict[str, Any]]:
+        changes: list[dict[str, Any]] = []
+        for status, file_path, old_path in names[:200]:
+            if not file_path:
+                continue
+            if source == "working_tree" and status == "?":
+                raw = file_diff(["diff", "--no-index", "--no-ext-diff", "--unified=3", "/dev/null", str(path / file_path)])
+                additions = sum(1 for line in raw.splitlines() if line.startswith("+") and not line.startswith("+++"))
+                deletions = 0
+                diff_text = raw
+            else:
+                scoped = base_args + ["--", file_path]
+                additions, deletions = numstat(scoped)
+                diff_text = file_diff(scoped)
+            changes.append({
+                "source": source,
+                "status": "??" if status == "?" else status,
+                "path": file_path,
+                "old_path": old_path,
+                "additions": additions,
+                "deletions": deletions,
+                "stat": f"+{additions} -{deletions}",
+                "diff": diff_text[:60000],
+            })
+        return changes
+
     status = run(["status", "--short"])
     # Keep the dashboard read-only and bounded even when an agent generated a
     # very large patch.  The recent commit diff covers changes that were
     # already checkpointed and are therefore no longer in the working tree.
-    diff = run(["diff", "--no-ext-diff", "--unified=3"])
+    diff = run(["diff", "HEAD", "--no-ext-diff", "--unified=3"])
     commit_diff = run(["diff", "HEAD~1", "HEAD", "--no-ext-diff", "--unified=3"])
+    working_names = parse_name_status(run(["diff", "HEAD", "--name-status", "-M"]))
+    untracked = []
+    for line in status.splitlines():
+        if line.startswith("??"):
+            untracked.append(("?", line[3:].lstrip(), ""))
+    working_names.extend(untracked)
+    commit_names = parse_name_status(run(["diff", "HEAD~1", "HEAD", "--name-status", "-M"]))
+    file_changes = build_file_changes("working_tree", working_names, ["diff", "HEAD", "--no-ext-diff", "--unified=3"])
+    file_changes += build_file_changes("latest_commit", commit_names, ["diff", "HEAD~1", "HEAD", "--no-ext-diff", "--unified=3"])
     return {
         "branch": run(["branch", "--show-current"]),
         "path": str(path),
@@ -109,6 +182,7 @@ def _git_snapshot(workspace: str) -> dict[str, Any]:
         "diff_stat": run(["diff", "--stat"]),
         "diff": diff[:120000],
         "commit_diff": commit_diff[:120000],
+        "file_changes": file_changes,
     }
 
 
@@ -419,7 +493,7 @@ class DashboardCollector:
             module_id = str(session.get("module_id") or (module or {}).get("node_id") or "")
             worktree = dict(active.get(module_id) or {})
             workspace = str(session.get("workspace") or worktree.get("path") or "")
-            snapshot = _git_snapshot(workspace) if workspace else {"branch": "", "path": "", "files_changed": [], "diff_stat": ""}
+            snapshot = _git_snapshot(workspace) if workspace else {"branch": "", "path": "", "files_changed": [], "diff_stat": "", "file_changes": []}
             if worktree.get("branch"):
                 snapshot["branch"] = worktree["branch"]
             if worktree.get("path"):
@@ -448,6 +522,7 @@ class DashboardCollector:
                     "diff_stat": snapshot.get("diff_stat", ""),
                     "diff": snapshot.get("diff", ""),
                     "commit_diff": snapshot.get("commit_diff", ""),
+                    "file_changes": snapshot.get("file_changes", []),
                     "errors": session.get("errors", []),
                     "tasks": tasks_by_role.get(role, []),
                 }
