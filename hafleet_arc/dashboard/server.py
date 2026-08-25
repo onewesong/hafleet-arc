@@ -435,7 +435,8 @@ class DashboardCollector:
 
 class _DashboardHandler(BaseHTTPRequestHandler):
     collector: DashboardCollector
-    static_dir = Path(__file__).with_name("static")
+    static_dir: Path | None = Path(__file__).with_name("static")
+    api_only = False
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -460,6 +461,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._send(404, b'{"error":"session not found"}', "application/json; charset=utf-8")
             else:
                 self._send(200, json.dumps(session, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+            return
+        if self.api_only:
+            self._send(404, b'{"error":"dashboard is running in API-only mode"}', "application/json; charset=utf-8")
+            return
+        if self.static_dir is None:
+            self._send(404, b"Dashboard UI is unavailable", "text/plain; charset=utf-8")
             return
         relative = parsed.path.removeprefix("/") or "index.html"
         target = (self.static_dir / relative).resolve()
@@ -489,11 +496,29 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 class DashboardServer:
     """Optional local dashboard that observes one HAFleet output directory."""
 
-    def __init__(self, output_dir: Path, host: str = "127.0.0.1", port: int = 3200) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        host: str = "127.0.0.1",
+        port: int = 3200,
+        api_only: bool = False,
+    ) -> None:
         self.collector = DashboardCollector(output_dir)
         self.host = host
         self.port = int(port)
-        handler = type("DashboardHandler", (_DashboardHandler,), {"collector": self.collector})
+        self.api_only = bool(api_only)
+        frontend_dist = Path(__file__).with_name("frontend") / "dist"
+        legacy_static = Path(__file__).with_name("static")
+        static_dir = (
+            None
+            if self.api_only
+            else (frontend_dist if frontend_dist.is_dir() else legacy_static)
+        )
+        handler = type(
+            "DashboardHandler",
+            (_DashboardHandler,),
+            {"collector": self.collector, "static_dir": static_dir, "api_only": self.api_only},
+        )
         self.httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self.thread: threading.Thread | None = None
 

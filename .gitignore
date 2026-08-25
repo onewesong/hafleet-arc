@@ -7,3 +7,5 @@ dist/
 build/
 *.egg-info/
 .env
+hafleet_arc/dashboard/frontend/node_modules/
+hafleet_arc/dashboard/frontend/dist/

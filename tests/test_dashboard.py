@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 from hafleet_arc.dashboard import DashboardServer
@@ -116,9 +117,38 @@ class DashboardTests(unittest.TestCase):
                     state = json.loads(response.read())
                 self.assertEqual(state["output_dir"], str(root.resolve()))
                 with urlopen(f"http://127.0.0.1:{port}/") as response:
-                    self.assertIn(b"HAFleet Factory Floor", response.read())
+                    body = response.read()
+                    self.assertTrue(
+                        b"HAFleet Factory Floor" in body or b"HAFleet ARC Dashboard" in body
+                    )
             finally:
                 server.stop()
+
+    def test_api_only_server_exposes_api_but_not_ui(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = DashboardServer(root, port=0, api_only=True).start()
+            try:
+                port = server.httpd.server_address[1]
+                with urlopen(f"http://127.0.0.1:{port}/api/state") as response:
+                    self.assertEqual(response.status, 200)
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(f"http://127.0.0.1:{port}/")
+                self.assertEqual(error.exception.code, 404)
+            finally:
+                server.stop()
+
+    def test_dashboard_frontend_manifest_and_vite_config(self) -> None:
+        frontend = Path(__file__).parents[1] / "hafleet_arc" / "dashboard" / "frontend"
+        package = json.loads((frontend / "package.json").read_text(encoding="utf-8"))
+        scripts = package["scripts"]
+        self.assertEqual(scripts["dev"], "vite")
+        self.assertEqual(scripts["build"], "vite build")
+        self.assertEqual(scripts["preview"], "vite preview")
+        vite_config = (frontend / "vite.config.js").read_text(encoding="utf-8")
+        self.assertIn("127.0.0.1:3200", vite_config)
+        self.assertIn('process.env.DASHBOARD_API_URL', vite_config)
+        self.assertIn('process.env.VITE_PORT', vite_config)
 
     def test_architect_stays_done_after_pipeline_moves_to_feature_module(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -11,9 +11,17 @@ def main() -> int:
     parser.add_argument("output_dir", help="HAFleet output directory to observe.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=3200)
+    parser.add_argument(
+        "--api-only",
+        action="store_true",
+        help="Serve only Dashboard APIs; run the Vite frontend separately.",
+    )
     args = parser.parse_args()
-    server = DashboardServer(Path(args.output_dir), host=args.host, port=args.port)
-    print(f"HAFleet dashboard: http://{args.host}:{args.port}", flush=True)
+    server = DashboardServer(
+        Path(args.output_dir), host=args.host, port=args.port, api_only=args.api_only
+    )
+    mode = "API" if args.api_only else "dashboard"
+    print(f"HAFleet {mode}: http://{args.host}:{args.port}", flush=True)
     try:
         server.httpd.serve_forever()
     except KeyboardInterrupt:

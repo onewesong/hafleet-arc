@@ -96,8 +96,10 @@ conflicted worktrees remain under `.arc/hafleet/worktrees/`.
 ## Optional run dashboard
 
 The standalone local dashboard observes one output directory without changing the
-execution pipeline. It reads `runner-events.jsonl`, `checkpoint.json`, module plans,
-and Codex session JSONL files. Enable it explicitly with:
+execution pipeline. Its Python service exposes the read-only API, while the UI is
+also available as an independent Vite project. It reads `runner-events.jsonl`,
+`checkpoint.json`, module plans, and Codex session JSONL files. Enable the integrated
+dashboard explicitly with:
 
 ```bash
 python3 main.py /path/to/requirements \
@@ -111,6 +113,34 @@ It is also configurable with `HAFLEET_DASHBOARD=1` and
 `HAFLEET_DASHBOARD_PORT=3200`. Open `http://127.0.0.1:3200` to see the pipeline,
 module state, Codex sessions, and clickable conversation details. The dashboard is
 bound to localhost and is disabled by default.
+
+For independent frontend development, run the API and Vite UI separately:
+
+```bash
+# Terminal 1: Dashboard API
+PYTHONPATH=. python3 -m hafleet_arc.dashboard \
+  /path/to/output \
+  --api-only \
+  --port 3200
+
+# Terminal 2: Dashboard UI
+cd hafleet_arc/dashboard/frontend
+pnpm install
+pnpm dev
+```
+
+Open `http://127.0.0.1:5173`. Vite proxies `/api` requests to
+`http://127.0.0.1:3200` by default. Override the target with
+`DASHBOARD_API_URL=http://127.0.0.1:3210 pnpm dev` or the frontend port with
+`VITE_PORT=5174 pnpm dev`.
+
+Build and preview the standalone UI with:
+
+```bash
+cd hafleet_arc/dashboard/frontend
+pnpm build
+pnpm preview
+```
 
 To inspect an existing output directory after the run has finished, serve it as a
 standalone read-only dashboard:
