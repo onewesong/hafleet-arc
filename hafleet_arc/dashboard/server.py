@@ -216,6 +216,34 @@ class DashboardCollector:
             return []
         return sorted(self.sessions_dir.rglob("*.jsonl"), key=lambda item: item.stat().st_mtime_ns)
 
+    @staticmethod
+    def _dedupe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove mirrored response_item/event_msg records from Codex JSONL.
+
+        Codex can persist one visible message as both a response item and an
+        event message. Keep real consecutive repeats, but collapse only an
+        adjacent pair with matching role/content and different source types.
+        Prefer the response item because it carries the richer message shape.
+        """
+        deduped: list[dict[str, Any]] = []
+        for message in messages:
+            current_source = message.get("_source")
+            if deduped:
+                previous = deduped[-1]
+                source_pair = {previous.get("_source"), current_source}
+                same_message = (
+                    previous.get("role") == message.get("role")
+                    and str(previous.get("content", "")).strip() == str(message.get("content", "")).strip()
+                )
+                if same_message and source_pair == {"response_item", "event_msg"}:
+                    if current_source == "response_item":
+                        deduped[-1] = message
+                    continue
+            deduped.append(message)
+        for message in deduped:
+            message.pop("_source", None)
+        return deduped
+
     def _parse_session(self, path: Path, detail: bool = False) -> dict[str, Any]:
         session_id = path.stem
         role = "unknown"
@@ -263,6 +291,7 @@ class DashboardCollector:
                                     "timestamp": timestamp,
                                     "role": str(payload.get("role") or "unknown"),
                                     "content": content,
+                                    "_source": "response_item",
                                 }
                             )
                     elif item.get("type") == "event_msg" and payload.get("type") in {
@@ -278,6 +307,7 @@ class DashboardCollector:
                                     "role": "user" if payload.get("type") == "user_message" else "assistant",
                                     "kind": payload.get("type"),
                                     "content": content,
+                                    "_source": "event_msg",
                                 }
                             )
                     elif item.get("type") == "response_item" and payload.get("type") in {
@@ -296,6 +326,7 @@ class DashboardCollector:
                                     "kind": payload.get("type"),
                                     "name": tool_name,
                                     "content": content,
+                                    "_source": "response_item",
                                 }
                             )
                     elif item.get("type") == "event_msg" and payload.get("type") in {
@@ -309,6 +340,7 @@ class DashboardCollector:
                                 "role": "system",
                                 "kind": payload.get("type"),
                                 "content": json.dumps(payload, ensure_ascii=False),
+                                "_source": "event_msg",
                             }
                         )
         except OSError:
@@ -326,7 +358,7 @@ class DashboardCollector:
             "size": path.stat().st_size if path.exists() else 0,
         }
         if detail:
-            result["messages"] = messages[-3000:]
+            result["messages"] = self._dedupe_messages(messages)[-3000:]
             snapshot = _git_snapshot(cwd)
             result.update(snapshot)
             result["errors"] = [

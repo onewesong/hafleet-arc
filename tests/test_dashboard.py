@@ -98,6 +98,18 @@ class DashboardTests(unittest.TestCase):
                 + "\n"
                 + json.dumps(
                     {
+                        "timestamp": "2026-01-01T00:00:00.501Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"text": "Inspecting files."}],
+                        },
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
                         "timestamp": "2026-01-01T00:00:00.750Z",
                         "type": "response_item",
                         "payload": {"type": "custom_tool_call", "name": "exec", "input": "ls"},
@@ -130,6 +142,7 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(any("Implemented" in message["content"] for message in detail["messages"]))
             self.assertTrue(any(message["role"] == "tool" for message in detail["messages"]))
             self.assertTrue(any(message["content"] == "Inspecting files." for message in detail["messages"]))
+            self.assertEqual(sum(message["content"] == "Inspecting files." for message in detail["messages"]), 1)
             self.assertEqual(detail["module_id"], "REQ-1")
             self.assertIn("diff", detail)
             self.assertIn("commit_diff", detail)
