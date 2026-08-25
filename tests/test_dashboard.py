@@ -194,8 +194,10 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("file_changes", app)
         self.assertIn("file-change-trigger", app)
         self.assertIn("file-change-diff", styles)
-        self.assertIn("Latest workspace commit", app)
-        self.assertIn("may include changes from other roles", app)
+        self.assertIn("changeSourceLabel", app)
+        self.assertIn("planner_output", app)
+        self.assertIn("module_checkpoint", app)
+        self.assertIn("Files are scoped to this role or stage", app)
         self.assertIn('diff-line ${kind}', app)
         self.assertIn(".diff-line.removed", styles)
         self.assertIn("conversation-message-", app)
@@ -251,6 +253,34 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(by_id["architect"]["message"], "Architecture scaffold completed")
             self.assertEqual(by_id["planner"]["status"], "success")
             self.assertEqual(by_id["implementer"]["status"], "working")
+
+    def test_role_snapshots_are_scoped_to_role_and_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def git(*args: str) -> None:
+                subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+            git("init", "-q")
+            git("config", "user.email", "test@example.com")
+            git("config", "user.name", "Dashboard Test")
+            (root / "architecture.md").write_text("architecture\n", encoding="utf-8")
+            git("add", "architecture.md")
+            git("commit", "-qm", "ROOT: architecture scaffold")
+            (root / ".arc" / "hafleet" / "plans").mkdir(parents=True)
+            (root / ".arc" / "hafleet" / "plans" / "REQ-1.md").write_text("plan\n", encoding="utf-8")
+            (root / "module.txt").write_text("module\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-qm", "REQ-1: implement and review")
+            collector = DashboardCollector(root)
+            checkpoint = {"current_node_id": "REQ-1", "current_phase": "completed"}
+            planner = collector._role_snapshot("planner", {"module_id": "REQ-1"}, checkpoint, str(root))
+            self.assertEqual(planner["file_changes"][0]["source"], "planner_output")
+            self.assertEqual(planner["file_changes"][0]["path"], ".arc/hafleet/plans/REQ-1.md")
+            architect = collector._role_snapshot("architect", {}, checkpoint, str(root))
+            self.assertTrue(architect["file_changes"])
+            self.assertTrue(all(item["source"] == "architect_commit" for item in architect["file_changes"]))
+            reviewer = collector._role_snapshot("reviewer", {"module_id": "REQ-1"}, checkpoint, str(root))
+            self.assertTrue(reviewer["file_changes"])
+            self.assertTrue(all(item["source"] == "module_checkpoint" for item in reviewer["file_changes"]))
 
 
 if __name__ == "__main__":

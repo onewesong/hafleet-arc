@@ -54,6 +54,17 @@ function characterById(id) { return (state.data?.characters || []).find((item) =
 function sessionById(id) { return (state.data?.sessions || []).find((item) => item.id === id); }
 function detailRows(item) { return `<div class="detail-grid"><span>Status</span><strong class="status ${esc(item.status)}">${esc(statusText(item.status))}</strong><span>Phase</span><strong>${esc(item.phase)}</strong><span>Module</span><strong>${esc(item.module_id || "—")}</strong><span>Workspace</span><strong class="path">${esc(item.workspace || item.worktree?.path || "—")}</strong><span>Branch</span><strong>${esc(item.worktree?.branch || "—")}</strong><span>Changed files</span><strong>${(item.files_changed || []).length}</strong></div>`; }
 function changeStatusLabel(status) { return ({ A: "Added", M: "Modified", D: "Deleted", R: "Renamed", "??": "Untracked" })[status] || status || "Changed"; }
+function changeSourceLabel(source) {
+  return ({
+    planner_output: "Planner output",
+    architect_commit: "Architect commit",
+    implementer_worktree: "Implementer worktree",
+    reviewer_worktree: "Reviewer worktree",
+    module_checkpoint: "Module checkpoint",
+    postflight_worktree: "Postflight worktree",
+    postflight_commit: "Postflight commit",
+  })[source] || ({ latest_commit: "Latest workspace commit", working_tree: "Working tree" })[source] || "Role/stage output";
+}
 function diffHtml(diff) {
   return String(diff || "").split(/\r?\n/).map((line) => {
     let kind = "context";
@@ -66,9 +77,9 @@ function diffHtml(diff) {
 }
 function fileChangesMarkup(changes) {
   if (!changes.length) return `<p class="subtle">No file-level changes available.</p>`;
-  const working = changes.filter((change) => change.source === "working_tree").length;
-  const committed = changes.filter((change) => change.source === "latest_commit").length;
-  return `<div class="change-summary"><span>Working tree <b>${working}</b></span><span title="Files changed by the most recent commit in this workspace">Latest workspace commit <b>${committed}</b></span></div><p class="change-summary-note">Latest workspace commit is the most recent repository commit and may include changes from other roles.</p><div class="file-change-list">${changes.map((change, index) => `<div class="file-change" data-change-index="${index}"><button class="file-change-trigger" type="button" aria-expanded="false"><span class="change-status status-${esc(change.status)}" data-status="${esc(change.status)}">${esc(changeStatusLabel(change.status))}</span><span class="file-change-main"><strong title="${esc(change.path)}">${esc(change.path)}</strong>${change.old_path ? `<small>from ${esc(change.old_path)}</small>` : ""}</span><span class="change-source">${change.source === "latest_commit" ? "Latest workspace commit" : "Working tree"}</span><span class="change-stat"><b>+${Number(change.additions || 0)}</b> <em>-${Number(change.deletions || 0)}</em></span></button><div class="file-change-diff" hidden>${change.diff ? `<pre class="syntax-diff">${diffHtml(change.diff)}</pre>` : `<p class="subtle">No textual diff available for this file.</p>`}</div></div>`).join("")}</div>`;
+  const grouped = changes.reduce((result, change) => { const label = changeSourceLabel(change.source); result[label] = (result[label] || 0) + 1; return result; }, {});
+  const summary = Object.entries(grouped).map(([label, count]) => `<span>${esc(label)} <b>${count}</b></span>`).join("");
+  return `<div class="change-summary">${summary}</div><p class="change-summary-note">Files are scoped to this role or stage; a module checkpoint is the reviewed module commit.</p><div class="file-change-list">${changes.map((change, index) => `<div class="file-change" data-change-index="${index}"><button class="file-change-trigger" type="button" aria-expanded="false"><span class="change-status status-${esc(change.status)}" data-status="${esc(change.status)}">${esc(changeStatusLabel(change.status))}</span><span class="file-change-main"><strong title="${esc(change.path)}">${esc(change.path)}</strong>${change.old_path ? `<small>from ${esc(change.old_path)}</small>` : ""}</span><span class="change-source">${esc(changeSourceLabel(change.source))}</span><span class="change-stat"><b>+${Number(change.additions || 0)}</b> <em>-${Number(change.deletions || 0)}</em></span></button><div class="file-change-diff" hidden>${change.diff ? `<pre class="syntax-diff">${diffHtml(change.diff)}</pre>` : `<p class="subtle">No textual diff available for this file.</p>`}</div></div>`).join("")}</div>`;
 }
 function messageKind(message) {
   const value = String(message?.kind || message?.role || "system").toLowerCase();
@@ -103,7 +114,7 @@ function conversationMessages(messages) {
 async function openCharacter(role) {
   const item = characterById(role); const session = item.session_id ? sessionById(item.session_id) : null;
   let detail = item;
-  if (item.session_id) { try { const response = await fetch(`/api/sessions/${encodeURIComponent(item.session_id)}`); if (response.ok) detail = { ...item, ...(await response.json()) }; } catch {} }
+  if (item.session_id) { try { const response = await fetch(`/api/sessions/${encodeURIComponent(item.session_id)}`); if (response.ok) detail = { ...(await response.json()), ...item }; } catch {} }
   document.querySelector("#drawer-kicker").textContent = `${labels[role]} · ${item.phase || "idle"}`;
   document.querySelector("#drawer-title").textContent = `${labels[role]} detail`;
   const workingDiff = detail.diff || "";

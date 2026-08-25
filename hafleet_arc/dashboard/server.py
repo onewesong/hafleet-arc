@@ -74,7 +74,7 @@ def _module_id_from_text(text: str) -> str:
     return match.group(1) if match else ""
 
 
-def _git_snapshot(workspace: str) -> dict[str, Any]:
+def _git_snapshot(workspace: str, commit_ref: str = "") -> dict[str, Any]:
     if not workspace:
         return {"branch": "", "path": "", "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": "", "file_changes": []}
     path = Path(workspace).resolve()
@@ -160,6 +160,23 @@ def _git_snapshot(workspace: str) -> dict[str, Any]:
             })
         return changes
 
+    if commit_ref:
+        diff_args = ["show", "--format=", "--no-ext-diff", "--unified=3", commit_ref]
+        status = run(["show", "--format=", "--name-status", "-M", commit_ref])
+        diff = run(diff_args)
+        commit_diff = diff
+        names = parse_name_status(status)
+        file_changes = build_file_changes("latest_commit", names, ["show", "--format=", "--no-ext-diff", "--unified=3", commit_ref])
+        return {
+            "branch": run(["branch", "--show-current"]),
+            "path": str(path),
+            "files_changed": status.splitlines()[:200],
+            "diff_stat": run(["show", "--format=", "--stat", commit_ref]),
+            "diff": diff[:120000],
+            "commit_diff": commit_diff[:120000],
+            "file_changes": file_changes,
+        }
+
     status = run(["status", "--short"])
     # Keep the dashboard read-only and bounded even when an agent generated a
     # very large patch.  The recent commit diff covers changes that were
@@ -179,7 +196,7 @@ def _git_snapshot(workspace: str) -> dict[str, Any]:
         "branch": run(["branch", "--show-current"]),
         "path": str(path),
         "files_changed": status.splitlines()[:200],
-        "diff_stat": run(["diff", "--stat"]),
+        "diff_stat": run(["diff", "HEAD", "--stat"]),
         "diff": diff[:120000],
         "commit_diff": commit_diff[:120000],
         "file_changes": file_changes,
@@ -215,6 +232,88 @@ class DashboardCollector:
         if not self.sessions_dir.is_dir():
             return []
         return sorted(self.sessions_dir.rglob("*.jsonl"), key=lambda item: item.stat().st_mtime_ns)
+
+    @staticmethod
+    def _relabel_snapshot(snapshot: dict[str, Any], source: str) -> dict[str, Any]:
+        snapshot = dict(snapshot)
+        snapshot["file_changes"] = [dict(change, source=source) for change in snapshot.get("file_changes", [])]
+        return snapshot
+
+    def _plan_snapshot(self, module_id: str, workspace: str) -> dict[str, Any]:
+        plan = Path(workspace).resolve() / ".arc" / "hafleet" / "plans" / f"{module_id}.md" if module_id and workspace else None
+        if not plan or not plan.is_file():
+            return {"branch": "", "path": workspace, "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": "", "file_changes": []}
+        content = plan.read_text(encoding="utf-8", errors="replace")
+        relative = f".arc/hafleet/plans/{module_id}.md"
+        diff = "\n".join([
+            f"diff --git a/{relative} b/{relative}",
+            "new file mode 100644",
+            f"--- /dev/null",
+            f"+++ b/{relative}",
+            *[f"+{line}" for line in content.splitlines()],
+            "",
+        ])
+        change = {
+            "source": "planner_output",
+            "status": "A",
+            "path": relative,
+            "old_path": "",
+            "additions": len(content.splitlines()),
+            "deletions": 0,
+            "stat": f"+{len(content.splitlines())} -0",
+            "diff": diff[:60000],
+        }
+        return {
+            "branch": "",
+            "path": workspace,
+            "files_changed": [f"A  {relative}"],
+            "diff_stat": f"{len(content.splitlines())} lines added: {relative}",
+            "diff": diff[:120000],
+            "commit_diff": "",
+            "file_changes": [change],
+        }
+
+    def _latest_commit_matching(self, workspace: str, message: str) -> str:
+        if not workspace or not message:
+            return ""
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(Path(workspace).resolve()), "log", "-1", "--format=%H", "--fixed-strings", "--grep", message],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3, check=False,
+            )
+            return result.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    def _role_snapshot(
+        self,
+        role: str,
+        session: dict[str, Any],
+        checkpoint: dict[str, Any],
+        workspace: str,
+    ) -> dict[str, Any]:
+        module_id = str(session.get("module_id") or checkpoint.get("current_node_id") or "")
+        current_node = str(checkpoint.get("current_node_id") or "")
+        current_phase = str(checkpoint.get("current_phase") or "")
+        if role == "planner":
+            return self._plan_snapshot(module_id, workspace)
+        if role == "architect":
+            commit = self._latest_commit_matching(workspace, "ROOT: architecture scaffold")
+            return self._relabel_snapshot(_git_snapshot(workspace, commit), "architect_commit") if commit else {"branch": "", "path": workspace, "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": "", "file_changes": []}
+        if role in {"implementer", "reviewer"} and current_node == module_id and current_phase in {"implement", "review"}:
+            return self._relabel_snapshot(_git_snapshot(workspace), f"{role}_worktree")
+        if role == "postflight":
+            if current_phase in {"postflight", "final-review"}:
+                return self._relabel_snapshot(_git_snapshot(workspace), "postflight_worktree")
+            commit = self._latest_commit_matching(workspace, "ROOT: final HAFleet integration review")
+            if commit:
+                return self._relabel_snapshot(_git_snapshot(workspace, commit), "postflight_commit")
+            return {"branch": "", "path": workspace, "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": "", "file_changes": []}
+        if module_id:
+            commit = self._latest_commit_matching(workspace, f"{module_id}: implement and review")
+            if commit:
+                return self._relabel_snapshot(_git_snapshot(workspace, commit), "module_checkpoint")
+        return {"branch": "", "path": workspace, "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": "", "file_changes": []}
 
     @staticmethod
     def _dedupe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -525,7 +624,7 @@ class DashboardCollector:
             module_id = str(session.get("module_id") or (module or {}).get("node_id") or "")
             worktree = dict(active.get(module_id) or {})
             workspace = str(session.get("workspace") or worktree.get("path") or "")
-            snapshot = _git_snapshot(workspace) if workspace else {"branch": "", "path": "", "files_changed": [], "diff_stat": "", "file_changes": []}
+            snapshot = self._role_snapshot(role, session, checkpoint, workspace) if workspace else {"branch": "", "path": "", "files_changed": [], "diff_stat": "", "file_changes": []}
             if worktree.get("branch"):
                 snapshot["branch"] = worktree["branch"]
             if worktree.get("path"):
