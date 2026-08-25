@@ -56,3 +56,16 @@
 .file-change-diff { border-top: 1px solid #2c405b; padding: 8px; }
 .file-change-diff pre { max-height: 360px; overflow: auto; margin: 0; padding: 10px; white-space: pre; word-break: normal; color: #dbe9f7; background: #07101d; font: 10px/1.5 ui-monospace, monospace; }
 .change-stat-summary { margin-top: 8px; font: 10px ui-monospace, monospace; }
+.syntax-diff { padding: 0 !important; overflow: auto; white-space: pre; tab-size: 4; }
+.diff-line { display: grid; grid-template-columns: 14px minmax(max-content, 1fr); min-width: max-content; min-height: 1.5em; line-height: 1.5; }
+.diff-gutter { border-right: 1px solid #1f3048; }
+.diff-content { padding: 0 12px; }
+.diff-line.added { color: #c9f7d9; background: #123d2c; }
+.diff-line.added .diff-gutter { background: #1e8b5a; }
+.diff-line.removed { color: #ffd4d8; background: #4a2029; }
+.diff-line.removed .diff-gutter { background: #c94a5b; }
+.diff-line.hunk { color: #b9d9ff; background: #173457; }
+.diff-line.hunk .diff-gutter { background: #397ed1; }
+.diff-line.meta { color: #9eb4d0; background: #111f33; }
+.diff-line.meta .diff-gutter { background: #304761; }
+.diff-line.context { color: #dbe9f7; }

@@ -181,6 +181,8 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("file_changes", app)
         self.assertIn("file-change-trigger", app)
         self.assertIn("file-change-diff", styles)
+        self.assertIn('diff-line ${kind}', app)
+        self.assertIn(".diff-line.removed", styles)
         self.assertIn("conversation-message-", app)
 
     def test_role_task_cards_keep_completed_module_history(self) -> None:

@@ -54,11 +54,21 @@ function characterById(id) { return (state.data?.characters || []).find((item) =
 function sessionById(id) { return (state.data?.sessions || []).find((item) => item.id === id); }
 function detailRows(item) { return `<div class="detail-grid"><span>Status</span><strong class="status ${esc(item.status)}">${esc(statusText(item.status))}</strong><span>Phase</span><strong>${esc(item.phase)}</strong><span>Module</span><strong>${esc(item.module_id || "—")}</strong><span>Workspace</span><strong class="path">${esc(item.workspace || item.worktree?.path || "—")}</strong><span>Branch</span><strong>${esc(item.worktree?.branch || "—")}</strong><span>Changed files</span><strong>${(item.files_changed || []).length}</strong></div>`; }
 function changeStatusLabel(status) { return ({ A: "Added", M: "Modified", D: "Deleted", R: "Renamed", "??": "Untracked" })[status] || status || "Changed"; }
+function diffHtml(diff) {
+  return String(diff || "").split(/\r?\n/).map((line) => {
+    let kind = "context";
+    if (line.startsWith("@@")) kind = "hunk";
+    else if (line.startsWith("diff ") || line.startsWith("index ") || line.startsWith("--- ") || line.startsWith("+++ ")) kind = "meta";
+    else if (line.startsWith("+")) kind = "added";
+    else if (line.startsWith("-")) kind = "removed";
+    return `<span class="diff-line ${kind}"><span class="diff-gutter" aria-hidden="true"></span><span class="diff-content">${esc(line) || " "}</span></span>`;
+  }).join("");
+}
 function fileChangesMarkup(changes) {
   if (!changes.length) return `<p class="subtle">No file-level changes available.</p>`;
   const working = changes.filter((change) => change.source === "working_tree").length;
   const committed = changes.filter((change) => change.source === "latest_commit").length;
-  return `<div class="change-summary"><span>Working tree <b>${working}</b></span><span>Latest commit <b>${committed}</b></span></div><div class="file-change-list">${changes.map((change, index) => `<div class="file-change" data-change-index="${index}"><button class="file-change-trigger" type="button" aria-expanded="false"><span class="change-status status-${esc(change.status)}" data-status="${esc(change.status)}">${esc(changeStatusLabel(change.status))}</span><span class="file-change-main"><strong title="${esc(change.path)}">${esc(change.path)}</strong>${change.old_path ? `<small>from ${esc(change.old_path)}</small>` : ""}</span><span class="change-source">${change.source === "latest_commit" ? "Latest commit" : "Working tree"}</span><span class="change-stat"><b>+${Number(change.additions || 0)}</b> <em>-${Number(change.deletions || 0)}</em></span></button><div class="file-change-diff" hidden>${change.diff ? `<pre>${esc(change.diff)}</pre>` : `<p class="subtle">No textual diff available for this file.</p>`}</div></div>`).join("")}</div>`;
+  return `<div class="change-summary"><span>Working tree <b>${working}</b></span><span>Latest commit <b>${committed}</b></span></div><div class="file-change-list">${changes.map((change, index) => `<div class="file-change" data-change-index="${index}"><button class="file-change-trigger" type="button" aria-expanded="false"><span class="change-status status-${esc(change.status)}" data-status="${esc(change.status)}">${esc(changeStatusLabel(change.status))}</span><span class="file-change-main"><strong title="${esc(change.path)}">${esc(change.path)}</strong>${change.old_path ? `<small>from ${esc(change.old_path)}</small>` : ""}</span><span class="change-source">${change.source === "latest_commit" ? "Latest commit" : "Working tree"}</span><span class="change-stat"><b>+${Number(change.additions || 0)}</b> <em>-${Number(change.deletions || 0)}</em></span></button><div class="file-change-diff" hidden>${change.diff ? `<pre class="syntax-diff">${diffHtml(change.diff)}</pre>` : `<p class="subtle">No textual diff available for this file.</p>`}</div></div>`).join("")}</div>`;
 }
 function messageKind(message) {
   const value = String(message?.kind || message?.role || "system").toLowerCase();
@@ -98,7 +108,7 @@ async function openCharacter(role) {
   document.querySelector("#drawer-title").textContent = `${labels[role]} detail`;
   const workingDiff = detail.diff || "";
   const commitDiff = detail.commit_diff || "";
-  const diffBlock = (title, content, empty) => content ? `<details class="diff-block"><summary>${title}</summary><pre>${esc(content)}</pre></details>` : `<p class="subtle">${empty}</p>`;
+  const diffBlock = (title, content, empty) => content ? `<details class="diff-block"><summary>${title}</summary><pre class="syntax-diff">${diffHtml(content)}</pre></details>` : `<p class="subtle">${empty}</p>`;
   const messages = detail.messages || [];
   const fileChanges = detail.file_changes || [];
   document.querySelector("#drawer-body").innerHTML = `${detailRows(detail)}<section class="drawer-section"><h3>Latest event</h3><p>${esc(item.message || "Waiting for work")}</p></section><section class="drawer-section"><h3>Files changed</h3>${fileChangesMarkup(fileChanges)}${detail.diff_stat ? `<p class="subtle change-stat-summary">${esc(detail.diff_stat)}</p>` : ""}${diffBlock("Working tree diff", workingDiff, "No uncommitted diff")}${diffBlock("Latest commit diff", commitDiff, "No recent commit diff")}</section><section class="drawer-section conversation-section"><h3>Conversation</h3>${messages.length ? `${conversationOverview(messages)}<div class="conversation-list">${conversationMessages(messages)}</div>` : `<p class="subtle">${session ? "Session has no renderable messages yet." : "No session is associated with this worker yet."}</p>`}</section>`;
