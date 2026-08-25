@@ -12,9 +12,13 @@ function renderRoom(data) {
   const characters = data.characters || [];
   document.querySelector("#room").innerHTML = roles.map((role) => {
     const item = characters.find((character) => character.id === role) || { id: role, label: labels[role], status: "idle", message: "Waiting for work" };
-    return `<button class="workstation ${esc(item.status)}" data-character="${role}" aria-label="Open ${labels[role]} details"><div class="bubble">${esc(item.message || statusText(item.status))}</div><div class="monitor"><span>${icons[role]}</span><small>${esc(item.phase || "idle")}</small></div><div class="worker">${characterSvg(role, item.status)}<div class="worker-tag"><strong>${labels[role]}</strong><span>${esc(statusText(item.status))}</span></div></div><div class="task-cards">${(item.tasks || []).map((task) => `<span class="task-card" data-module="${esc(task.node_id)}">${esc(task.node_id)}</span>`).join("") || (item.module_id ? `<span class="task-card">${esc(item.module_id)}</span>` : "")}</div></button>`;
+    return `<button class="workstation ${esc(item.status)}" data-character="${role}" aria-label="Open ${labels[role]} details"><div class="bubble">${esc(item.message || statusText(item.status))}</div><div class="monitor"><span>${icons[role]}</span><small>${esc(item.phase || "idle")}</small></div><div class="worker">${characterSvg(role, item.status)}<div class="worker-tag"><strong>${labels[role]}</strong><span>${esc(statusText(item.status))}</span></div></div><div class="task-cards">${(item.tasks || []).map((task) => `<span class="task-card" data-task-module="${esc(task.node_id)}">${esc(task.node_id)}</span>`).join("") || (item.module_id ? `<span class="task-card">${esc(item.module_id)}</span>` : "")}</div></button>`;
   }).join("");
-  document.querySelectorAll("[data-character]").forEach((button) => button.addEventListener("click", () => openCharacter(button.dataset.character)));
+  document.querySelectorAll("[data-character]").forEach((button) => button.addEventListener("click", (event) => {
+    const task = event.target.closest("[data-task-module]");
+    if (task) { event.stopPropagation(); openCharacter(button.dataset.character, task.dataset.taskModule); return; }
+    openCharacter(button.dataset.character);
+  }));
 }
 
 function renderPipeline(data) {
@@ -26,10 +30,10 @@ function renderModules(data) {
   const modules = data.modules || [];
   document.querySelector("#module-count").textContent = `${modules.length} modules`;
   document.querySelector("#modules").innerHTML = modules.length ? modules.map((item) => `<button class="module-row" data-module="${esc(item.node_id)}"><span class="module-mark ${esc(item.status)}"></span><span><strong>${esc(item.node_id)}</strong><small>${esc(item.message || item.phase || "")}</small></span><span class="status ${esc(item.status)}">${esc(statusText(item.status))}</span></button>`).join("") : `<p class="subtle">No module events yet.</p>`;
-  document.querySelectorAll("[data-module]").forEach((button) => button.addEventListener("click", () => {
+  document.querySelectorAll("#modules [data-module]").forEach((button) => button.addEventListener("click", () => {
     const module = (state.data?.modules || []).find((item) => item.node_id === button.dataset.module);
     const role = (state.data?.characters || []).find((item) => item.phase === module?.phase)?.id || "reviewer";
-    openCharacter(role);
+    openCharacter(role, button.dataset.module);
   }));
 }
 
@@ -111,10 +115,10 @@ function conversationMessages(messages) {
   }).join("");
 }
 
-async function openCharacter(role) {
+async function openCharacter(role, moduleId = "") {
   const item = characterById(role); const session = item.session_id ? sessionById(item.session_id) : null;
   let detail = item;
-  if (item.session_id) { try { const response = await fetch(`/api/sessions/${encodeURIComponent(item.session_id)}`); if (response.ok) detail = { ...(await response.json()), ...item }; } catch {} }
+  if (item.session_id) { try { const query = moduleId ? `?module_id=${encodeURIComponent(moduleId)}` : ""; const response = await fetch(`/api/sessions/${encodeURIComponent(item.session_id)}${query}`); if (response.ok) detail = moduleId ? { ...item, ...(await response.json()), module_id: moduleId } : { ...(await response.json()), ...item }; } catch {} }
   document.querySelector("#drawer-kicker").textContent = `${labels[role]} · ${item.phase || "idle"}`;
   document.querySelector("#drawer-title").textContent = `${labels[role]} detail`;
   const workingDiff = detail.diff || "";

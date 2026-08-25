@@ -146,6 +146,8 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(detail["module_id"], "REQ-1")
             self.assertIn("diff", detail)
             self.assertIn("commit_diff", detail)
+            module_detail = collector.session("session-1", module_id="REQ-2")
+            self.assertEqual(module_detail["module_id"], "REQ-2")
 
     def test_server_exposes_state_and_session_detail(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -201,6 +203,8 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('diff-line ${kind}', app)
         self.assertIn(".diff-line.removed", styles)
         self.assertIn("conversation-message-", app)
+        self.assertIn("data-task-module", app)
+        self.assertIn("module_id=${encodeURIComponent(moduleId)}", app)
 
     def test_role_task_cards_keep_completed_module_history(self) -> None:
         modules = [

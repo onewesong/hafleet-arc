@@ -8,7 +8,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 ROLE_PATTERNS = {
@@ -684,11 +684,17 @@ class DashboardCollector:
     def sessions(self) -> list[dict[str, Any]]:
         return [self._parse_session(path) for path in self._session_files()]
 
-    def session(self, session_id: str) -> dict[str, Any] | None:
+    def session(self, session_id: str, module_id: str = "") -> dict[str, Any] | None:
         for path in self._session_files():
             item = self._parse_session(path)
             if item["id"] == session_id or path.stem == session_id:
-                return self._parse_session(path, detail=True)
+                detail = self._parse_session(path, detail=True)
+                if module_id:
+                    detail["module_id"] = module_id
+                    checkpoint = _read_json(self.checkpoint_path, {})
+                    workspace = str(detail.get("cwd") or detail.get("workspace") or "")
+                    detail.update(self._role_snapshot(str(detail.get("role") or ""), detail, checkpoint, workspace))
+                return detail
         return None
 
 
@@ -715,7 +721,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/sessions/"):
             session_id = unquote(parsed.path.removeprefix("/api/sessions/"))
-            session = self.collector.session(session_id)
+            module_id = parse_qs(parsed.query).get("module_id", [""])[0]
+            session = self.collector.session(session_id, module_id=module_id)
             if session is None:
                 self._send(404, b'{"error":"session not found"}', "application/json; charset=utf-8")
             else:
