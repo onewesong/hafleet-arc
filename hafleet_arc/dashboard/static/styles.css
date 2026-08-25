@@ -37,6 +37,7 @@
 .change-summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 10px; color: #8da1bd; font-size: 11px; }
 .change-summary span { padding: 5px 8px; border: 1px solid #2c405b; border-radius: 6px; background: #0b1423; }
 .change-summary b { color: #dbe9f7; margin-left: 3px; }
+.change-summary-note { margin: -3px 0 10px; color: #7188a6; font-size: 10px; line-height: 1.4; }
 .file-change-list { display: grid; gap: 7px; }
 .file-change { border: 1px solid #2c405b; border-radius: 8px; overflow: hidden; background: #0b1423; }
 .file-change.expanded { border-color: #70b8ff; }

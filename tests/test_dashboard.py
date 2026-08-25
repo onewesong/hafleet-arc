@@ -194,6 +194,8 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("file_changes", app)
         self.assertIn("file-change-trigger", app)
         self.assertIn("file-change-diff", styles)
+        self.assertIn("Latest workspace commit", app)
+        self.assertIn("may include changes from other roles", app)
         self.assertIn('diff-line ${kind}', app)
         self.assertIn(".diff-line.removed", styles)
         self.assertIn("conversation-message-", app)
