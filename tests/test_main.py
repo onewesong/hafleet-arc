@@ -77,6 +77,25 @@ class FakeFleet:
 
 
 class EntrypointSmokeTests(unittest.TestCase):
+    def test_env_example_documents_hafleet_environment(self) -> None:
+        env_example = Path(__file__).parents[1] / ".env.example"
+        content = env_example.read_text(encoding="utf-8")
+        for name in (
+            "OPENAI_API_KEY",
+            "MODEL",
+            "HAFLEET_ARCHITECT_MODEL",
+            "HAFLEET_PLANNER_MODEL",
+            "HAFLEET_IMPLEMENTER_MODEL",
+            "HAFLEET_REVIEWER_MODEL",
+            "HAFLEET_POSTFLIGHT_MODEL",
+            "HAFLEET_PARALLEL",
+            "HAFLEET_DASHBOARD_PORT",
+            "HAFLEET_GIT_NAME_PREFIX",
+            "HAFLEET_GIT_EMAIL_DOMAIN",
+        ):
+            self.assertIn(name, content)
+        self.assertIn("# HAFLEET_PARALLEL=0", content)
+
     def test_parallel_arguments_are_parsed(self) -> None:
         args = entrypoint.parse_args(["requirements", "--parallel", "--max-workers", "3"])
         self.assertTrue(args.parallel)
