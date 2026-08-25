@@ -53,8 +53,34 @@ function render(data) {
 function characterById(id) { return (state.data?.characters || []).find((item) => item.id === id) || { id, label: labels[id], status: "idle", phase: "idle", message: "Waiting for work" }; }
 function sessionById(id) { return (state.data?.sessions || []).find((item) => item.id === id); }
 function detailRows(item) { return `<div class="detail-grid"><span>Status</span><strong class="status ${esc(item.status)}">${esc(statusText(item.status))}</strong><span>Phase</span><strong>${esc(item.phase)}</strong><span>Module</span><strong>${esc(item.module_id || "—")}</strong><span>Workspace</span><strong class="path">${esc(item.workspace || item.worktree?.path || "—")}</strong><span>Branch</span><strong>${esc(item.worktree?.branch || "—")}</strong><span>Changed files</span><strong>${(item.files_changed || []).length}</strong></div>`; }
+function messageKind(message) {
+  const value = String(message?.kind || message?.role || "system").toLowerCase();
+  if (value.includes("developer")) return "developer";
+  if (value.includes("tool") || value.includes("function")) return "tool";
+  if (value.includes("assistant") || value.includes("agent")) return "assistant";
+  if (value.includes("user")) return "user";
+  return "system";
+}
+function messageSummary(message) {
+  return String(message?.content || "").split(/\r?\n/)[0].trim().replace(/\s+/g, " ").slice(0, 120) || "(empty message)";
+}
+function conversationOverview(messages) {
+  const counts = messages.reduce((result, message) => {
+    const kind = messageKind(message); result[kind] = (result[kind] || 0) + 1; return result;
+  }, {});
+  const legend = ["user", "assistant", "tool", "system", "developer"].filter((kind) => counts[kind]).map((kind) => `<span class="conversation-legend-item"><i class="conversation-node-dot ${kind}"></i>${kind} <b>${counts[kind]}</b></span>`).join("");
+  const nodes = messages.map((message, index) => {
+    const kind = messageKind(message); const target = `conversation-message-${index}`;
+    const label = `${kind} message ${index + 1}${message.timestamp ? ` at ${message.timestamp}` : ""}: ${messageSummary(message)}`;
+    return `<button class="conversation-node ${kind}" data-message-target="${target}" aria-label="Jump to ${esc(label)}" title="${esc(label)}"><span class="sr-only">${esc(index + 1)}</span></button>`;
+  }).join("");
+  return `<div class="conversation-overview"><div class="conversation-overview-head"><h4>Message overview</h4><span>${messages.length} message${messages.length === 1 ? "" : "s"}</span></div><div class="conversation-legend">${legend || `<span class="subtle">No messages</span>`}</div><div class="conversation-timeline" aria-label="Conversation message timeline">${nodes || `<span class="subtle">No messages yet.</span>`}</div></div>`;
+}
 function conversationMessages(messages) {
-  return messages.map((message) => `<article class="message ${esc(message.role)}" tabindex="0" role="button" aria-expanded="false"><div class="message-meta"><strong>${esc(message.role)}</strong>${message.name ? ` · ${esc(message.name)}` : ""}<time>${esc(message.timestamp)}</time></div><pre>${esc(message.content)}</pre><span class="message-hint">Click to expand</span></article>`).join("");
+  return messages.map((message, index) => {
+    const kind = messageKind(message); const id = `conversation-message-${index}`;
+    return `<article id="${id}" class="message ${kind}" tabindex="0" role="button" aria-expanded="false"><div class="message-meta"><strong>${esc(message.role || kind)}</strong>${message.name ? ` · ${esc(message.name)}` : ""}<time>${esc(message.timestamp)}</time></div><pre>${esc(message.content)}</pre><span class="message-hint">Click to expand</span></article>`;
+  }).join("");
 }
 
 async function openCharacter(role) {
@@ -66,7 +92,8 @@ async function openCharacter(role) {
   const workingDiff = detail.diff || "";
   const commitDiff = detail.commit_diff || "";
   const diffBlock = (title, content, empty) => content ? `<details class="diff-block"><summary>${title}</summary><pre>${esc(content)}</pre></details>` : `<p class="subtle">${empty}</p>`;
-  document.querySelector("#drawer-body").innerHTML = `${detailRows(detail)}<section class="drawer-section"><h3>Latest event</h3><p>${esc(item.message || "Waiting for work")}</p></section><section class="drawer-section"><h3>Files changed</h3><pre>${esc((detail.files_changed || []).join("\n") || detail.diff_stat || "No uncommitted file changes")}</pre>${detail.diff_stat ? `<p class="subtle">${esc(detail.diff_stat)}</p>` : ""}${diffBlock("Working tree diff", workingDiff, "No uncommitted diff")}${diffBlock("Latest commit diff", commitDiff, "No recent commit diff")}</section><section class="drawer-section"><h3>Conversation</h3>${(detail.messages || []).length ? conversationMessages(detail.messages) : `<p class="subtle">${session ? "Session has no renderable messages yet." : "No session is associated with this worker yet."}</p>`}</section>`;
+  const messages = detail.messages || [];
+  document.querySelector("#drawer-body").innerHTML = `${detailRows(detail)}<section class="drawer-section"><h3>Latest event</h3><p>${esc(item.message || "Waiting for work")}</p></section><section class="drawer-section"><h3>Files changed</h3><pre>${esc((detail.files_changed || []).join("\n") || detail.diff_stat || "No uncommitted file changes")}</pre>${detail.diff_stat ? `<p class="subtle">${esc(detail.diff_stat)}</p>` : ""}${diffBlock("Working tree diff", workingDiff, "No uncommitted diff")}${diffBlock("Latest commit diff", commitDiff, "No recent commit diff")}</section><section class="drawer-section conversation-section"><h3>Conversation</h3>${messages.length ? `${conversationOverview(messages)}<div class="conversation-list">${conversationMessages(messages)}</div>` : `<p class="subtle">${session ? "Session has no renderable messages yet." : "No session is associated with this worker yet."}</p>`}</section>`;
   document.querySelectorAll("#drawer-body .message").forEach((message) => {
     const toggle = () => {
       const expanded = message.classList.toggle("expanded");
@@ -77,6 +104,24 @@ async function openCharacter(role) {
       if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(); }
     });
   });
+  const nodes = document.querySelectorAll("#drawer-body .conversation-node");
+  const activateNode = (target) => {
+    nodes.forEach((node) => node.classList.toggle("active", node.dataset.messageTarget === target.id));
+  };
+  nodes.forEach((node) => {
+    const jump = () => {
+      const target = document.getElementById(node.dataset.messageTarget); if (!target) return;
+      target.classList.add("expanded", "conversation-target"); target.setAttribute("aria-expanded", "true"); activateNode(target);
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      window.setTimeout(() => target.classList.remove("conversation-target"), 1500);
+    };
+    node.addEventListener("click", jump);
+    node.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); jump(); } });
+  });
+  if (window.IntersectionObserver) {
+    const observer = new IntersectionObserver((entries) => entries.forEach((entry) => { if (entry.isIntersecting) activateNode(entry.target); }), { root: document.querySelector("#drawer"), threshold: 0.35 });
+    document.querySelectorAll("#drawer-body .message").forEach((message) => observer.observe(message));
+  }
   document.querySelector("#drawer").classList.add("open"); document.querySelector("#drawer").setAttribute("aria-hidden", "false"); document.querySelector("#backdrop").hidden = false;
 }
 function closeDrawer() { document.querySelector("#drawer").classList.remove("open"); document.querySelector("#drawer").setAttribute("aria-hidden", "true"); document.querySelector("#backdrop").hidden = true; }
