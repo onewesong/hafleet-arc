@@ -5,10 +5,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hafleet_arc.worktree import WorktreeConflict, WorktreeManager
+from hafleet_arc.worktree import WorktreeConflict, WorktreeManager, _role_identity
 
 
 class WorktreeManagerTests(unittest.TestCase):
+    def test_role_identity_uses_prefix_and_domain_rules(self) -> None:
+        self.assertEqual(_role_identity("architect"), ("HAFleet-Architect", "architect@hafleet.local"))
+        self.assertEqual(_role_identity("final review"), ("HAFleet-Final-Review", "final-review@hafleet.local"))
+        self.assertEqual(_role_identity(""), ("HAFleet-Reviewer", "reviewer@hafleet.local"))
+
     def test_create_commit_cherry_pick_and_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -25,6 +30,11 @@ class WorktreeManagerTests(unittest.TestCase):
             worktree, branch = manager.create_or_reuse("REQ-1", base)
             (worktree / "feature.txt").write_text("feature\n", encoding="utf-8")
             manager.ensure_commit(worktree, "REQ-1: feature")
+            author = subprocess.run(
+                ["git", "log", "-1", "--format=%an <%ae>"], cwd=worktree,
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(author, "HAFleet-Reviewer <reviewer@hafleet.local>")
             manager.cherry_pick(manager.commits_since(worktree, base))
             manager.remove_successful(worktree, branch)
 

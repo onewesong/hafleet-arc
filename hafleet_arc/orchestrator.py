@@ -30,7 +30,7 @@ class RuntimeEvents(Protocol):
 
 
 class RuntimeGit(Protocol):
-    def commit(self, message: str) -> bool: ...
+    def commit(self, message: str, role: str = "reviewer") -> bool: ...
 
 
 class RuntimeLike(Protocol):
@@ -89,6 +89,15 @@ class FleetOrchestrator:
         self.architecture_path = output_dir / ".arc" / "hafleet" / "architecture.md"
         configured_pause = os.environ.get("ARCBENCH_PAUSE_REQUEST_PATH", "").strip()
         self.pause_request_path = Path(configured_pause) if configured_pause else output_dir / ".arc" / "pause-request"
+
+    def _commit(self, message: str, role: str) -> bool:
+        """Commit with a role identity while keeping older RuntimeGit adapters working."""
+        try:
+            return self.runtime.git.commit(message, role=role)
+        except TypeError as error:
+            if "role" not in str(error):
+                raise
+            return self.runtime.git.commit(message)
 
     def _check_pause(self, module: RequirementModule | None, phase: str | None) -> None:
         if not self.pause_request_path.exists():
@@ -264,7 +273,7 @@ class FleetOrchestrator:
 
             self.runtime.events.mark_implementation_done(module.node_id, "Implementation reviewed and repaired")
             checkpoint_message = f"{module.node_id}: implement and review {module.name}"
-            committed = self.runtime.git.commit(checkpoint_message)
+            committed = self._commit(checkpoint_message, "reviewer")
             log(
                 f"[hafleet]   checkpoint {'created' if committed else 'skipped'}: {checkpoint_message}",
                 flush=True,
@@ -308,7 +317,7 @@ class FleetOrchestrator:
             )
             self._run_postflight(module_ids)
             final_checkpoint = "ROOT: final HAFleet integration review"
-            committed = self.runtime.git.commit(final_checkpoint)
+            committed = self._commit(final_checkpoint, "postflight")
             log(
                 f"[hafleet] Final checkpoint {'created' if committed else 'skipped'}: {final_checkpoint}",
                 flush=True,
@@ -456,6 +465,7 @@ class FleetOrchestrator:
                     commit = manager.ensure_commit(
                         workspace,
                         f"{module.node_id}: implement and review {module.name}",
+                        role="reviewer",
                     )
                     commits = manager.commits_since(workspace, module_base)
                     if not commits:
@@ -540,7 +550,7 @@ class FleetOrchestrator:
                         + "\n- ".join(violations)
                     )
             checkpoint_message = "ROOT: architecture scaffold"
-            committed = self.runtime.git.commit(checkpoint_message)
+            committed = self._commit(checkpoint_message, "architect")
             self.checkpoint.mark_architecture_completed()
             log(
                 f"[hafleet] architecture document created ({self.architecture_path.stat().st_size} bytes)",

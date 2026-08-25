@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,21 @@ ARC_GITIGNORE_START = "# >>> arcbench-agent-runtime >>>"
 ARC_GITIGNORE_END = "# <<< arcbench-agent-runtime <<<"
 
 
+def normalize_role(role: str) -> str:
+    """Return a safe, stable role token for generated Git identities."""
+    value = re.sub(r"[^a-z0-9]+", "-", str(role or "").strip().lower()).strip("-")
+    return value or "reviewer"
+
+
+def git_identity_for_role(role: str) -> tuple[str, str]:
+    normalized = normalize_role(role)
+    prefix = os.environ.get("HAFLEET_GIT_NAME_PREFIX", "HAFleet-").strip() or "HAFleet-"
+    domain = os.environ.get("HAFLEET_GIT_EMAIL_DOMAIN", "hafleet.local").strip().lower() or "hafleet.local"
+    domain = re.sub(r"[^a-z0-9.-]", "", domain).strip(".") or "hafleet.local"
+    title = "-".join(part.capitalize() for part in normalized.split("-"))
+    return f"{prefix}{title}", f"{normalized}@{domain}"
+
+
 @dataclass(frozen=True)
 class GitResult:
     returncode: int
@@ -27,7 +43,9 @@ class GitClient:
         self.paths = paths
         self.events = events
 
-    def _get_identity(self) -> tuple[str, str]:
+    def _get_identity(self, role: str | None = None) -> tuple[str, str]:
+        if role is not None:
+            return git_identity_for_role(role)
         user_name = (
             os.environ.get("ARC_GIT_USER_NAME")
             or os.environ.get("GIT_AUTHOR_NAME")
@@ -42,20 +60,20 @@ class GitClient:
         ).strip()
         return user_name, user_email
 
-    def _build_env(self) -> dict[str, str]:
+    def _build_env(self, role: str | None = None) -> dict[str, str]:
         env = os.environ.copy()
-        user_name, user_email = self._get_identity()
+        user_name, user_email = self._get_identity(role)
         env["GIT_AUTHOR_NAME"] = user_name
         env["GIT_AUTHOR_EMAIL"] = user_email
         env["GIT_COMMITTER_NAME"] = user_name
         env["GIT_COMMITTER_EMAIL"] = user_email
         return env
 
-    def run(self, args: list[str], *, check: bool = True) -> GitResult:
+    def run(self, args: list[str], *, check: bool = True, role: str | None = None) -> GitResult:
         completed = subprocess.run(
             ["git", *args],
             cwd=str(self.paths.project_dir),
-            env=self._build_env(),
+            env=self._build_env(role),
             check=False,
             capture_output=True,
             text=True,
@@ -72,10 +90,10 @@ class GitClient:
             raise RuntimeError(stderr)
         return result
 
-    def configure_identity(self) -> tuple[str, str]:
-        user_name, user_email = self._get_identity()
-        self.run(["config", "user.name", user_name])
-        self.run(["config", "user.email", user_email])
+    def configure_identity(self, role: str | None = None) -> tuple[str, str]:
+        user_name, user_email = self._get_identity(role)
+        self.run(["config", "user.name", user_name], role=role)
+        self.run(["config", "user.email", user_email], role=role)
         return user_name, user_email
 
     def ensure_arc_gitignore(self) -> Path:
@@ -121,12 +139,12 @@ class GitClient:
         git_dir = self.paths.project_dir / ".git"
         if not git_dir.exists():
             self.run(["init"])
-        user_name, user_email = self.configure_identity()
+        user_name, user_email = self.configure_identity("architect")
         self.ensure_arc_gitignore()
         self.events.notify_commit_history_changed("git_initialized")
         if create_initial_commit:
             self.run(["add", "."])
-            result = self.run(["commit", "-m", "init"], check=False)
+            result = self.run(["commit", "-m", "init"], check=False, role="architect")
             if result.returncode == 0:
                 self.events.notify_commit_history_changed("git_init_commit", preview=True)
             elif "nothing to commit" not in (result.stdout + result.stderr):
@@ -150,12 +168,12 @@ class GitClient:
     def status_porcelain(self) -> str:
         return self.run(["status", "--short"], check=False).stdout
 
-    def add_all(self) -> None:
-        self.run(["add", "."])
+    def add_all(self, role: str | None = None) -> None:
+        self.run(["add", "."], role=role)
 
-    def commit(self, message: str) -> bool:
-        self.add_all()
-        result = self.run(["commit", "-m", message], check=False)
+    def commit(self, message: str, role: str = "reviewer") -> bool:
+        self.add_all(role)
+        result = self.run(["commit", "-m", message], check=False, role=role)
         if result.returncode == 0:
             self.events.notify_commit_history_changed("git_commit", preview=True)
             return True
