@@ -10,52 +10,7 @@ from types import TracebackType
 from typing import Any, Self
 
 from .log import log
-
-ROLE_INSTRUCTIONS = {
-    "architect": """
-You are the architecture agent in a finite HAFleet ARC run. Read the complete ROOT
-requirement tree and the current repository, then create a durable architecture for
-the whole project before feature modules are implemented. Write the architecture
-document to the exact path supplied by the coordinator and create or refactor a
-minimal, runnable project skeleton without implementing the full business feature
-set.
-
-The architecture document must cover frontend views/components/state/router,
-backend routes/services/repositories/middleware, API boundaries, data model and
-persistence, validation, permissions, testing, and the module ownership map. Keep
-frontend and backend business logic modular: use directories such as
-frontend/src/client, components, views, state, router and backend/routes, services,
-repositories, middleware, data. Keep entrypoints thin and do not put the whole
-application in frontend/src/app.js or backend/server.js. Preserve existing working
-behavior when refactoring an existing workspace. For web tasks, leave a runnable
-frontend/backend skeleton with the required npm scripts and PORT handling. Do not
-implement all requirement scenarios during this turn and do not start a long-running
-server. Do not place browser-loaded frontend modules under a top-level `api/` path:
-the backend reserves `/api/*` for JSON endpoints, so frontend client modules must use
-paths such as `frontend/src/client/` or `frontend/src/services/`.
-""",
-    "planner": """
-You are the planning agent in a finite HAFleet run. Analyze the supplied requirement
-subtree and the current repository. Write a concise, concrete implementation plan to
-the exact plan path supplied by the coordinator. Do not modify any other file. Cover
-data model, routes/UI, persistence, validation, scenarios, and verification. Resolve
-uncertainty by inspecting the existing project. Do not start a long-running server.
-""",
-    "implementer": """
-You are the implementation agent in a finite HAFleet run. Read the coordinator's plan
-and implement the entire supplied requirement subtree in the current repository.
-Preserve working behavior from earlier modules. Build real persisted behavior rather
-than static mock screens. Run focused checks while working. Do not merely explain what
-to do, do not stop at scaffolding, and do not start a long-running server.
-""",
-    "reviewer": """
-You are the reviewer and repair agent in a finite HAFleet run. Inspect the implemented
-requirement subtree against its scenarios, run practical tests or build checks, and fix
-all defects you find. Check cross-module regressions, persistence, permissions,
-validation, and visible UI behavior. Finish with a runnable project. Do not only write
-a review report and do not start a long-running server.
-""",
-}
+from .pipeline import Pipeline, load_pipeline
 
 TRANSIENT_ERROR_MARKERS = (
     "401",
@@ -134,6 +89,7 @@ class CodexFleet:
         self._codex: Any = None
         self._threads: dict[tuple[str, str], Any] = {}
         self._thread_lock = threading.Lock()
+        self.pipeline: Pipeline = load_pipeline(output_dir)
 
     @staticmethod
     def _model_for_role(role: str) -> str | None:
@@ -141,6 +97,17 @@ class CodexFleet:
 
         role_model = os.environ.get(f"HAFLEET_{role.upper()}_MODEL", "").strip()
         return role_model or os.environ.get("MODEL", "").strip() or None
+
+    @staticmethod
+    def _read_only_role(role: str) -> bool:
+        normalized = str(role or "").strip().lower().replace("-", "_")
+        return (
+            normalized in {"reviewer", "review", "qa"}
+            or normalized.endswith("_reviewer")
+            or "review" in normalized
+            or "audit" in normalized
+            or normalized.endswith("_qa")
+        )
 
     def __enter__(self) -> Self:
         try:
@@ -186,8 +153,9 @@ class CodexFleet:
         key = (role, str(cwd))
         if key in self._threads:
             return self._threads[key]
-        if role not in ROLE_INSTRUCTIONS:
-            raise ValueError(f"unknown fleet role: {role}")
+        instructions = self.pipeline.prompt_for(role) or self.pipeline.default_prompt
+        if not instructions:
+            raise RuntimeError(f"pipeline has no prompt for role {role!r} and no default_prompt")
         from openai_codex import ApprovalMode, Sandbox
 
         skill_note = (
@@ -196,6 +164,8 @@ class CodexFleet:
             else ""
         )
         model = self._model_for_role(role)
+        if self._read_only_role(role):
+            instructions += "\nThis role is read-only: do not modify project files or Git state; report findings only."
         delivery_note = ""
         if self.task_type == "web":
             delivery_note = f"""
@@ -212,10 +182,10 @@ ARC-Bench web delivery contract:
 """
         thread = self._codex.thread_start(
             cwd=str(cwd),
-            sandbox=Sandbox.full_access,
+            sandbox=Sandbox.read_only if self._read_only_role(role) else Sandbox.full_access,
             approval_mode=ApprovalMode.deny_all,
             model=model,
-            developer_instructions=ROLE_INSTRUCTIONS[role].strip() + delivery_note + skill_note,
+            developer_instructions=instructions.strip() + delivery_note + skill_note,
         )
         self._threads[key] = thread
         return thread

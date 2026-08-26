@@ -38,20 +38,23 @@ flowchart TD
     E -- "Yes" --> F["Skip module"]
     E -- "No" --> G["Planner: write implementation plan"]
     G --> H["Implementer: implement requirement subtree"]
-    H --> I["Reviewer: test, review, and repair"]
-    I --> J["Emit events and update traceability"]
-    J --> K["Create git checkpoint"]
-    K --> L["Update checkpoint.json"]
-    L --> M{"More modules?"}
-    F --> M
-    M -- "Yes" --> E
-    M -- "No" --> N["Run final integration review"]
-    N --> O["Build and start rehearsal on smoke port"]
-    O --> P{"Postflight passed?"}
-    P -- "No" --> Q["Reviewer repairs exact failure"]
-    Q --> O
-    P -- "Yes" --> R["Create final git checkpoint"]
-    R --> S["Mark run completed and exit"]
+    H --> I["Reviewer: read-only JSON review"]
+    I --> J{"Blocker/major findings?"}
+    J -- "Yes" --> K["Implementer repairs from feedback"]
+    K --> I
+    J -- "No" --> L["Emit events and update traceability"]
+    L --> M["Create git checkpoint"]
+    M --> N["Update checkpoint.json"]
+    N --> O{"More modules?"}
+    F --> O
+    O -- "Yes" --> E
+    O -- "No" --> P["Run final integration review loop"]
+    P --> Q["Build and start rehearsal on smoke port"]
+    Q --> R{"Postflight passed?"}
+    R -- "No" --> S["Implementer repairs exact failure"]
+    S --> Q
+    R -- "Yes" --> T["Create final git checkpoint"]
+    T --> U["Mark run completed and exit"]
 ```
 
 ### 1. Initialize the workspace
@@ -93,12 +96,29 @@ implementer, and reviewer in an isolated worktree; the main workspace cherry-pic
 modules in dependency order. Successful worktrees are removed, while failed or
 conflicted worktrees remain under `.arc/hafleet/worktrees/`.
 
+### Optional pipeline configuration
+
+The built-in pipeline is maintained in `hafleet_arc/pipeline.yaml` and can be
+overridden per output workspace with `.arc/hafleet/pipeline.yaml`. It uses versioned `agent`, `loop`, and `operation`
+nodes; the loop's `review`, `repair`, `until`, and `max_rounds` fields control the
+review/repair policy. Omit the file to use the default Architect → Planner →
+Implementer → Reviewer/Implementer loop → checkpoint → Postflight pipeline.
+Role prompts are maintained in the same YAML under `roles.<role>`. A run-local
+configuration may override only one prompt while inheriting the other built-in
+role prompts.
+
+Every turn and operation is appended to `.arc/hafleet/messages.jsonl`. The log is
+durable and can be replayed after a restart; the Dashboard's `/api/stream` endpoint
+uses Server-Sent Events (and `Last-Event-ID`) to show the same messages in its
+virtual Agent conversation room.
+
 ## Optional run dashboard
 
 The standalone local dashboard observes one output directory without changing the
 execution pipeline. Its Python service exposes the read-only API, while the UI is
 also available as an independent Vite project. It reads `runner-events.jsonl`,
-`checkpoint.json`, module plans, and Codex session JSONL files. Enable the integrated
+`checkpoint.json`, module plans, Codex session JSONL files, and the append-only
+`.arc/hafleet/messages.jsonl` Agent message bus. Enable the integrated
 dashboard explicitly with:
 
 ```bash
@@ -111,7 +131,7 @@ python3 main.py /path/to/requirements \
 
 It is also configurable with `HAFLEET_DASHBOARD=1` and
 `HAFLEET_DASHBOARD_PORT=3200`. Open `http://127.0.0.1:3200` to see the pipeline,
-module state, Codex sessions, and clickable conversation details. The dashboard is
+module state, live Agent conversation room, review rounds, Codex sessions, and clickable conversation details. The dashboard is
 bound to localhost and is disabled by default.
 
 For independent frontend development, run the API and Vite UI separately:
@@ -177,12 +197,16 @@ in the shared output workspace. It must preserve behavior from earlier modules,
 build real persisted behavior rather than static mock screens, and run focused
 checks while working.
 
-### 6. Review and repair
+### 6. Review loop and repair
 
-The `reviewer` checks the implementation against its scenarios, runs practical
-tests or build checks, and directly repairs every defect it finds. The review
-also covers cross-module regressions, persistence, permissions, validation, and
-visible UI behavior.
+The `reviewer` checks the implementation against its scenarios in a read-only
+Codex sandbox, runs practical tests or build checks, and returns a structured JSON
+verdict. It never edits source files or Git state. Findings use `blocker`, `major`,
+`minor`, or `info` severity. Blocker/major findings are appended to the message
+bus and routed to the `implementer`, which repairs the current module. The reviewer
+runs again until the module passes or the bounded loop pauses (three rounds by
+default). Minor/info findings remain visible in the Dashboard but do not block a
+checkpoint.
 
 When the module passes review, the orchestrator:
 
@@ -203,10 +227,10 @@ run again, while earlier completed modules are retained.
 
 ### 8. Run the final integration review
 
-After all modules are complete, the `reviewer` performs one whole-project
-integration pass. It runs the build and practical tests, repairs regressions and
-integration gaps, and leaves the application runnable without starting a
-long-running server. The resulting checkpoint commit is:
+After all modules are complete, the read-only `reviewer` performs a whole-project
+integration pass. Any regression is sent to the `implementer` through the same
+message-bus loop. It runs the build and practical tests and leaves the application
+runnable without starting a long-running server. The resulting checkpoint commit is:
 
 ```text
 ROOT: final HAFleet integration review
@@ -220,7 +244,7 @@ For web tasks, HAFleet ARC does not report completion immediately after the
 final review. It first verifies the required `frontend/` and `backend/`
 structure, runs the same npm install and frontend build sequence as the grader,
 then starts the backend on the isolated smoke port and waits for an HTTP
-response. A failed postflight is sent back to the reviewer with the exact error
+response. A failed postflight is sent back to the implementer with the exact error
 for up to two repair passes.
 
 Only a successful postflight creates the final git checkpoint, marks the
@@ -245,7 +269,7 @@ foreign listener on a shared runner.
 | `HAFLEET_RETRY_DELAYS` | `30,60` | Comma-separated retry delays in seconds |
 | `HAFLEET_TURN_TIMEOUT` | `1200` | Maximum seconds for one Codex turn |
 | `HAFLEET_SMOKE_PORT` | `3100` | Safe generation-time application port |
-| `HAFLEET_POSTFLIGHT_REPAIRS` | `2` | Reviewer repair attempts after failed rehearsal |
+| `HAFLEET_POSTFLIGHT_REPAIRS` | `2` | Implementer repair attempts after failed rehearsal |
 | `HAFLEET_NPM_TIMEOUT` | `600` | Timeout for each postflight npm command |
 | `HAFLEET_READY_TIMEOUT` | `45` | Backend readiness timeout during rehearsal |
 | `HAFLEET_FINAL_REVIEW` | `1` | Enable the whole-project reviewer pass |

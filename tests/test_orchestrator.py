@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import subprocess
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -80,6 +81,39 @@ class FakeRuntime:
 class OrchestratorTests(unittest.TestCase):
     def _module(self, index: int, node_id: str) -> RequirementModule:
         return RequirementModule(index, 2, node_id, node_id, {"id": node_id})
+
+    def test_reviewer_feedback_loops_back_to_implementer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class LoopDriver:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append(role)
+                    if role == "reviewer" and self.calls.count("reviewer") == 1:
+                        return SimpleNamespace(final_response='{"verdict":"changes_requested","summary":"fix","findings":[{"id":"F-1","severity":"major","title":"missing"}],"checks":[]}')
+                    if role == "implementer":
+                        (workspace_dir or root / "workspace").mkdir(parents=True, exist_ok=True)
+                        (workspace_dir or root / "workspace").joinpath("fixed.txt").write_text("fixed\n", encoding="utf-8")
+                    return SimpleNamespace(final_response='{"verdict":"pass","summary":"ok","findings":[],"checks":[]}')
+
+            driver = LoopDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            result = orchestrator._review_loop(self._module(1, "REQ-1"), "Review REQ-1")
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(driver.calls, ["reviewer", "implementer", "reviewer"])
+            messages = orchestrator.bus.replay()
+            self.assertTrue(any(item["kind"] == "review.feedback" for item in messages))
+            self.assertTrue(any(item["kind"] == "pipeline.state" and item["payload"].get("status") == "approved" for item in messages))
 
     def test_runs_three_roles_and_checkpoints_each_module(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

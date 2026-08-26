@@ -137,6 +137,35 @@ class CodexFleetRetryTests(unittest.TestCase):
 
             self.assertEqual(codex.starts, 2)
 
+    def test_reviewer_uses_read_only_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fleet = CodexFleet(Path(temporary))
+            codex = FakeCodex([SimpleNamespace(error=None, final_response="review")])
+            fleet._codex = codex
+            fleet.run("reviewer", "review")
+            self.assertEqual(str(codex.start_kwargs[0]["sandbox"]), "Sandbox.read_only")
+
+    def test_role_prompt_is_loaded_from_pipeline_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / ".arc" / "hafleet" / "pipeline.yaml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                "version: 1\n"
+                "roles:\n"
+                "  planner: |\n"
+                "    Custom planner instructions from YAML.\n"
+                "nodes:\n"
+                "  - {id: planner, type: agent, role: planner}\n"
+                "  - {id: review_loop, type: loop, review: reviewer, repair: implementer, max_rounds: 1}\n",
+                encoding="utf-8",
+            )
+            fleet = CodexFleet(root)
+            codex = FakeCodex([SimpleNamespace(error=None, final_response="planner")])
+            fleet._codex = codex
+            fleet.run("planner", "plan")
+            self.assertIn("Custom planner instructions from YAML.", codex.start_kwargs[0]["developer_instructions"])
+
 
 if __name__ == "__main__":
     unittest.main()

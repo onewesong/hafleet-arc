@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from ..message_bus import MessageBus
+
 
 ROLE_PATTERNS = {
     "architect": re.compile(r"architecture agent", re.IGNORECASE),
@@ -210,6 +212,36 @@ class DashboardCollector:
         self.events_path = self.arc_dir / "runner-events.jsonl"
         self.checkpoint_path = self.arc_dir / "checkpoint.json"
         self.sessions_dir = self.arc_dir / "hafleet" / "codex-home" / "sessions"
+        self.messages_path = self.arc_dir / "hafleet" / "messages.jsonl"
+        self.message_bus = MessageBus(self.messages_path)
+
+    def messages(self, after_sequence: int = 0, module_id: str = "") -> list[dict[str, Any]]:
+        return self.message_bus.replay(after_sequence, module_id=module_id)[-500:]
+
+    def conversations(self) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for message in self.message_bus.replay():
+            conversation_id = str(message.get("conversation_id") or "run")
+            item = grouped.setdefault(
+                conversation_id,
+                {
+                    "id": conversation_id,
+                    "module_id": message.get("module_id", ""),
+                    "status": "active",
+                    "round": 0,
+                    "last_message_id": "",
+                    "major_findings": 0,
+                },
+            )
+            item["round"] = max(int(item.get("round", 0) or 0), int(message.get("round", 0) or 0))
+            item["last_message_id"] = message.get("id", "")
+            if message.get("kind") == "review.verdict":
+                payload = message.get("payload") or {}
+                item["major_findings"] = len(payload.get("blocking_findings") or [])
+                item["status"] = "approved" if payload.get("passed") else "changes_requested"
+            elif message.get("kind") == "pipeline.state":
+                item["status"] = (message.get("payload") or {}).get("status", item["status"])
+        return list(grouped.values())
 
     def _events(self) -> list[dict[str, Any]]:
         if not self.events_path.is_file():
@@ -666,6 +698,7 @@ class DashboardCollector:
         checkpoint = _read_json(self.checkpoint_path, {})
         modules = self._module_states(events)
         sessions = [self._parse_session(path) for path in self._session_files()]
+        conversations = self.conversations()
         return {
             "output_dir": str(self.output_dir),
             "runner": {
@@ -674,8 +707,16 @@ class DashboardCollector:
                 "message": runner.get("message"),
             },
             "checkpoint": checkpoint,
+            "pipeline": {
+                "node": checkpoint.get("current_pipeline_node"),
+                "round": int(checkpoint.get("current_round", 0) or 0),
+                "status": checkpoint.get("loop_status") or runner.get("state", "unknown"),
+                "message_cursor": int(checkpoint.get("message_cursor", 0) or 0),
+            },
             "modules": modules,
             "events": events[-200:],
+            "messages": self.messages()[-300:],
+            "conversations": conversations,
             "sessions": sessions,
             "characters": self._characters(sessions, modules, runner, checkpoint),
             "generated_at": datetime.now().astimezone().isoformat(),
@@ -713,6 +754,28 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/api/stream":
+            after = self.headers.get("Last-Event-ID", "")
+            try:
+                after_sequence = int(after or 0)
+            except ValueError:
+                after_sequence = 0
+            module_id = parse_qs(parsed.query).get("module_id", [""])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                for message in self.collector.message_bus.subscribe(after_sequence, module_id=module_id):
+                    sequence = message.get("sequence", "")
+                    payload = json.dumps(message, ensure_ascii=False)
+                    self.wfile.write(f"id: {sequence}\nevent: {message.get('kind', 'message')}\ndata: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            return
         if parsed.path == "/api/state":
             self._send(200, json.dumps(self.collector.state(), ensure_ascii=False).encode(), "application/json; charset=utf-8")
             return

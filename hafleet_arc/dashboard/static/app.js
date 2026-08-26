@@ -1,5 +1,5 @@
 const esc = (value) => String(value ?? "").replace(/[&<>\"]/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[char]));
-const state = { data: null };
+const state = { data: null, chatMessages: new Map(), stream: null, reconnectTimer: null, chatFilters: { module: "", role: "", round: "", kind: "" } };
 const roles = ["architect", "planner", "implementer", "reviewer", "postflight"];
 const labels = { architect: "Architect", planner: "Planner", implementer: "Implementer", reviewer: "Reviewer", postflight: "Postflight" };
 const icons = { architect: "⌂", planner: "✎", implementer: "⚙", reviewer: "✓", postflight: "◈" };
@@ -42,6 +42,74 @@ function renderEvents(data) {
   document.querySelector("#events").innerHTML = events.length ? events.map((event) => `<div class="event-row"><time>${esc(event.timestamp || "")}</time><span><strong>${esc(event.type || "event")}</strong> ${esc(event.message || event.reason || event.state || "")}</span></div>`).join("") : `<p class="subtle">No events yet.</p>`;
 }
 
+function chatRoleLabel(role) { return labels[role] || String(role || "System"); }
+function chatMessageText(message) {
+  const payload = message.payload || {};
+  if (message.kind === "review.feedback") return payload.summary || "Reviewer requested changes";
+  if (message.kind === "review.verdict") return payload.passed ? "Review approved" : `Changes requested (${(payload.blocking_findings || []).length} major/blocker)`;
+  if (message.kind === "pipeline.state") return `Pipeline: ${payload.status || "updated"}`;
+  return payload.response || payload.message || `${message.kind || "message"}`;
+}
+function renderChat() {
+  const filters = state.chatFilters;
+  const messages = Array.from(state.chatMessages.values()).filter((message) => {
+    if (filters.module && String(message.module_id || "") !== filters.module) return false;
+    if (filters.role && String(message.from || "") !== filters.role) return false;
+    if (filters.round && String(message.round || 0) !== filters.round) return false;
+    if (filters.kind && String(message.kind || "") !== filters.kind) return false;
+    return true;
+  }).slice(-120);
+  const target = document.querySelector("#chat");
+  if (!target) return;
+  target.innerHTML = messages.length ? messages.map((message) => {
+    const payload = message.payload || {};
+    const findings = message.kind === "review.feedback" ? (payload.findings || []).map((finding) => `<li class="chat-finding ${esc(finding.severity || "major")}"><strong>${esc(finding.severity || "major")}</strong> ${esc(finding.title || finding.description || "Finding")}</li>`).join("") : "";
+    const module = String(message.module_id || "");
+    const sender = String(message.from || "");
+    return `<article class="chat-message ${esc(sender || "system")} ${esc(message.kind || "message")}" data-chat-role="${esc(sender)}" data-chat-module="${esc(module)}" tabindex="0" role="button"><div class="chat-message-head"><strong>${esc(chatRoleLabel(sender))}</strong><span>${esc(module || "run")}${message.round ? ` · round ${Number(message.round)}` : ""}</span><time>${esc(message.created_at || "")}</time></div><p>${esc(chatMessageText(message))}</p>${findings ? `<ul class="chat-findings">${findings}</ul>` : ""}</article>`;
+  }).join("") : `<p class="subtle">No agent messages yet.</p>`;
+  target.scrollTop = target.scrollHeight;
+  target.querySelectorAll("[data-chat-module]").forEach((message) => {
+    const open = () => { if (message.dataset.chatModule) openCharacter(message.dataset.chatRole || "reviewer", message.dataset.chatModule); };
+    message.addEventListener("click", open);
+    message.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
+  });
+}
+function updateChatFilters() {
+  const values = Array.from(state.chatMessages.values());
+  const choices = [
+    ["chat-module-filter", "module_id", "All modules"],
+    ["chat-role-filter", "from", "All roles"],
+    ["chat-round-filter", "round", "All rounds"],
+    ["chat-kind-filter", "kind", "All message types"],
+  ];
+  choices.forEach(([id, key, empty]) => {
+    const select = document.querySelector(`#${id}`); if (!select) return;
+    const current = state.chatFilters[{ module_id: "module", from: "role", round: "round", kind: "kind" }[key]];
+    const unique = [...new Set(values.map((message) => String(message[key] || "")).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b)));
+    select.innerHTML = `<option value="">${empty}</option>${unique.map((value) => `<option value="${esc(value)}">${esc(value)}</option>`).join("")}`;
+    select.value = current;
+  });
+}
+function addChatMessage(message) {
+  if (!message || message.kind === "heartbeat") return;
+  const key = message.id || `sequence-${message.sequence}`;
+  if (state.chatMessages.has(key)) return;
+  state.chatMessages.set(key, message);
+  updateChatFilters();
+  renderChat();
+}
+function connectChatStream() {
+  if (!window.EventSource) { document.querySelector("#chat-connection").textContent = "Polling fallback"; return; }
+  if (state.stream) state.stream.close();
+  const stream = new EventSource("/api/stream"); state.stream = stream;
+  stream.onopen = () => { document.querySelector("#chat-connection").textContent = "Live"; };
+  stream.onerror = () => { document.querySelector("#chat-connection").textContent = "Reconnecting…"; stream.close(); window.clearTimeout(state.reconnectTimer); state.reconnectTimer = window.setTimeout(connectChatStream, 2000); };
+  ["turn.request", "turn.started", "turn.completed", "agent.message", "review.feedback", "review.verdict", "operation.started", "operation.completed", "operation.failed", "pipeline.state", "checkpoint.created", "heartbeat"].forEach((kind) => stream.addEventListener(kind, (event) => {
+    try { addChatMessage(JSON.parse(event.data)); } catch {}
+  }));
+}
+
 function render(data) {
   state.data = data;
   const runner = data.runner || {};
@@ -51,6 +119,9 @@ function render(data) {
   document.querySelector("#run-message").textContent = runner.message || "Factory is ready";
   document.querySelector("#updated").textContent = data.generated_at ? `Updated ${new Date(data.generated_at).toLocaleTimeString()}` : "";
   document.querySelector("#session-count").textContent = `${(data.sessions || []).length} Codex sessions`;
+  (data.messages || []).forEach(addChatMessage);
+  updateChatFilters();
+  renderChat();
   renderRoom(data); renderPipeline(data); renderModules(data); renderEvents(data);
 }
 
@@ -67,7 +138,7 @@ function changeSourceLabel(source) {
     module_checkpoint: "Module checkpoint",
     postflight_worktree: "Postflight worktree",
     postflight_commit: "Postflight commit",
-  })[source] || ({ latest_commit: "Latest workspace commit", working_tree: "Working tree" })[source] || "Role/stage output";
+  })[source] || ({ latest_commit: "Latest commit", working_tree: "Working tree" })[source] || "Role/stage output";
 }
 function diffHtml(diff) {
   return String(diff || "").split(/\r?\n/).map((line) => {
@@ -169,3 +240,5 @@ async function openCharacter(role, moduleId = "") {
 function closeDrawer() { document.querySelector("#drawer").classList.remove("open"); document.querySelector("#drawer").setAttribute("aria-hidden", "true"); document.querySelector("#backdrop").hidden = true; }
 async function refresh() { try { render(await (await fetch("/api/state", { cache: "no-store" })).json()); } catch (error) { document.querySelector("#runner").textContent = `Dashboard error: ${error.message}`; } }
 document.querySelector("#close").addEventListener("click", closeDrawer); document.querySelector("#backdrop").addEventListener("click", closeDrawer); refresh(); setInterval(refresh, 1500);
+[["chat-module-filter", "module"], ["chat-role-filter", "role"], ["chat-round-filter", "round"], ["chat-kind-filter", "kind"]].forEach(([id, key]) => document.querySelector(`#${id}`)?.addEventListener("change", (event) => { state.chatFilters[key] = event.target.value; renderChat(); }));
+connectChatStream();

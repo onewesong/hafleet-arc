@@ -205,6 +205,26 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("conversation-message-", app)
         self.assertIn("data-task-module", app)
         self.assertIn("module_id=${encodeURIComponent(moduleId)}", app)
+        self.assertIn("EventSource", app)
+        self.assertIn("Agent conversation room", (frontend / "index.html").read_text(encoding="utf-8"))
+
+    def test_dashboard_state_and_sse_include_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            collector = DashboardCollector(root)
+            collector.message_bus.publish("review.feedback", sender="reviewer", module_id="REQ-1", payload={"summary": "fix"})
+            state = collector.state()
+            self.assertEqual(state["messages"][0]["kind"], "review.feedback")
+            self.assertEqual(state["conversations"][0]["module_id"], "REQ-1")
+            server = DashboardServer(root, port=0, api_only=True).start()
+            try:
+                port = server.httpd.server_address[1]
+                with urlopen(f"http://127.0.0.1:{port}/api/stream", timeout=2) as response:
+                    self.assertEqual(response.headers.get_content_type(), "text/event-stream")
+                    body = response.readline().decode()
+                    self.assertTrue(body.startswith("id:"))
+            finally:
+                server.stop()
 
     def test_role_task_cards_keep_completed_module_history(self) -> None:
         modules = [

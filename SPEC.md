@@ -53,7 +53,7 @@ HAFleet ARC MUST:
 2. preserve existing files when initializing or resuming an output workspace;
 3. create a global architecture contract before feature modules are implemented;
 4. process direct ROOT children in stable, dependency-aware order;
-5. give every module a plan, implementation turn, review/repair turn, and
+5. give every module a plan, implementation turn, read-only review loop, and
    durable checkpoint;
 6. emit machine-readable lifecycle and requirement-state events;
 7. keep runtime state, Codex home, checkpoints, and traceability under the
@@ -71,7 +71,8 @@ HAFleet ARC does not:
 
 - implement a hosted multi-tenant control plane;
 - prescribe a specific model vendor or model name;
-- provide a general workflow language;
+- replace a general-purpose workflow engine; its bounded pipeline YAML is scoped
+  to the ARC run and supported node types;
 - replace the coding agent's own file-editing, testing, or tool protocol;
 - write to a remote Git provider or open pull requests;
 - expose a mutable dashboard control API;
@@ -95,7 +96,8 @@ HAFleet ARC does not:
 
 3. **Fleet orchestrator** (`FleetOrchestrator`)
    - Owns phase transitions, module sequencing, pause checks, checkpoint
-     updates, retries through the driver, and final integration.
+     updates, message routing, review loops, retries through the driver, and
+     final integration.
 
 4. **Codex fleet driver** (`CodexFleet`)
    - Starts and reuses one in-process agent thread per `(role, workspace)`.
@@ -161,6 +163,8 @@ workspace contains:
     hafleet/
       architecture.md
       plans/<module-id>.md
+      pipeline.yaml                 # optional declarative pipeline
+      messages.jsonl                # append-only Agent/Pipeline bus
       codex-home/
       worktrees/<module-id>/       # parallel mode only
   frontend/                         # web task contract
@@ -169,6 +173,13 @@ workspace contains:
 
 `CODEX_HOME` MUST be redirected to `.arc/hafleet/codex-home` for the run so
 agent state does not depend on a writable user home directory.
+
+The built-in pipeline and role prompts are maintained in
+`hafleet_arc/pipeline.yaml`. A run-local `.arc/hafleet/pipeline.yaml` overrides
+the node graph and may override individual `roles.<role>` prompt strings; omitted
+role prompts inherit the built-in definitions. Orchestration policy and Agent
+instructions are therefore versioned together in YAML rather than hard-coded in
+the driver.
 
 ### 4.3 Completion result
 
@@ -279,16 +290,18 @@ where required, run focused checks, and avoid starting long-running servers.
 
 ### 6.4 Reviewer
 
-The reviewer runs after implementation and MUST test against the requirement
-scenarios, inspect cross-module behavior, repair defects directly, and leave a
-runnable project. The reviewer also performs the optional whole-project final
-integration review after all modules complete.
+The reviewer runs after implementation in a read-only sandbox. It MUST test
+against the requirement scenarios, inspect cross-module behavior, and return a
+structured verdict with blocker, major, minor, or info findings. It MUST NOT
+modify project files or Git state. Blocker/major findings are routed back to
+the implementer through the message bus; the reviewer runs again after repair
+until the loop passes or reaches its configured limit.
 
 ### 6.5 Postflight
 
 Postflight is a deterministic delivery stage, not a separate coding-agent
-role. It validates the final artifact and may route exact failures back to a
-reviewer repair turn. The final Git checkpoint is attributed to Postflight.
+role. It validates the final artifact and may route exact failures back to an
+implementer repair turn. The final Git checkpoint is attributed to Postflight.
 
 ## 7. Message and control flow
 
@@ -304,9 +317,9 @@ The orchestrator sends a role turn containing:
 - parallel worktree path and branch, if applicable; and
 - the complete module subtree or full ROOT tree for architecture.
 
-The message is a prompt to the coding agent. It is not persisted as a mutable
-workflow record; the resulting files, events, and Git commit are the durable
-outputs.
+The message is a prompt to the coding agent and is persisted in the run-local
+append-only message bus at `.arc/hafleet/messages.jsonl`. The resulting files,
+events, feedback, and Git commit remain durable outputs as well.
 
 ### 7.2 Agent-to-coordinator results
 
@@ -331,6 +344,22 @@ The event stream is observability data. It MUST NOT be used as the only resume
 source; `checkpoint.json` is authoritative for module completion and pause
 state.
 
+### 7.4 Message bus and dashboard stream
+
+The Agent message bus is an append-only JSONL log at
+`.arc/hafleet/messages.jsonl`. Each envelope has a monotonic `sequence`, unique
+`id`, run and conversation identifiers, sender/recipient, kind, module/phase/round,
+timestamp, and structured payload. Message kinds include `turn.request`,
+`turn.started`, `turn.completed`, `agent.message`, `review.feedback`,
+`review.verdict`, `operation.*`, `pipeline.state`, and `checkpoint.created`.
+
+The bus supports replay after a sequence cursor, idempotent publication by message
+ID, and in-process subscriptions. Subscribers also poll the durable file, so a
+Dashboard process separate from the orchestrator receives new messages without
+sharing Python objects. `GET /api/stream` exposes the same stream as SSE, honors
+`Last-Event-ID` and optional `module_id`, and emits periodic heartbeat events.
+The stream is read-only and does not replace `/api/state` or session detail APIs.
+
 ### 7.4 Phase transition sequence
 
 For a sequential module, the required sequence is:
@@ -340,11 +369,13 @@ For a sequential module, the required sequence is:
 3. emit planner/design completed;
 4. checkpoint `implement` and emit implementer started;
 5. run implementer;
-6. checkpoint `review` and run reviewer;
-7. emit implementation completed;
-8. commit the module checkpoint as reviewer;
-9. add the module to `checkpoint.json.completed`; and
-10. continue to the next module.
+6. checkpoint `review_loop` and run the read-only reviewer;
+7. route structured blocker/major feedback to implementer and repeat until
+   approved or bounded failure;
+8. emit implementation completed;
+9. commit the module checkpoint as reviewer;
+10. add the module to `checkpoint.json.completed`; and
+11. continue to the next module.
 
 The checkpoint MUST be created before the module is marked completed.
 
@@ -416,6 +447,11 @@ normalization and fallback rules.
 - `parallel_mode` and `max_workers`; and
 - `active_worktrees`, `failed_modules`, and `conflicted_modules` as applicable.
 
+When a review loop is active it SHOULD also contain `current_pipeline_node`,
+`current_round`, `loop_status`, `last_feedback_message_id`,
+`last_feedback_hash`, `review_findings`, `reviewer_write_violation`, and the
+last consumed message sequence.
+
 Checkpoint writes SHOULD be atomic. A malformed checkpoint is treated as an
 empty/default checkpoint rather than as permission to claim completion.
 
@@ -451,7 +487,7 @@ Postflight runs on `HAFLEET_SMOKE_PORT` (default `3100`) and MUST stop every
 server it starts. A workspace-scoped port guard MAY terminate only processes
 owned by this submission; it MUST NOT kill unrelated listeners.
 
-If rehearsal fails, HAFleet MAY send the exact error to the reviewer for up to
+If rehearsal fails, HAFleet MAY send the exact error to the implementer for up to
 `HAFLEET_POSTFLIGHT_REPAIRS` repair attempts. Only a passing rehearsal permits
 the final checkpoint and successful completion.
 
@@ -465,6 +501,7 @@ The following files have stable meanings:
 | File | Contract |
 | --- | --- |
 | `.arc/runner-events.jsonl` | Append-only lifecycle, requirement, signal, and traceability events |
+| `.arc/hafleet/messages.jsonl` | Ordered Agent/Pipeline messages, feedback, verdicts, and operation events |
 | `.arc/checkpoint.json` | Resume and completion state machine |
 | `.arc/traceability/` | Requirement, scenario, test, interface, node-state, and call-edge stores |
 | `.arc/hafleet/architecture.md` | Global architecture contract written by Architect |
@@ -496,7 +533,7 @@ Implementations SHOULD preserve these reference variables:
 | `HAFLEET_RETRY_DELAYS` | `30,60` | Retry delays in seconds |
 | `HAFLEET_TURN_TIMEOUT` | `1200` | Agent turn timeout in seconds |
 | `HAFLEET_SMOKE_PORT` | `3100` | Safe web rehearsal port |
-| `HAFLEET_POSTFLIGHT_REPAIRS` | `2` | Reviewer repairs after failed rehearsal |
+| `HAFLEET_POSTFLIGHT_REPAIRS` | `2` | Implementer repairs after failed rehearsal |
 | `HAFLEET_NPM_TIMEOUT` | `600` | Per-command npm timeout |
 | `HAFLEET_READY_TIMEOUT` | `45` | Backend readiness timeout |
 | `HAFLEET_FINAL_REVIEW` | `1` | Enable whole-project reviewer pass |
@@ -517,9 +554,10 @@ The runtime additionally honors ARC-Bench paths such as
 
 ## 14. Security and safety posture
 
-The reference Codex sessions use full workspace access with approvals denied by
-the SDK configuration. This is a trusted-runner posture: the requirement bundle
-and agent prompts are inside the execution trust boundary.
+The reference Codex sessions use full workspace access for Architect, Planner,
+and Implementer, while Reviewer sessions use `Sandbox.read_only`; approvals are
+denied by the SDK configuration. This is a trusted-runner posture: the
+requirement bundle and agent prompts are inside the execution trust boundary.
 
 Implementations MUST:
 

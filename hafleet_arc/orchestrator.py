@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -10,10 +11,61 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .checkpoint import CheckpointStore
+from .feedback import blocking_findings, parse_review, review_hash, review_passes
+from .message_bus import MessageBus
 from .models import RequirementModule
+from .pipeline import Pipeline, load_pipeline
 from .postflight import PostflightError, rehearse_web_app, validate_web_structure
 from .log import log
 from .worktree import WorktreeConflict, WorktreeManager
+
+
+def _content_fingerprint(root: Path) -> tuple[tuple[str, str], ...]:
+    entries: list[tuple[str, str]] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if relative.parts and relative.parts[0] in {".arc", ".git", "node_modules"}:
+            continue
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        entries.append((relative.as_posix(), digest))
+    return tuple(sorted(entries))
+
+
+def _file_snapshot(root: Path) -> dict[str, bytes]:
+    snapshot: dict[str, bytes] = {}
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if relative.parts and relative.parts[0] in {".arc", ".git", "node_modules"}:
+            continue
+        try:
+            snapshot[relative.as_posix()] = path.read_bytes()
+        except OSError:
+            continue
+    return snapshot
+
+
+def _restore_file_snapshot(root: Path, snapshot: dict[str, bytes]) -> None:
+    current = _file_snapshot(root)
+    for relative in set(current) - set(snapshot):
+        try:
+            (root / relative).unlink()
+        except OSError:
+            pass
+    for relative, content in snapshot.items():
+        target = root / relative
+        if current.get(relative) != content:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                target.write_bytes(content)
+            except OSError:
+                pass
 
 
 class FleetDriver(Protocol):
@@ -74,6 +126,8 @@ class FleetOrchestrator:
         requirement_tree: dict[str, Any] | None = None,
         parallel: bool = False,
         max_workers: int = 2,
+        bus: MessageBus | None = None,
+        pipeline: Pipeline | None = None,
     ) -> None:
         self.driver = driver
         self.runtime = runtime
@@ -89,6 +143,266 @@ class FleetOrchestrator:
         self.architecture_path = output_dir / ".arc" / "hafleet" / "architecture.md"
         configured_pause = os.environ.get("ARCBENCH_PAUSE_REQUEST_PATH", "").strip()
         self.pause_request_path = Path(configured_pause) if configured_pause else output_dir / ".arc" / "pause-request"
+        self.bus = bus or MessageBus(output_dir / ".arc" / "hafleet" / "messages.jsonl")
+        self.pipeline = pipeline or load_pipeline(output_dir)
+
+    def _message(
+        self,
+        kind: str,
+        sender: str,
+        *,
+        recipient: str = "orchestrator",
+        module: RequirementModule | None = None,
+        phase: str = "",
+        round_number: int = 0,
+        payload: dict[str, Any] | None = None,
+        correlation_id: str = "",
+        parent_id: str = "",
+    ) -> dict[str, Any]:
+        message = self.bus.publish(
+            kind,
+            sender=sender,
+            recipient=recipient,
+            module_id=module.node_id if module else "",
+            phase=phase,
+            round_number=round_number,
+            payload=payload,
+            correlation_id=correlation_id,
+            parent_id=parent_id,
+        )
+        if module:
+            self.checkpoint.update_pipeline(module.node_id, message_cursor=message.get("sequence", 0))
+        return message
+
+    def _run_agent(
+        self,
+        role: str,
+        prompt: str,
+        *,
+        module: RequirementModule | None = None,
+        phase: str = "",
+        round_number: int = 0,
+        workspace_dir: Path | None = None,
+        parent_id: str = "",
+    ) -> Any:
+        request = self._message(
+            "turn.request",
+            "orchestrator",
+            recipient=role,
+            module=module,
+            phase=phase,
+            round_number=round_number,
+            payload={"prompt": prompt[:20000]},
+            parent_id=parent_id,
+        )
+        self._message(
+            "turn.started",
+            role,
+            module=module,
+            phase=phase,
+            round_number=round_number,
+            correlation_id=request["id"],
+            payload={"workspace": str(workspace_dir or self.output_dir)},
+            parent_id=request["id"],
+        )
+        try:
+            result = self.driver.run(role, prompt, workspace_dir=workspace_dir)
+        except TypeError as error:
+            if "workspace_dir" not in str(error):
+                raise
+            result = self.driver.run(role, prompt)
+        response = str(getattr(result, "final_response", "") or "")
+        self._message(
+            "turn.completed",
+            role,
+            module=module,
+            phase=phase,
+            round_number=round_number,
+            correlation_id=request["id"],
+            payload={"response": response[:20000]},
+            parent_id=request["id"],
+        )
+        return result
+
+    def _review_loop(
+        self,
+        module: RequirementModule | None,
+        base_prompt: str,
+        *,
+        workspace_dir: Path | None = None,
+        final_review: bool = False,
+        resume_round: int = 0,
+        resume_feedback: dict[str, Any] | None = None,
+        resume_message_id: str = "",
+    ) -> dict[str, Any]:
+        loop = self.pipeline.loop()
+        reviewer_role = loop.review or "reviewer"
+        repair_role = loop.repair or "implementer"
+        max_rounds = loop.max_rounds
+        previous_hash = ""
+        previous_fingerprint: tuple[tuple[str, str], ...] | None = None
+        feedback: dict[str, Any] = {}
+        parent_id = ""
+        first_round = 1
+        if resume_feedback and resume_round > 0:
+            # A process may stop after a reviewer has requested changes but
+            # before the repair turn starts. Resume from that durable message
+            # instead of rerunning planner/implementation or losing feedback.
+            if resume_round >= max_rounds:
+                if module:
+                    self.checkpoint.update_pipeline(module.node_id, loop_status="blocked")
+                raise PauseRequested(f"review loop exceeded {max_rounds} rounds")
+            repair_round = resume_round
+            repair_prompt = base_prompt + f"""
+
+Repair loop round {repair_round}. This is a resumed pipeline node. Reviewer feedback is authoritative:
+{json.dumps(resume_feedback, ensure_ascii=False, indent=2)}
+
+You are the implementation agent. Modify only the current module/workspace, resolve
+all blocker and major findings, run focused checks, and return a structured summary of
+changed_files, resolved_findings, remaining_findings, and checks.
+"""
+            if module:
+                self.checkpoint.update_pipeline(module.node_id, node="repair", loop_status="repairing", round_number=repair_round)
+            repair_result = self._run_agent(
+                repair_role,
+                repair_prompt.strip(),
+                module=module,
+                phase="repair",
+                round_number=repair_round,
+                workspace_dir=workspace_dir,
+                parent_id=resume_message_id,
+            )
+            self._message(
+                "agent.message",
+                repair_role,
+                module=module,
+                phase="repair",
+                round_number=repair_round,
+                payload={"response": str(getattr(repair_result, "final_response", "") or "")[:20000], "feedback": resume_feedback, "resumed": True},
+                parent_id=resume_message_id,
+            )
+            previous_hash = review_hash(resume_feedback)
+            previous_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
+            parent_id = resume_message_id
+            first_round = repair_round + 1
+        for round_number in range(first_round, max_rounds + 1):
+            self._check_pause(module, "final-review" if final_review else "review")
+            self.checkpoint.update_pipeline(
+                module.node_id if module else "ROOT",
+                node="review_loop",
+                round_number=round_number,
+                loop_status="reviewing",
+            )
+            review_workspace = workspace_dir or self.output_dir
+            before_files = _file_snapshot(review_workspace)
+            before = _content_fingerprint(review_workspace)
+            review_prompt = base_prompt + f"""
+
+Review loop round {round_number}/{max_rounds}. You are read-only. Inspect the current
+implementation and return ONLY a JSON review object followed by a short summary.
+Use verdict=pass only when all blocker/major findings are resolved and required checks pass.
+Do not edit project files or Git state.
+"""
+            result = self._run_agent(
+                reviewer_role,
+                review_prompt.strip(),
+                module=module,
+                phase="final-review" if final_review else "review",
+                round_number=round_number,
+                workspace_dir=workspace_dir,
+                parent_id=parent_id,
+            )
+            after = _content_fingerprint(review_workspace)
+            if before != after:
+                _restore_file_snapshot(review_workspace, before_files)
+                self.checkpoint.update_pipeline(module.node_id if module else "ROOT", reviewer_write_violation=True, loop_status="blocked")
+                self._message(
+                    "pipeline.state",
+                    "orchestrator",
+                    module=module,
+                    phase="review",
+                    round_number=round_number,
+                    payload={"status": "reviewer_write_violation"},
+                )
+                raise PauseRequested("reviewer modified project files")
+            response = str(getattr(result, "final_response", "") or "")
+            # Legacy test doubles and older adapters have no final_response; an
+            # empty response is treated as a passing review for compatibility.
+            feedback = parse_review(response) if response.strip() else {
+                "verdict": "pass", "summary": "Reviewer completed without structured findings.", "findings": [], "checks": [], "raw": ""
+            }
+            current_hash = review_hash(feedback)
+            feedback_message = self._message(
+                "review.feedback",
+                reviewer_role,
+                recipient="orchestrator",
+                module=module,
+                phase="review",
+                round_number=round_number,
+                payload=feedback,
+                parent_id=parent_id,
+            )
+            verdict = self._message(
+                "review.verdict",
+                reviewer_role,
+                recipient="orchestrator",
+                module=module,
+                phase="review",
+                round_number=round_number,
+                payload={"verdict": feedback["verdict"], "blocking_findings": blocking_findings(feedback), "passed": review_passes(feedback)},
+                parent_id=parent_id,
+            )
+            if review_passes(feedback):
+                self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="checkpoint", loop_status="approved", review_findings=feedback.get("findings", []), last_feedback_message_id=feedback_message["id"], last_feedback_hash=current_hash)
+                self._message("pipeline.state", "orchestrator", module=module, phase="review", round_number=round_number, payload={"status": "approved"}, parent_id=verdict["id"])
+                return feedback
+            fingerprint = after
+            if current_hash == previous_hash and fingerprint == previous_fingerprint:
+                self.checkpoint.update_pipeline(module.node_id if module else "ROOT", loop_status="blocked", last_feedback_hash=current_hash, review_findings=feedback.get("findings", []))
+                raise PauseRequested("review loop made no progress")
+            if round_number >= max_rounds:
+                self.checkpoint.update_pipeline(module.node_id if module else "ROOT", loop_status="blocked", last_feedback_hash=current_hash, review_findings=feedback.get("findings", []))
+                raise PauseRequested(f"review loop exceeded {max_rounds} rounds")
+            if module:
+                self.checkpoint.update_pipeline(
+                    module.node_id,
+                    node="repair",
+                    round_number=round_number,
+                    loop_status="changes_requested",
+                    review_findings=feedback.get("findings", []),
+                    last_feedback_message_id=feedback_message["id"],
+                    last_feedback_hash=current_hash,
+                )
+            repair_prompt = base_prompt + f"""
+
+Repair loop round {round_number}. Reviewer feedback is authoritative:
+{json.dumps(feedback, ensure_ascii=False, indent=2)}
+
+You are the implementation agent. Modify only the current module/workspace, resolve
+all blocker and major findings, run focused checks, and return a structured summary
+of changed_files, resolved_findings, remaining_findings, and checks.
+"""
+            repair_result = self._run_agent(
+                repair_role,
+                repair_prompt.strip(),
+                module=module,
+                phase="repair",
+                round_number=round_number,
+                workspace_dir=workspace_dir,
+                parent_id=verdict["id"],
+            )
+            self._message(
+                "agent.message",
+                repair_role,
+                module=module,
+                phase="repair",
+                round_number=round_number,
+                payload={"response": str(getattr(repair_result, "final_response", "") or "")[:20000], "feedback": feedback},
+                parent_id=verdict["id"],
+            )
+            previous_hash, previous_fingerprint, parent_id = current_hash, fingerprint, verdict["id"]
+        raise PauseRequested("review loop terminated without approval")
 
     def _commit(self, message: str, role: str) -> bool:
         """Commit with a role identity while keeping older RuntimeGit adapters working."""
@@ -98,6 +412,43 @@ class FleetOrchestrator:
             if "role" not in str(error):
                 raise
             return self.runtime.git.commit(message)
+
+    def _commit_operation(
+        self,
+        message: str,
+        role: str,
+        *,
+        module: RequirementModule | None = None,
+        phase: str = "checkpoint",
+    ) -> bool:
+        operation = self._message(
+            "operation.started",
+            "orchestrator",
+            module=module,
+            phase=phase,
+            payload={"operation": "commit", "message": message, "role": role},
+        )
+        try:
+            committed = self._commit(message, role)
+        except Exception as error:  # noqa: BLE001 - preserve checkpoint failure semantics
+            self._message(
+                "operation.failed",
+                "orchestrator",
+                module=module,
+                phase=phase,
+                payload={"operation": "commit", "message": message, "error": str(error)},
+                parent_id=operation["id"],
+            )
+            raise
+        self._message(
+            "operation.completed",
+            "orchestrator",
+            module=module,
+            phase=phase,
+            payload={"operation": "commit", "message": message, "committed": committed, "role": role},
+            parent_id=operation["id"],
+        )
+        return committed
 
     def _check_pause(self, module: RequirementModule | None, phase: str | None) -> None:
         if not self.pause_request_path.exists():
@@ -222,63 +573,108 @@ class FleetOrchestrator:
             plan_path = self.plan_dir / f"{module.node_id}.md"
             base_prompt = self._base_prompt(module, completed_ids, plan_path)
 
-            self._check_pause(module, "design")
-            self.checkpoint.mark_module_started(module.node_id, "design")
-            self.runtime.events.mark_design_started(module.node_id, "HAFleet planner started")
-            log(f"[hafleet]   planner started -> {plan_path}", flush=True)
-            try:
-                self.driver.run(
-                    "planner",
-                    base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
-                )
-                if not plan_path.is_file() or not plan_path.read_text(
-                    encoding="utf-8", errors="ignore"
-                ).strip():
-                    self.driver.run(
-                        "planner",
-                        base_prompt
-                        + f"\n\nThe required plan file was not created. Write a concrete plan now to exactly: {plan_path}",
-                    )
-                if not plan_path.is_file() or not plan_path.read_text(
-                    encoding="utf-8", errors="ignore"
-                ).strip():
-                    raise RuntimeError(f"planner did not create required plan: {plan_path}")
-            except Exception:
-                self.runtime.events.mark_design_failed(module.node_id, "HAFleet planner failed")
-                raise
-            self.runtime.events.mark_design_done(module.node_id, "HAFleet plan completed")
-            log(f"[hafleet]   planner finished ({plan_path.stat().st_size} bytes)", flush=True)
+            # If the checkpoint records a review feedback boundary, continue
+            # with the implementer repair turn. This makes a restart after a
+            # crash/pause deterministic and avoids repeating planner work.
+            checkpoint_state = self.checkpoint.read()
+            resume_loop = (
+                checkpoint_state.get("current_node_id") == module.node_id
+                and checkpoint_state.get("current_pipeline_node") in {"review_loop", "repair", "review"}
+                and checkpoint_state.get("loop_status") in {"changes_requested", "repairing", "reviewing"}
+            )
+            resume_feedback: dict[str, Any] | None = None
+            resume_message_id = str(checkpoint_state.get("last_feedback_message_id") or "")
+            resume_round = int(checkpoint_state.get("current_round", 0) or 0)
+            if resume_loop:
+                messages = self.bus.replay(module_id=module.node_id)
+                if resume_message_id:
+                    match = next((item for item in messages if item.get("id") == resume_message_id and item.get("kind") == "review.feedback"), None)
+                else:
+                    match = next((item for item in reversed(messages) if item.get("kind") == "review.feedback"), None)
+                if match and isinstance(match.get("payload"), dict):
+                    resume_feedback = dict(match["payload"])
+                else:
+                    resume_loop = False
 
-            self._check_pause(module, "implement")
-            self.checkpoint.mark_module_started(module.node_id, "implement")
-            self.runtime.events.mark_implementation_started(module.node_id, "HAFleet implementer started")
-            log(f"[hafleet]   implementer started: {module.node_id}", flush=True)
-            try:
-                self.driver.run(
-                    "implementer",
-                    base_prompt + "\n\nRead the coordinator plan, then implement and verify the complete subtree now.",
+            if resume_loop and resume_feedback:
+                self._check_pause(module, "repair")
+                log(f"[hafleet]   resuming repair round {resume_round}: {module.node_id}", flush=True)
+                self._review_loop(
+                    module,
+                    base_prompt,
+                    resume_round=resume_round,
+                    resume_feedback=resume_feedback,
+                    resume_message_id=resume_message_id,
                 )
-                self._check_pause(module, "review")
-                self.checkpoint.mark_module_started(module.node_id, "review")
-                log(f"[hafleet]   reviewer started: {module.node_id}", flush=True)
-                self.driver.run(
-                    "reviewer",
-                    base_prompt + "\n\nReview the current implementation, run checks, and directly repair every issue found.",
-                )
-            except PauseRequested:
-                raise
-            except Exception:
-                self.runtime.events.mark_implementation_failed(module.node_id, "HAFleet worker failed")
-                raise
+            else:
+                self._check_pause(module, "design")
+                self.checkpoint.mark_module_started(module.node_id, "design")
+                self.runtime.events.mark_design_started(module.node_id, "HAFleet planner started")
+                log(f"[hafleet]   planner started -> {plan_path}", flush=True)
+                try:
+                    self._run_agent(
+                        self.pipeline.role_for("planner", "planner"),
+                        base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
+                        module=module,
+                        phase="design",
+                    )
+                    if not plan_path.is_file() or not plan_path.read_text(
+                        encoding="utf-8", errors="ignore"
+                    ).strip():
+                        self._run_agent(
+                            self.pipeline.role_for("planner", "planner"),
+                            base_prompt
+                            + f"\n\nThe required plan file was not created. Write a concrete plan now to exactly: {plan_path}",
+                            module=module,
+                            phase="design",
+                        )
+                    if not plan_path.is_file() or not plan_path.read_text(
+                        encoding="utf-8", errors="ignore"
+                    ).strip():
+                        raise RuntimeError(f"planner did not create required plan: {plan_path}")
+                except Exception:
+                    self.runtime.events.mark_design_failed(module.node_id, "HAFleet planner failed")
+                    raise
+                self.runtime.events.mark_design_done(module.node_id, "HAFleet plan completed")
+                log(f"[hafleet]   planner finished ({plan_path.stat().st_size} bytes)", flush=True)
+
+                self._check_pause(module, "implement")
+                self.checkpoint.mark_module_started(module.node_id, "implement")
+                self.runtime.events.mark_implementation_started(module.node_id, "HAFleet implementer started")
+                log(f"[hafleet]   implementer started: {module.node_id}", flush=True)
+                try:
+                    self._run_agent(
+                        self.pipeline.role_for("implementer", "implementer"),
+                        base_prompt + "\n\nRead the coordinator plan, then implement and verify the complete subtree now.",
+                        module=module,
+                        phase="implement",
+                    )
+                    self._check_pause(module, "review")
+                    self.checkpoint.mark_module_started(module.node_id, "review")
+                    log(f"[hafleet]   reviewer started: {module.node_id}", flush=True)
+                    self._review_loop(module, base_prompt)
+                except PauseRequested:
+                    raise
+                except Exception:
+                    self.runtime.events.mark_implementation_failed(module.node_id, "HAFleet worker failed")
+                    raise
 
             self.runtime.events.mark_implementation_done(module.node_id, "Implementation reviewed and repaired")
             checkpoint_message = f"{module.node_id}: implement and review {module.name}"
-            committed = self._commit(checkpoint_message, "reviewer")
+            committed = self._commit_operation(checkpoint_message, "reviewer", module=module)
+            self._message(
+                "checkpoint.created",
+                "orchestrator",
+                module=module,
+                phase="checkpoint",
+                payload={"message": checkpoint_message, "committed": committed},
+            )
             log(
                 f"[hafleet]   checkpoint {'created' if committed else 'skipped'}: {checkpoint_message}",
                 flush=True,
             )
             self.checkpoint.mark_module_completed(module.node_id, module.index)
+            self.checkpoint.update_pipeline(module.node_id, message_cursor=self.bus.last_sequence)
             completed_ids.append(module.node_id)
             completed_set.add(module.node_id)
             log(
@@ -297,18 +693,19 @@ class FleetOrchestrator:
             module_ids = ", ".join(item.node_id for item in modules)
             if final_review_enabled:
                 log("[hafleet] Final integration review started", flush=True)
-                self.driver.run(
-                    "reviewer",
+                self._review_loop(
+                    None,
                     textwrap.dedent(
                         f"""
                         Perform the final integration review for ARC-Bench task type {self.task_type}.
                         Completed ROOT modules: {module_ids}.
                         Read {self.architecture_path} and preserve its module boundaries.
-                        Inspect the whole project, run the build and practical tests, fix regressions and
-                        integration gaps, and leave the application runnable. For web smoke tests use only
-                        port {self.smoke_port}, stop every server afterward, and never bind the grading port.
+                        Inspect the whole project and report regressions and integration gaps. For web
+                        smoke tests use only port {self.smoke_port}, stop every server afterward, and
+                        never bind the grading port. Do not modify project files.
                         """
                     ).strip(),
+                    final_review=True,
                 )
             log(
                 f"[hafleet] Final review {'enabled' if final_review_enabled else 'disabled'}; "
@@ -317,7 +714,13 @@ class FleetOrchestrator:
             )
             self._run_postflight(module_ids)
             final_checkpoint = "ROOT: final HAFleet integration review"
-            committed = self._commit(final_checkpoint, "postflight")
+            committed = self._commit_operation(final_checkpoint, "postflight", phase="checkpoint")
+            self._message(
+                "checkpoint.created",
+                "postflight",
+                phase="checkpoint",
+                payload={"message": final_checkpoint, "committed": committed},
+            )
             log(
                 f"[hafleet] Final checkpoint {'created' if committed else 'skipped'}: {final_checkpoint}",
                 flush=True,
@@ -338,30 +741,52 @@ class FleetOrchestrator:
         plan_path = workspace / ".arc" / "hafleet" / "plans" / f"{module.node_id}.md"
         plan_path.parent.mkdir(parents=True, exist_ok=True)
         base_prompt = self._base_prompt(module, completed_ids, plan_path, workspace, branch)
-        self.driver.run(
-            "planner",
+        checkpoint_state = self.checkpoint.read()
+        resume_loop = (
+            checkpoint_state.get("current_node_id") == module.node_id
+            and checkpoint_state.get("current_pipeline_node") in {"review_loop", "repair", "review"}
+            and checkpoint_state.get("loop_status") in {"changes_requested", "repairing", "reviewing"}
+        )
+        if resume_loop:
+            feedback_id = str(checkpoint_state.get("last_feedback_message_id") or "")
+            messages = self.bus.replay(module_id=module.node_id)
+            match = next((item for item in messages if item.get("id") == feedback_id and item.get("kind") == "review.feedback"), None)
+            if match and isinstance(match.get("payload"), dict):
+                self._review_loop(
+                    module,
+                    base_prompt,
+                    workspace_dir=workspace,
+                    resume_round=int(checkpoint_state.get("current_round", 0) or 0),
+                    resume_feedback=dict(match["payload"]),
+                    resume_message_id=feedback_id,
+                )
+                return plan_path
+        self._run_agent(
+            self.pipeline.role_for("planner", "planner"),
             base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
+            module=module,
+            phase="design",
             workspace_dir=workspace,
         )
         if not plan_path.is_file() or not plan_path.read_text(encoding="utf-8", errors="ignore").strip():
-            self.driver.run(
-                "planner",
+            self._run_agent(
+                self.pipeline.role_for("planner", "planner"),
                 base_prompt
                 + f"\n\nThe required plan file was not created. Write a concrete plan now to exactly: {plan_path}",
+                module=module,
+                phase="design",
                 workspace_dir=workspace,
             )
         if not plan_path.is_file() or not plan_path.read_text(encoding="utf-8", errors="ignore").strip():
             raise RuntimeError(f"planner did not create required plan: {plan_path}")
-        self.driver.run(
-            "implementer",
+        self._run_agent(
+            self.pipeline.role_for("implementer", "implementer"),
             base_prompt + "\n\nRead the coordinator plan, then implement and verify the complete subtree now.",
+            module=module,
+            phase="implement",
             workspace_dir=workspace,
         )
-        self.driver.run(
-            "reviewer",
-            base_prompt + "\n\nReview the current implementation, run checks, and directly repair every issue found.",
-            workspace_dir=workspace,
-        )
+        self._review_loop(module, base_prompt, workspace_dir=workspace)
         return plan_path
 
     def _run_parallel(
@@ -462,10 +887,40 @@ class FleetOrchestrator:
                     log(f"[hafleet] parallel module failed {module.node_id}: {failures[module.node_id]}", flush=True)
                     continue
                 try:
-                    commit = manager.ensure_commit(
-                        workspace,
-                        f"{module.node_id}: implement and review {module.name}",
-                        role="reviewer",
+                    checkpoint_message = f"{module.node_id}: implement and review {module.name}"
+                    operation = self._message(
+                        "operation.started",
+                        "orchestrator",
+                        module=module,
+                        phase="checkpoint",
+                        payload={"operation": "commit", "message": checkpoint_message, "role": "reviewer", "parallel": True},
+                    )
+                    try:
+                        commit = manager.ensure_commit(workspace, checkpoint_message, role="reviewer")
+                    except Exception as error:  # noqa: BLE001 - retain worktree for diagnosis
+                        self._message(
+                            "operation.failed",
+                            "orchestrator",
+                            module=module,
+                            phase="checkpoint",
+                            payload={"operation": "commit", "message": checkpoint_message, "error": str(error), "parallel": True},
+                            parent_id=operation["id"],
+                        )
+                        raise
+                    self._message(
+                        "operation.completed",
+                        "orchestrator",
+                        module=module,
+                        phase="checkpoint",
+                        payload={"operation": "commit", "message": checkpoint_message, "committed": bool(commit), "parallel": True},
+                        parent_id=operation["id"],
+                    )
+                    self._message(
+                        "checkpoint.created",
+                        "orchestrator",
+                        module=module,
+                        phase="checkpoint",
+                        payload={"message": checkpoint_message, "commit": commit, "parallel": True},
                     )
                     commits = manager.commits_since(workspace, module_base)
                     if not commits:
@@ -532,7 +987,7 @@ class FleetOrchestrator:
         if requirement_tree is None:
             raise RuntimeError("architecture requirement tree is unavailable")
         try:
-            self.driver.run("architect", self._architecture_prompt(requirement_tree))
+            self._run_agent(self.pipeline.role_for("architect", "architect"), self._architecture_prompt(requirement_tree), phase="architecture")
             if self.pause_request_path.exists():
                 self.checkpoint.mark_paused("ROOT", "architecture")
                 raise PauseRequested("ARC-Bench pause requested")
@@ -550,7 +1005,7 @@ class FleetOrchestrator:
                         + "\n- ".join(violations)
                     )
             checkpoint_message = "ROOT: architecture scaffold"
-            committed = self._commit(checkpoint_message, "architect")
+            committed = self._commit_operation(checkpoint_message, "architect", phase="architecture")
             self.checkpoint.mark_architecture_completed()
             log(
                 f"[hafleet] architecture document created ({self.architecture_path.stat().st_size} bytes)",
@@ -584,6 +1039,12 @@ class FleetOrchestrator:
 
         for attempt in range(repair_attempts + 1):
             self._check_pause(None, "postflight")
+            operation = self._message(
+                "operation.started",
+                "orchestrator",
+                phase="postflight",
+                payload={"operation": "postflight", "attempt": attempt + 1},
+            )
             log(
                 f"[hafleet] Web postflight attempt {attempt + 1}/{repair_attempts + 1} "
                 f"on smoke port {self.smoke_port}",
@@ -595,20 +1056,34 @@ class FleetOrchestrator:
                     f"[hafleet] Web postflight passed on smoke port {self.smoke_port}",
                     flush=True,
                 )
+                self._message(
+                    "operation.completed",
+                    "orchestrator",
+                    phase="postflight",
+                    payload={"operation": "postflight", "attempt": attempt + 1},
+                    parent_id=operation["id"],
+                )
                 return
             except PostflightError as exc:
+                self._message(
+                    "operation.failed",
+                    "orchestrator",
+                    phase="postflight",
+                    payload={"operation": "postflight", "attempt": attempt + 1, "error": str(exc)},
+                    parent_id=operation["id"],
+                )
                 if attempt >= repair_attempts:
                     raise
                 log(
                     f"[hafleet] Web postflight failed; repair {attempt + 1}/{repair_attempts}: {exc}",
                     flush=True,
                 )
-                self.driver.run(
-                    "reviewer",
+                self._run_agent(
+                    self.pipeline.role_for("implementer", "implementer"),
                     textwrap.dedent(
                         f"""
                         The ARC-Bench web delivery postflight failed after modules {module_ids}.
-                        Repair the project now, then verify it on smoke port {self.smoke_port}.
+                        Repair the project now as the implementation agent, then verify it on smoke port {self.smoke_port}.
                         The grader requires frontend/package.json with `npm run build` and
                         backend/package.json with `npm run start`; the backend must read PORT and
                         serve the built frontend. Do not bind the grading port. Stop all servers.
