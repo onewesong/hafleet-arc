@@ -94,3 +94,48 @@
 .chat-finding.major { color: #ffd479; }
 .chat-finding.minor { color: #70b8ff; }
 .chat-finding.info { color: #9baac0; }
+.execution-board { margin-top: 22px; padding: 22px; }
+.execution-head { align-items: flex-start; }
+.execution-meta { display: flex; align-items: center; gap: 12px; }
+.execution-filters { display: flex; flex-wrap: wrap; gap: 9px; margin: 0 0 18px; padding: 12px; border: 1px solid #263b56; border-radius: 10px; background: #0d192b; }
+.execution-filters label { display: flex; align-items: center; gap: 7px; color: #8da1bd; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.execution-filters select { min-width: 136px; padding: 7px 9px; border: 1px solid #41536f; border-radius: 6px; color: #dbe9f7; background: #111f33; font-size: 11px; }
+.execution-subhead { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.execution-subhead h3 { margin: 0; color: #b8d4f5; font-size: 13px; }
+.execution-modules { padding-bottom: 18px; border-bottom: 1px solid #2c405b; }
+.module-summary-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 8px; }
+.module-summary-list .module-row { margin: 0; min-width: 0; }
+.module-findings { color: #ffd479; font-size: 10px; white-space: nowrap; }
+.execution-timeline-wrap { margin-top: 18px; }
+.execution-timeline { max-height: 560px; overflow: auto; padding: 2px 4px 2px 0; }
+.activity-row { display: flex; gap: 12px; margin: 8px 0; padding: 12px 14px; border: 1px solid #2c405b; border-left: 3px solid #778ba6; border-radius: 10px; background: #16253b; }
+.activity-row[role="button"] { cursor: pointer; }
+.activity-row[role="button"]:hover, .activity-row[role="button"]:focus-visible { border-color: #70b8ff; outline: none; background: #1a2d47; }
+.activity-row.agent { border-left-color: #66e3a1; }
+.activity-row.system { border-left-color: #9baac0; background: #131f31; }
+.activity-row.module { border-left-color: #c79cff; background: #1b2039; }
+.activity-row.review\.feedback { border-left-color: #ffd479; background: #28263a; }
+.activity-row.review\.verdict { border-left-color: #66e3a1; background: #1d332d; }
+.activity-icon { flex: 0 0 26px; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 7px; color: #dbe9f7; background: #263d5b; font-size: 15px; }
+.activity-content { min-width: 0; flex: 1; }
+.activity-head { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; color: #8da1bd; font-size: 10px; }
+.activity-head strong { color: #edf4ff; font-size: 12px; }
+.activity-head time { margin-left: auto; white-space: nowrap; color: #7188a6; }
+.activity-source, .activity-module, .activity-phase, .activity-round, .activity-severity { padding: 2px 6px; border: 1px solid #3a506e; border-radius: 999px; white-space: nowrap; }
+.activity-module { color: #b8d4f5; }
+.activity-phase { color: #c79cff; }
+.activity-round { color: #70b8ff; }
+.activity-severity { text-transform: uppercase; }
+.activity-severity.blocker { color: #ff8790; border-color: #c94a5b; }
+.activity-severity.major { color: #ffd479; border-color: #c78d32; }
+.activity-severity.minor { color: #70b8ff; border-color: #397ed1; }
+.activity-content p { margin: 7px 0 0; color: #dbe9f7; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+@media(max-width:1000px) { .execution-meta { flex-direction: column; align-items: flex-end; gap: 5px; } }
+@media(max-width:620px) { .execution-board { padding: 15px; } .execution-head { flex-direction: column; gap: 10px; } .execution-meta { flex-direction: row; align-items: center; } .execution-filters label { flex: 1 1 45%; } .execution-filters select { min-width: 0; width: 100%; } .activity-head time { width: 100%; margin-left: 0; } .module-summary-list { grid-template-columns: 1fr; } }
+.pipeline-strip { grid-template-columns: repeat(7, 1fr); }
+@media(max-width:620px) { .pipeline-strip { grid-template-columns: repeat(3, 1fr); } }
+.test-result-list { display: grid; gap: 7px; }
+.test-result-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 6px 9px; align-items: center; padding: 9px 10px; border: 1px solid #2c405b; border-radius: 8px; background: #0b1423; font-size: 11px; }
+.test-result-row strong { color: #dbe9f7; }
+.test-result-row small { grid-column: 1 / -1; color: #7188a6; font: 10px ui-monospace, monospace; overflow-wrap: anywhere; }
+.activity-severity.passed { color: #66e3a1; border-color: #2b9c6c; }

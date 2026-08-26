@@ -18,19 +18,16 @@
         <div id="room" class="room"></div>
         <div id="pipeline" class="pipeline-strip"></div>
       </section>
-    <section class="bottom-grid">
-      <div class="card"><div class="card-head"><h2>Module board</h2><span id="module-count" class="subtle"></span></div><div id="modules"></div></div>
-      <div class="card"><div class="card-head"><h2>Recent factory events</h2></div><div id="events" class="event-list"></div></div>
-    </section>
-    <section class="card chat-card" aria-label="Agent conversation room">
-      <div class="card-head"><div><h2>Agent conversation room</h2><p class="subtle">Live pipeline messages and review rounds</p></div><span id="chat-connection" class="subtle">Connecting…</span></div>
-      <div class="chat-filters" aria-label="Conversation filters">
+    <section class="card execution-board" aria-label="Execution board">
+      <div class="card-head execution-head"><div><h2>Execution board</h2><p class="subtle">Agent conversation room · modules, pipeline events and agent conversation in one timeline</p></div><div class="execution-meta"><span id="execution-runner" class="pill">Loading…</span><span id="module-count" class="subtle"></span><span id="chat-connection" class="subtle">Connecting…</span></div></div>
+      <div class="execution-filters" aria-label="Execution filters">
         <label>Module <select id="chat-module-filter"><option value="">All modules</option></select></label>
         <label>Role <select id="chat-role-filter"><option value="">All roles</option></select></label>
         <label>Round <select id="chat-round-filter"><option value="">All rounds</option></select></label>
-        <label>Type <select id="chat-kind-filter"><option value="">All message types</option></select></label>
+        <label>Activity <select id="chat-kind-filter"><option value="">All activity types</option></select></label>
       </div>
-      <div id="chat" class="chat-list"><p class="subtle">No agent messages yet.</p></div>
+      <div class="execution-modules"><div class="execution-subhead"><h3>Modules</h3><span class="subtle">Select a module to focus its activity</span></div><div id="modules" class="module-summary-list"></div></div>
+      <div class="execution-timeline-wrap"><div class="execution-subhead"><h3>Activity timeline</h3><span id="activity-count" class="subtle"></span></div><div id="chat" class="execution-timeline"><p class="subtle">No activity yet.</p></div></div>
     </section>
     </main>
     <aside id="drawer" class="drawer" aria-hidden="true"><div class="drawer-head"><div><p id="drawer-kicker" class="eyebrow">ROLE DETAIL</p><h2 id="drawer-title">Select a worker</h2></div><button id="close" class="icon-button" aria-label="Close">×</button></div><div id="drawer-body" class="drawer-body"></div></aside>

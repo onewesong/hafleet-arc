@@ -39,6 +39,11 @@ class CheckpointStore:
             "review_findings": [],
             "reviewer_write_violation": False,
             "message_cursor": 0,
+            "test_status": "",
+            "last_test_message_id": "",
+            "last_test_hash": "",
+            "test_results": [],
+            "tester_write_violation": False,
         }
         if not self.path.is_file():
             return default
@@ -68,6 +73,11 @@ class CheckpointStore:
         payload.setdefault("review_findings", [])
         payload.setdefault("reviewer_write_violation", False)
         payload.setdefault("message_cursor", 0)
+        payload.setdefault("test_status", "")
+        payload.setdefault("last_test_message_id", "")
+        payload.setdefault("last_test_hash", "")
+        payload.setdefault("test_results", [])
+        payload.setdefault("tester_write_violation", False)
         return payload
 
     def write(self, payload: dict[str, Any]) -> None:

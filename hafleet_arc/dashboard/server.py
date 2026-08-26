@@ -18,12 +18,14 @@ ROLE_PATTERNS = {
     "planner": re.compile(r"planning agent", re.IGNORECASE),
     "implementer": re.compile(r"implementation agent", re.IGNORECASE),
     "reviewer": re.compile(r"reviewer and repair agent|reviewer", re.IGNORECASE),
+    "tester": re.compile(r"test agent|tester|playwright", re.IGNORECASE),
 }
 ROLE_LABELS = {
     "architect": "Architect",
     "planner": "Planner",
     "implementer": "Implementer",
     "reviewer": "Reviewer",
+    "tester": "Tester",
     "postflight": "Postflight",
 }
 ROLE_PHASES = {
@@ -31,6 +33,7 @@ ROLE_PHASES = {
     "planner": "design",
     "implementer": "implement",
     "reviewer": "review",
+    "tester": "test",
     "postflight": "postflight",
 }
 
@@ -243,6 +246,22 @@ class DashboardCollector:
                 item["status"] = (message.get("payload") or {}).get("status", item["status"])
         return list(grouped.values())
 
+    def test_results(self, module_id: str = "") -> list[dict[str, Any]]:
+        root = self.arc_dir / "hafleet" / "test-results"
+        if not root.is_dir():
+            return []
+        items: list[dict[str, Any]] = []
+        paths = [root / module_id] if module_id else list(root.iterdir())
+        for directory in paths:
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.glob("round-*.json"))[-10:]:
+                item = _read_json(path, {})
+                if isinstance(item, dict):
+                    item["result_path"] = str(path.relative_to(self.output_dir))
+                    items.append(item)
+        return items[-100:]
+
     def _events(self) -> list[dict[str, Any]]:
         if not self.events_path.is_file():
             return []
@@ -332,7 +351,7 @@ class DashboardCollector:
         if role == "architect":
             commit = self._latest_commit_matching(workspace, "ROOT: architecture scaffold")
             return self._relabel_snapshot(_git_snapshot(workspace, commit), "architect_commit") if commit else {"branch": "", "path": workspace, "files_changed": [], "diff_stat": "", "diff": "", "commit_diff": "", "file_changes": []}
-        if role in {"implementer", "reviewer"} and current_node == module_id and current_phase in {"implement", "review"}:
+        if role in {"implementer", "tester", "reviewer"} and current_node == module_id and current_phase in {"implement", "test", "review"}:
             return self._relabel_snapshot(_git_snapshot(workspace), f"{role}_worktree")
         if role == "postflight":
             if current_phase in {"postflight", "final-review"}:
@@ -554,6 +573,10 @@ class DashboardCollector:
             if "implement" in phases:
                 tasks["implementer"].append(dict(phases["implement"]))
                 if phases["implement"].get("status") == "completed":
+                    tester_task = dict(phases["implement"])
+                    tester_task["phase"] = "test"
+                    tester_task["message"] = "Tester generated and executed tests"
+                    tasks["tester"].append(tester_task)
                     reviewer_task = dict(phases["implement"])
                     reviewer_task["phase"] = "review"
                     reviewer_task["message"] = "Reviewer completed"
@@ -624,9 +647,9 @@ class DashboardCollector:
             return direct
 
         phase = str(checkpoint.get("current_phase") or (module or {}).get("phase") or "")
-        phases = {"design": 1, "implement": 2, "review": 3, "postflight": 4, "completed": 5}
+        phases = {"design": 1, "implement": 2, "test": 3, "review": 4, "postflight": 5, "completed": 6}
         current_rank = phases.get(phase, 0)
-        role_rank = {"planner": 1, "implementer": 2, "reviewer": 3, "postflight": 4}.get(role, 0)
+        role_rank = {"planner": 1, "implementer": 2, "tester": 3, "reviewer": 4, "postflight": 5}.get(role, 0)
         if runner_state == "completed" or current_rank > role_rank:
             return "success"
         if current_rank == role_rank:
@@ -688,6 +711,7 @@ class DashboardCollector:
                     "file_changes": snapshot.get("file_changes", []),
                     "errors": session.get("errors", []),
                     "tasks": tasks_by_role.get(role, []),
+                    "test_results": self.test_results(module_id) if role == "tester" else [],
                 }
             )
         return characters
@@ -717,6 +741,7 @@ class DashboardCollector:
             "events": events[-200:],
             "messages": self.messages()[-300:],
             "conversations": conversations,
+            "test_results": self.test_results(),
             "sessions": sessions,
             "characters": self._characters(sessions, modules, runner, checkpoint),
             "generated_at": datetime.now().astimezone().isoformat(),

@@ -11,11 +11,21 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .checkpoint import CheckpointStore
-from .feedback import blocking_findings, parse_review, review_hash, review_passes
+from .feedback import (
+    blocking_findings,
+    parse_review,
+    parse_test_result,
+    review_hash,
+    review_passes,
+    test_hash,
+    test_passes,
+    test_blocking_findings,
+)
 from .message_bus import MessageBus
 from .models import RequirementModule
 from .pipeline import Pipeline, load_pipeline
 from .postflight import PostflightError, rehearse_web_app, validate_web_structure
+from .test_runner import persist_test_result, run_project_tests
 from .log import log
 from .worktree import WorktreeConflict, WorktreeManager
 
@@ -224,6 +234,187 @@ class FleetOrchestrator:
         )
         return result
 
+    @staticmethod
+    def _tester_path_allowed(relative: str) -> bool:
+        path = relative.replace("\\", "/")
+        name = Path(path).name
+        return (
+            path.startswith("tests/")
+            or path.startswith("frontend/tests/")
+            # Playwright/common test runners emit diagnostics beside test code.
+            or path.startswith("test-results/")
+            or path.startswith("frontend/test-results/")
+            or path.startswith("playwright-report/")
+            or path.startswith("frontend/playwright-report/")
+            or path.startswith("screenshots/")
+            or path.startswith("frontend/screenshots/")
+            or path.startswith("traces/")
+            or path.startswith("frontend/traces/")
+            or name.startswith("playwright.config")
+            or path in {"package.json", "package-lock.json", "frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml"}
+        )
+
+    def _tester_enabled(self, module: RequirementModule | None, workspace_dir: Path | None) -> bool:
+        if os.environ.get("HAFLEET_TESTER", "1").strip().lower() in {"0", "false", "no"}:
+            return False
+        configured_tester = bool(self.pipeline.role_for("tester", ""))
+        configured_tester = configured_tester or any(
+            node.type == "loop" and bool(node.test)
+            for node in self.pipeline.nodes
+        )
+        final_test_node = self.pipeline.node("final_test")
+        configured_tester = configured_tester or bool(final_test_node and final_test_node.role)
+        if not configured_tester:
+            return False
+        # Keep legacy empty test doubles and old output directories compatible;
+        # real requirement subtrees contain children/scenarios or an existing test command.
+        if module is not None:
+            subtree = module.subtree if isinstance(module.subtree, dict) else {}
+            meaningful = any(key in subtree for key in ("children", "requirements", "scenarios", "description", "acceptance"))
+            if not meaningful:
+                return False
+        if module is None:
+            root = workspace_dir or self.output_dir
+            frontend = root / "frontend"
+            return (frontend / "tests").exists() or (root / "tests").exists()
+        return True
+
+    def _run_tester(
+        self,
+        module: RequirementModule | None,
+        base_prompt: str,
+        *,
+        tester_role: str | None = None,
+        workspace_dir: Path | None = None,
+        round_number: int = 1,
+        mode: str = "module",
+        parent_id: str = "",
+    ) -> dict[str, Any]:
+        tester_role = tester_role or self.pipeline.role_for("tester", "tester")
+        module_id = module.node_id if module else "ROOT"
+        workspace = workspace_dir or self.output_dir
+        self.checkpoint.update_pipeline(module_id, node="tester", phase="test", round_number=round_number, loop_status="testing", test_status="testing")
+        request = self._message(
+            "test.request",
+            "orchestrator",
+            recipient=tester_role,
+            module=module,
+            phase="test",
+            round_number=round_number,
+            payload={"mode": mode, "workspace": str(workspace)},
+            parent_id=parent_id,
+        )
+        self._message(
+            "test.started",
+            tester_role,
+            module=module,
+            phase="test",
+            round_number=round_number,
+            payload={"mode": mode, "workspace": str(workspace)},
+            correlation_id=request["id"],
+            parent_id=request["id"],
+        )
+        before_files = _file_snapshot(workspace)
+        prompt = base_prompt + f"""
+
+Test round {round_number}. You are the test agent in {mode} mode. Generate or update
+tests for the supplied ARC requirements, then execute them against smoke port {self.smoke_port}.
+Only modify tests, Playwright configuration, and test dependency manifests. Never modify
+implementation source files. Return the required structured Tester JSON response.
+"""
+        result = self._run_agent(tester_role, prompt.strip(), module=module, phase="test", round_number=round_number, workspace_dir=workspace_dir, parent_id=request["id"])
+        after_files = _file_snapshot(workspace)
+        changed_paths = {
+            path for path in set(before_files) | set(after_files)
+            if before_files.get(path) != after_files.get(path)
+        }
+        # Browser tests may exercise persistence and leave runtime records in
+        # backend/data (for example a registered test user). Restore those
+        # side-effects before evaluating Tester file authorization.
+        runtime_data = {
+            path for path in changed_paths
+            if path.startswith("backend/data/") and Path(path).suffix.lower() in {".json", ".db", ".sqlite"}
+        }
+        for relative in runtime_data:
+            target = workspace / relative
+            if relative in before_files:
+                try:
+                    target.write_bytes(before_files[relative])
+                except OSError:
+                    pass
+            else:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+        unauthorized = {
+            path for path in changed_paths
+            if path not in runtime_data and not self._tester_path_allowed(path)
+        }
+        if unauthorized:
+            _restore_file_snapshot(workspace, before_files)
+            self.checkpoint.update_pipeline(module_id, tester_write_violation=True, test_status="blocked", loop_status="blocked")
+            self.checkpoint.mark_paused(module_id, "test")
+            self._message("pipeline.state", "orchestrator", module=module, phase="test", round_number=round_number, payload={"status": "tester_write_violation", "files": sorted(unauthorized)}, parent_id=request["id"])
+            raise PauseRequested("tester modified implementation files")
+        response = str(getattr(result, "final_response", "") or "")
+        parsed = parse_test_result(response, module_id=module_id, round_number=round_number) if response.strip() else {
+            "verdict": "pass", "summary": "Tester completed without structured findings.",
+            "module_id": module_id, "round": round_number, "tests": [], "findings": [], "checks": [], "artifacts": {}, "raw": "",
+        }
+        # If the agent created a runnable e2e command, execute it centrally so the
+        # result is reproducible and server cleanup is guaranteed.
+        package = workspace / "frontend" / "package.json"
+        if self.task_type == "web" and package.is_file():
+            try:
+                package_data = json.loads(package.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                package_data = {}
+            scripts = package_data.get("scripts") if isinstance(package_data, dict) else {}
+            if isinstance(scripts, dict) and scripts.get("test:e2e"):
+                executed = run_project_tests(workspace, task_type=self.task_type, module_id=module_id, round_number=round_number, smoke_port=self.smoke_port)
+                parsed.setdefault("checks", [])
+                parsed["checks"].extend(executed.get("checks", []))
+                parsed.setdefault("artifacts", {}).update(executed.get("artifacts", {}))
+                if not executed.get("verdict") == "pass":
+                    parsed["verdict"] = "changes_requested"
+                    parsed.setdefault("findings", []).extend(executed.get("findings", []))
+        parsed["round"] = round_number
+        parsed["module_id"] = module_id
+        # Persist each generated case/artifact as a first-class bus event so the
+        # dashboard can show test creation separately from execution results.
+        for case in parsed.get("tests", []):
+            if isinstance(case, dict):
+                self._message(
+                    "test.case.generated",
+                    tester_role,
+                    module=module,
+                    phase="test",
+                    round_number=round_number,
+                    payload={"test": case},
+                    parent_id=request["id"],
+                )
+        artifacts = parsed.get("artifacts") if isinstance(parsed.get("artifacts"), dict) else {}
+        for artifact_name, artifact_path in artifacts.items():
+            if artifact_path:
+                self._message(
+                    "test.artifact.created",
+                    tester_role,
+                    module=module,
+                    phase="test",
+                    round_number=round_number,
+                    payload={"name": artifact_name, "path": artifact_path},
+                    parent_id=request["id"],
+                )
+        persist_test_result(workspace, module_id, round_number, parsed)
+        result_hash = test_hash(parsed)
+        kind = "test.completed" if test_passes(parsed) else "test.failed"
+        completed = self._message(kind, tester_role, module=module, phase="test", round_number=round_number, payload=parsed, parent_id=request["id"])
+        if not test_passes(parsed):
+            self._message("test.feedback", tester_role, recipient="orchestrator", module=module, phase="test", round_number=round_number, payload={"result": parsed, "finding_ids": [item.get("id") for item in test_blocking_findings(parsed)]}, parent_id=completed["id"])
+        self.checkpoint.update_pipeline(module_id, test_status="passed" if test_passes(parsed) else "failed", last_test_message_id=completed["id"], last_test_hash=result_hash, test_results=parsed.get("tests", []))
+        return parsed
+
     def _review_loop(
         self,
         module: RequirementModule | None,
@@ -235,7 +426,10 @@ class FleetOrchestrator:
         resume_feedback: dict[str, Any] | None = None,
         resume_message_id: str = "",
     ) -> dict[str, Any]:
-        loop = self.pipeline.loop()
+        # Select the loop declared for this stage.  Older custom pipelines may
+        # only define one loop, so retain the first-loop fallback for backwards
+        # compatibility while allowing a distinct final integration loop.
+        loop = self.pipeline.loop("final_review" if final_review else "quality_loop")
         reviewer_role = loop.review or "reviewer"
         repair_role = loop.repair or "implementer"
         max_rounds = loop.max_rounds
@@ -251,7 +445,7 @@ class FleetOrchestrator:
             if resume_round >= max_rounds:
                 if module:
                     self.checkpoint.update_pipeline(module.node_id, loop_status="blocked")
-                raise PauseRequested(f"review loop exceeded {max_rounds} rounds")
+                self._pause_pipeline(module, "review", f"review loop exceeded {max_rounds} rounds")
             repair_round = resume_round
             repair_prompt = base_prompt + f"""
 
@@ -288,6 +482,50 @@ changed_files, resolved_findings, remaining_findings, and checks.
             first_round = repair_round + 1
         for round_number in range(first_round, max_rounds + 1):
             self._check_pause(module, "final-review" if final_review else "review")
+            if self._tester_enabled(module, workspace_dir):
+                tester_node = self.pipeline.node("final_test") if final_review else self.pipeline.node("tester")
+                tester_role = loop.test or (tester_node.role if tester_node else "") or self.pipeline.role_for("tester", "tester")
+                test_result = self._run_tester(
+                    module,
+                    base_prompt,
+                    tester_role=tester_role,
+                    workspace_dir=workspace_dir,
+                    round_number=round_number,
+                    mode=(tester_node.mode if tester_node and tester_node.mode else ("integration" if final_review else "module")),
+                    parent_id=parent_id,
+                )
+                if not test_passes(test_result):
+                    current_hash = test_hash(test_result)
+                    current_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
+                    if current_hash == previous_hash and current_fingerprint == previous_fingerprint:
+                        self.checkpoint.update_pipeline(
+                            module.node_id if module else "ROOT",
+                            node="blocked",
+                            loop_status="blocked",
+                            test_status="failed",
+                            last_test_hash=current_hash,
+                        )
+                        self._pause_pipeline(module, "test", "test loop made no progress")
+                    if round_number >= max_rounds:
+                        self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="blocked", loop_status="blocked", test_status="failed", last_test_hash=current_hash)
+                        self._pause_pipeline(module, "test", f"test loop exceeded {max_rounds} rounds")
+                    repair_prompt = base_prompt + f"""
+
+Test failures require repair before review. This is repair round {round_number}; test
+feedback is authoritative:
+{json.dumps(test_result, ensure_ascii=False, indent=2)}
+
+You are the implementation agent. Modify only implementation files belonging to the
+current module, resolve the failing tests, and leave test files intact unless a test
+itself is demonstrably incorrect.
+"""
+                    self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", round_number=round_number, review_findings=test_result.get("findings", []))
+                    repair_result = self._run_agent(repair_role, repair_prompt.strip(), module=module, phase="repair", round_number=round_number, workspace_dir=workspace_dir, parent_id=parent_id)
+                    self._message("agent.message", repair_role, module=module, phase="repair", round_number=round_number, payload={"response": str(getattr(repair_result, "final_response", "") or "")[:20000], "test_feedback": test_result}, parent_id=parent_id)
+                    previous_hash = current_hash
+                    previous_fingerprint = current_fingerprint
+                    parent_id = self.bus.replay(module_id=module.node_id if module else "")[-1]["id"] if self.bus.replay(module_id=module.node_id if module else "") else parent_id
+                    continue
             self.checkpoint.update_pipeline(
                 module.node_id if module else "ROOT",
                 node="review_loop",
@@ -325,7 +563,7 @@ Do not edit project files or Git state.
                     round_number=round_number,
                     payload={"status": "reviewer_write_violation"},
                 )
-                raise PauseRequested("reviewer modified project files")
+                self._pause_pipeline(module, "review", "reviewer modified project files")
             response = str(getattr(result, "final_response", "") or "")
             # Legacy test doubles and older adapters have no final_response; an
             # empty response is treated as a passing review for compatibility.
@@ -360,10 +598,10 @@ Do not edit project files or Git state.
             fingerprint = after
             if current_hash == previous_hash and fingerprint == previous_fingerprint:
                 self.checkpoint.update_pipeline(module.node_id if module else "ROOT", loop_status="blocked", last_feedback_hash=current_hash, review_findings=feedback.get("findings", []))
-                raise PauseRequested("review loop made no progress")
+                self._pause_pipeline(module, "review", "review loop made no progress")
             if round_number >= max_rounds:
                 self.checkpoint.update_pipeline(module.node_id if module else "ROOT", loop_status="blocked", last_feedback_hash=current_hash, review_findings=feedback.get("findings", []))
-                raise PauseRequested(f"review loop exceeded {max_rounds} rounds")
+                self._pause_pipeline(module, "review", f"review loop exceeded {max_rounds} rounds")
             if module:
                 self.checkpoint.update_pipeline(
                     module.node_id,
@@ -402,7 +640,7 @@ of changed_files, resolved_findings, remaining_findings, and checks.
                 parent_id=verdict["id"],
             )
             previous_hash, previous_fingerprint, parent_id = current_hash, fingerprint, verdict["id"]
-        raise PauseRequested("review loop terminated without approval")
+        self._pause_pipeline(module, "review", "review loop terminated without approval")
 
     def _commit(self, message: str, role: str) -> bool:
         """Commit with a role identity while keeping older RuntimeGit adapters working."""
@@ -455,6 +693,11 @@ of changed_files, resolved_findings, remaining_findings, and checks.
             return
         self.checkpoint.mark_paused(module.node_id if module else None, phase)
         raise PauseRequested("ARC-Bench pause requested")
+
+    def _pause_pipeline(self, module: RequirementModule | None, phase: str, reason: str) -> None:
+        """Persist a durable paused state before unwinding a bounded loop."""
+        self.checkpoint.mark_paused(module.node_id if module else "ROOT", phase)
+        raise PauseRequested(reason)
 
     def _architecture_prompt(self, requirement_tree: dict[str, object]) -> str:
         return textwrap.dedent(

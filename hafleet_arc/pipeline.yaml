@@ -52,6 +52,18 @@ roles:
     files, expected behavior, and verification guidance. Finish with a short human-readable
     summary. Do not start a long-running server.
 
+  tester: |
+    You are the HAFleet test agent. Read the supplied ARC requirement subtree,
+    architecture, implementation plan, and current workspace. Generate executable
+    tests for the requirements and run them. For web tasks use Playwright against the
+    supplied smoke port. You may modify only test files, test configuration, and test
+    dependencies; never modify implementation source files to make tests pass.
+    Every test must include the relevant requirement ID in its title or metadata.
+    Return ONLY a JSON object with verdict (pass or changes_requested), summary,
+    module_id, round, tests, findings, checks, and artifacts, followed by a short
+    human-readable summary. Failed required tests are major findings; unavailable
+    test infrastructure is a blocker. Do not start a long-running server.
+
 nodes:
   - id: architect
     type: agent
@@ -65,16 +77,34 @@ nodes:
     type: agent
     role: implementer
 
-  - id: review_loop
+  - id: tester
+    type: agent
+    role: tester
+
+  - id: quality_loop
     type: loop
+    test: tester
     review: reviewer
     repair: implementer
-    until: no_major_findings
+    until: tests_and_review_pass
     max_rounds: 3
 
   - id: checkpoint
     type: operation
     operation: checkpoint
+
+  - id: final_test
+    type: agent
+    role: tester
+    mode: integration
+
+  - id: final_review
+    type: loop
+    test: tester
+    review: reviewer
+    repair: implementer
+    until: tests_and_review_pass
+    max_rounds: 3
 
   - id: postflight
     type: operation

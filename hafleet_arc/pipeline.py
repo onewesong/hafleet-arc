@@ -20,6 +20,8 @@ class PipelineNode:
     operation: str = ""
     review: str = ""
     repair: str = ""
+    test: str = ""
+    mode: str = "module"
     until: str = ""
     max_rounds: int = 3
     options: dict[str, Any] = field(default_factory=dict)
@@ -35,7 +37,11 @@ class Pipeline:
     def node(self, node_id: str) -> PipelineNode | None:
         return next((node for node in self.nodes if node.id == node_id), None)
 
-    def loop(self) -> PipelineNode:
+    def loop(self, node_id: str | None = None) -> PipelineNode:
+        if node_id:
+            candidate = self.node(node_id)
+            if candidate is not None and candidate.type == "loop":
+                return candidate
         for node in self.nodes:
             if node.type == "loop":
                 return node
@@ -135,8 +141,12 @@ def _parse(payload: dict[str, Any]) -> Pipeline:
             operation = str(raw.get("operation") or "").strip().lower()
             if operation not in SUPPORTED_OPERATIONS:
                 raise ValueError(f"unsupported pipeline operation: {operation!r}")
-        if node_type == "loop" and str(raw.get("until") or "no_major_findings").strip() not in {"no_major_findings", "pass", "approved"}:
+        if node_type == "loop" and str(raw.get("until") or "no_major_findings").strip() not in {"no_major_findings", "pass", "approved", "tests_and_review_pass"}:
             raise ValueError(f"unsupported loop termination condition: {raw.get('until')!r}")
+        if node_type == "loop":
+            mode = str(raw.get("mode") or "module").strip().lower()
+            if mode not in {"module", "integration"}:
+                raise ValueError(f"unsupported loop mode: {mode!r}")
         seen.add(node_id)
         max_rounds = max(int(raw.get("max_rounds", 3) or 3), 1)
         nodes.append(
@@ -147,9 +157,11 @@ def _parse(payload: dict[str, Any]) -> Pipeline:
                 operation=str(raw.get("operation") or ""),
                 review=str(raw.get("review") or ""),
                 repair=str(raw.get("repair") or ""),
+                test=str(raw.get("test") or ""),
+                mode=str(raw.get("mode") or "module").strip().lower(),
                 until=str(raw.get("until") or ""),
                 max_rounds=max_rounds,
-                options={key: value for key, value in raw.items() if key not in {"id", "type", "role", "operation", "review", "repair", "until", "max_rounds"}},
+                options={key: value for key, value in raw.items() if key not in {"id", "type", "role", "operation", "review", "repair", "test", "mode", "until", "max_rounds"}},
             )
         )
     loops = [node for node in nodes if node.type == "loop"]

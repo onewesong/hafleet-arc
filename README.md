@@ -197,7 +197,17 @@ in the shared output workspace. It must preserve behavior from earlier modules,
 build real persisted behavior rather than static mock screens, and run focused
 checks while working.
 
-### 6. Review loop and repair
+### 6. Test, review loop and repair
+
+When enabled (the default for requirement subtrees with testable scenarios), the
+`tester` role generates executable project tests before review. Web projects use
+Playwright from `frontend/tests/e2e`; test results and screenshots are persisted
+under `.arc/hafleet/test-results`. Tester changes are restricted to test files,
+Playwright configuration, and dependency manifests. Failed required tests are
+sent to the implementer as blocking findings, so the tester runs again after each
+repair before the reviewer is invoked.
+
+### 7. Review loop and repair
 
 The `reviewer` checks the implementation against its scenarios in a read-only
 Codex sandbox, runs practical tests or build checks, and returns a structured JSON
@@ -215,7 +225,7 @@ When the module passes review, the orchestrator:
    `<module-id>: implement and review <module-name>`; and
 3. records the completed module in `.arc/checkpoint.json`.
 
-### 7. Pause and resume
+### 8. Pause and resume
 
 The orchestrator checks for an ARC-Bench pause request at phase boundaries. On
 pause it records the current module and phase, emits a paused event, and exits
@@ -225,7 +235,7 @@ On the next run, modules already listed as completed in the checkpoint are
 skipped. Resume is therefore module-granular: a partially completed module is
 run again, while earlier completed modules are retained.
 
-### 8. Run the final integration review
+### 9. Run the final integration review
 
 After all modules are complete, the read-only `reviewer` performs a whole-project
 integration pass. Any regression is sent to the `implementer` through the same
@@ -238,7 +248,7 @@ ROOT: final HAFleet integration review
 
 Set `HAFLEET_FINAL_REVIEW=0` to disable this pass for cheaper local experiments.
 
-### 9. Validate the delivery and exit
+### 10. Validate the delivery and exit
 
 For web tasks, HAFleet ARC does not report completion immediately after the
 final review. It first verifies the required `frontend/` and `backend/`

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-labelledby="title">
+  <title id="title">Tester character</title>
+  <circle cx="60" cy="38" r="22" fill="#f5c7a5"/>
+  <path d="M38 36c2-20 42-25 45 2-10-7-27-8-45-2Z" fill="#293b56"/>
+  <circle cx="52" cy="40" r="3" fill="#162238"/><circle cx="68" cy="40" r="3" fill="#162238"/>
+  <path d="M52 51c5 4 11 4 16 0" fill="none" stroke="#162238" stroke-width="3" stroke-linecap="round"/>
+  <path d="M29 105c2-27 17-39 31-39s29 12 31 39" fill="#6a9bd7"/>
+  <circle cx="88" cy="74" r="13" fill="none" stroke="#ffd479" stroke-width="6"/>
+  <path d="m98 84 12 12" stroke="#ffd479" stroke-width="6" stroke-linecap="round"/>
+</svg>

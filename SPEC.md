@@ -53,8 +53,8 @@ HAFleet ARC MUST:
 2. preserve existing files when initializing or resuming an output workspace;
 3. create a global architecture contract before feature modules are implemented;
 4. process direct ROOT children in stable, dependency-aware order;
-5. give every module a plan, implementation turn, read-only review loop, and
-   durable checkpoint;
+5. give every module a plan, implementation turn, Tester execution, a
+   read-only review loop, and durable checkpoint;
 6. emit machine-readable lifecycle and requirement-state events;
 7. keep runtime state, Codex home, checkpoints, and traceability under the
    output workspace unless explicitly configured otherwise;
@@ -64,6 +64,16 @@ HAFleet ARC MUST:
 10. expose a read-only local dashboard when explicitly enabled; and
 11. leave a completed run with a runnable project and a final integration
     checkpoint.
+
+Tester is an optional-compatible quality stage. When enabled by the pipeline,
+the Tester may create or update only test sources, test configuration, and test
+dependency manifests. Web projects use Playwright against an isolated smoke
+port; results are persisted under `.arc/hafleet/test-results/<module>/` and
+published to the MessageBus. Failed required tests become blocking findings for
+the Implementer. Every Implementer repair re-runs Tester before Reviewer, with
+the same bounded loop and no-progress safeguards as review findings. Setting
+`HAFLEET_TESTER=0`, or omitting a Tester node from a legacy pipeline, preserves
+the pre-Tester flow.
 
 ### 2.2 Non-goals
 
