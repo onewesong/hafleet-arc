@@ -346,6 +346,92 @@ class FleetOrchestrator:
         )
         return setting in {"1", "true", "yes", "on"} or meaningful
 
+    @staticmethod
+    def _module_leaf_count(module: RequirementModule | None) -> int:
+        """Count concrete requirement leaves without inspecting evaluator data."""
+        if module is None or not isinstance(module.subtree, dict):
+            return 0
+        count = 0
+
+        def visit(node: object) -> None:
+            nonlocal count
+            if not isinstance(node, dict):
+                return
+            children = node.get("children") or node.get("requirements") or []
+            if isinstance(children, list) and children:
+                for child in children:
+                    visit(child)
+            else:
+                count += 1
+
+        visit(module.subtree)
+        return count
+
+    def _completion_pass_enabled(self, module: RequirementModule | None) -> bool:
+        """Enable a second implementation pass for genuinely large modules.
+
+        Large ARC modules frequently contain several independent workflows. A single
+        context window can produce a convincing shell while omitting entire leaves.
+        This bounded pass is still the same Implementer role and remains driven only
+        by the supplied requirement subtree. Small synthetic fixtures retain the old
+        call sequence; operators can force/disable it explicitly.
+        """
+        setting = os.environ.get("HAFLEET_COMPLETION_PASS", "auto").strip().lower()
+        if setting in {"0", "false", "no"}:
+            return False
+        if setting in {"1", "true", "yes", "on"}:
+            return module is not None
+        return self._module_leaf_count(module) >= 8
+
+    def _run_implementer_completion_pass(
+        self,
+        module: RequirementModule,
+        base_prompt: str,
+        *,
+        workspace_dir: Path | None = None,
+        plan_path: Path | None = None,
+    ) -> Any:
+        """Ask Implementer to finish omitted leaves after the initial turn/self-check."""
+        self.checkpoint.update_pipeline(
+            module.node_id,
+            node="completion",
+            phase="implement",
+            loop_status="completing",
+        )
+        prompt = base_prompt + f"""
+
+Implementation completion pass. The module contains {self._module_leaf_count(module)}
+concrete requirement leaves. Re-read the complete subtree, the architecture, and the
+current files after the previous implementation/self-check. Enumerate every leaf and
+identify what is actually implemented versus still a static placeholder, missing
+route/API, missing state transition, or untested behavior. Now implement the missing
+high-impact behavior in the current module, including real persistence and cross-view
+handoffs where the requirements imply them. Do not merely write an audit or claim that
+future work is needed: make concrete source and executable-test changes in this turn.
+Prioritize domain entities/services and API contracts, then shared client state and
+canonical routes, then view details. Preserve existing working behavior and module
+boundaries. Do not search for or infer hidden/evaluator tests. Run focused tests/build
+checks and return JSON with changed_files, covered requirement IDs, checks, and any
+remaining risks; an empty changed_files result is acceptable only when you can cite
+evidence for every leaf being implemented.
+"""
+        result = self._run_agent(
+            self.pipeline.role_for("implementer", "implementer"),
+            textwrap.dedent(prompt).strip(),
+            module=module,
+            phase="completion",
+            round_number=0,
+            workspace_dir=workspace_dir,
+        )
+        self._message(
+            "agent.message",
+            self.pipeline.role_for("implementer", "implementer"),
+            module=module,
+            phase="completion",
+            payload={"response": str(getattr(result, "final_response", "") or "")[:20000]},
+        )
+        return result
+
     def _run_implementer_self_check(
         self,
         module: RequirementModule,
@@ -1159,6 +1245,9 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     if self._self_check_enabled(module):
                         log(f"[hafleet]   implementer self-check: {module.node_id}", flush=True)
                         self._run_implementer_self_check(module, base_prompt, plan_path=plan_path)
+                    if self._completion_pass_enabled(module):
+                        log(f"[hafleet]   implementer completion pass: {module.node_id}", flush=True)
+                        self._run_implementer_completion_pass(module, base_prompt, plan_path=plan_path)
                     self._check_pause(module, "review")
                     self.checkpoint.mark_module_started(module.node_id, "review")
                     log(f"[hafleet]   reviewer started: {module.node_id}", flush=True)
@@ -1371,6 +1460,13 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             self._ensure_plan_artifact(plan_path, module)
         if self._self_check_enabled(module):
             self._run_implementer_self_check(
+                module,
+                base_prompt,
+                workspace_dir=workspace,
+                plan_path=plan_path,
+            )
+        if self._completion_pass_enabled(module):
+            self._run_implementer_completion_pass(
                 module,
                 base_prompt,
                 workspace_dir=workspace,
