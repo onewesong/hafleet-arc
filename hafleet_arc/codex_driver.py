@@ -208,6 +208,16 @@ ARC-Bench web delivery contract:
   {self.grading_port}, and stop every server process you start.
 - Match visible requirement text exactly. Use visible labels, real text buttons, inline
   validation messages, and avoid rendering the same test-targeted value more than once.
+- Use canonical history-style URL paths for user-visible views. A direct request or
+  browser refresh at a client route must return the app shell and render that route;
+  reserve /api/* for JSON and return structured non-2xx errors there. Hash links can
+  be compatibility aliases only. Every form control needs a label/accessible name,
+  required and described-by semantics, deterministic validation, and a named submit
+  button with duplicate-submit protection. Keep loading/empty/error/retry states
+  visible and ensure successful mutations survive a reload through the public API.
+- Before finishing a web turn, smoke-check each requirement-derived route directly
+  (HTTP GET), then exercise one valid and one invalid form action. Record failures in
+  the structured result instead of silently substituting static placeholder content.
 """
         thread = self._codex.thread_start(
             cwd=str(cwd),

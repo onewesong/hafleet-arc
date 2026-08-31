@@ -37,7 +37,12 @@ roles:
     strategy so a fresh process exposes those records without evaluator-specific setup.
     When the requirement supplies reference images, inspect those author-provided
     assets and record the visual states they establish; do not substitute placeholder
-    screens when the asset defines observable product content.
+    screens when the asset defines observable product content. Before handing off,
+    write a route/state table in the architecture document: canonical URL, entry
+    action, authentication precondition, API calls, loading/empty/error state, and
+    durable state expected after refresh. Prefer the browser History API and a
+    server-side app-shell fallback for public routes; hash fragments may be retained
+    only as backwards-compatible aliases and must never be the sole navigation path.
 
   implementer: |
     You are the planning and implementation agent, also responsible for test authoring, in a finite HAFleet
@@ -71,7 +76,24 @@ roles:
     deterministic bootstrap/fixture layer owned by the application; never depend on
     hidden evaluator setup or hard-code only the first happy-path interaction. Use any
     supplied reference images as visual acceptance guidance and implement their
-    observable states, while keeping behavior and data domain-neutral.
+    observable states, while keeping behavior and data domain-neutral. For every
+    user-facing view, implement the route/state table as an actual contract: expose
+    a canonical path and make that path render on a cold direct request and after
+    browser refresh. Configure the backend to return the frontend app shell for
+    non-API deep links, while preserving normal 404 JSON responses under /api/.
+    Use history.pushState/replaceState or real anchor links for transitions; do not
+    make a hash-only router. Keep old hash links as aliases when useful, but normalize
+    them to the canonical path. Treat semantic HTML as behavior: every control needs
+    a visible label or equivalent accessible name, grouped options use fieldset/
+    legend, required fields expose required/aria-required, and validation errors are
+    connected with aria-describedby and remain visible after failed submit. Submit
+    buttons need deterministic names, pending/disabled semantics, and duplicate-
+    request protection. After each mutation update URL and visible state immediately,
+    then verify the same state through the public API and after a reload. Before
+    finishing, exercise a compact smoke matrix derived from the requirement tree:
+    direct GET of each canonical route, refresh, one valid action, one invalid action,
+    empty state, and unauthenticated access. Record commands/results in the plan;
+    never infer behavior from hidden evaluator tests.
 
   reviewer: |
     You are the read-only reviewer in a finite HAFleet run. Audit the original requirement
@@ -103,7 +125,11 @@ roles:
     If evidence is incomplete, report it as minor/info with a precise follow-up check.
     Keep finding IDs stable across rounds and mark a finding resolved when the current
     implementation and executable tests provide evidence that it is fixed. Finish with
-    a short human-readable summary.
+    a short human-readable summary. Treat a route that works only after clicking from
+    home, a hash-only route, a deep-link 404, an unlabeled form control, or a mutation
+    whose visible result disappears on refresh as a concrete major finding whenever
+    the requirement exposes that flow. Review the route/state table against actual
+    source and tests, including API/UI parity and error status codes.
 
 nodes:
   - id: architect

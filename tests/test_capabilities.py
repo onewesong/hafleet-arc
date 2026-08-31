@@ -26,12 +26,17 @@ class CapabilityModelTests(unittest.TestCase):
         contract = model["requirements"][0]["observable_contract"]
         self.assertIn("success", contract)
         self.assertIn("navigation_and_refresh", contract)
+        self.assertIn("ui_api_parity", contract)
 
     def test_model_is_requirement_only_and_has_generic_quality_rules(self) -> None:
         model = build_capability_model({"id": "ROOT", "children": [{"id": "A", "title": "A"}]})
         self.assertEqual(model["source"], "arc_requirement_tree")
         self.assertTrue(any("hidden" in rule for rule in model["coverage_rules"]))
         self.assertNotIn("tests", model)
+        web = model["web_contract"]
+        self.assertTrue(any("canonical spelling" in rule for rule in web["routing"]))
+        self.assertTrue(any("API boundary" in rule for rule in web["forms"]))
+        self.assertTrue(any("retry states" in rule for rule in web["state"]))
 
 
 if __name__ == "__main__":

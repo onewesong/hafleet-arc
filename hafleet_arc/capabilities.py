@@ -123,6 +123,7 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
                     "invalid_and_failure": "Define validation, conflict, unauthorized/not-found, and server failure behavior when applicable.",
                     "navigation_and_refresh": "Define a stable public entry point and behavior after direct navigation or refresh for web flows.",
                     "persistence": "Verify state survives the supported storage boundary or process restart when the requirement implies persistence.",
+                    "ui_api_parity": "The public UI and API must expose the same state transition, result data, and structured errors.",
                 },
             }
         )
@@ -144,11 +145,13 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
                 "Every requirement-mentioned page has a stable canonical URL path.",
                 "Opening a deep URL directly and refreshing it renders the same page; the server falls back to the app shell for client routes.",
                 "Navigation uses real links/buttons with accessible names; hash-only navigation is not the sole way to reach a page.",
+                "Each route has one canonical spelling and normalizes trailing slashes, query defaults, and legacy aliases without losing state.",
                 "Authenticated routes have an explicit unauthenticated redirect or visible access-denied state.",
             ],
             "forms": [
                 "Every input, select, radio group, checkbox, and date control has a visible label or equivalent accessible name.",
                 "Required fields expose required semantics and deterministic validation messages without losing entered values.",
+                "Validation is enforced at the API boundary as well as the UI; errors identify the field or business conflict and use a non-2xx status for rejected mutations.",
                 "Submit controls expose a stable accessible name and prevent duplicate submissions while pending.",
             ],
             "api": [
@@ -159,6 +162,7 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
             "state": [
                 "Successful auth and mutations update navigation and visible state immediately.",
                 "Refresh/reload reconstructs state from the public API or durable storage rather than in-memory-only fixtures.",
+                "Every async view has explicit loading, empty, recoverable error, and retry states; stale data is not presented as a successful response.",
                 "Logout clears client credentials and protects authenticated views after reload.",
             ],
         },
