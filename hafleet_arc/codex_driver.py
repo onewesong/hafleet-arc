@@ -229,6 +229,18 @@ ARC-Bench web delivery contract:
         self._threads[key] = thread
         return thread
 
+    def reset_thread(self, role: str, workspace_dir: Path | None = None) -> None:
+        """Drop a role/workspace conversation before a corrective turn.
+
+        Initial implementation turns benefit from a persistent conversation, but a
+        long review/repair loop can accumulate stale or contradictory conclusions.
+        The orchestrator may request a fresh context for those bounded corrective
+        passes; the files and durable MessageBus context remain the source of truth.
+        """
+        key = (role, str((workspace_dir or self.output_dir).resolve()))
+        with self._thread_lock:
+            self._threads.pop(key, None)
+
     def _run_once(
         self,
         role: str,

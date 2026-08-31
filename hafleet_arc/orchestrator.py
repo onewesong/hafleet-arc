@@ -243,6 +243,14 @@ class FleetOrchestrator:
             parent_id=request["id"],
         )
         try:
+            # Keep the initial implementation context warm, but isolate corrective
+            # turns from stale model conclusions. The complete requirement subtree,
+            # plan, and structured feedback are supplied again, while workspace files
+            # and MessageBus history remain durable across the fresh conversation.
+            if phase in {"review", "final-review", "repair", "completion", "self-check"}:
+                reset_thread = getattr(self.driver, "reset_thread", None)
+                if callable(reset_thread):
+                    reset_thread(role, workspace_dir=workspace_dir)
             result = self.driver.run(role, prompt, workspace_dir=workspace_dir)
         except TypeError as error:
             if "workspace_dir" not in str(error):
