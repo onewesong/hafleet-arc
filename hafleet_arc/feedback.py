@@ -68,7 +68,10 @@ def review_passes(review: dict[str, Any]) -> bool:
     passed_statuses = {"passed", "pass", "success", "ok"}
     failed_checks = [
         item for item in checks
-        if str(item.get("status", "")).strip().lower() not in passed_statuses
+        if (
+            str(item.get("status", "")).strip().lower() not in passed_statuses
+            and not str(item.get("status", "")).strip().lower().startswith("passed_")
+        )
     ]
     # Only blocker/major findings are gate conditions. Reviewers sometimes retain
     # ``changes_requested`` while reporting only minor/info observations; treating

@@ -25,6 +25,13 @@ class FeedbackPipelineTests(unittest.TestCase):
         )
         self.assertTrue(review_passes(review))
 
+    def test_passed_check_with_minor_gaps_does_not_block_review(self) -> None:
+        review = parse_review(
+            '{"verdict":"pass","findings":[{"severity":"minor","title":"coverage follow-up"}],'
+            '"checks":[{"name":"assertion quality","status":"passed_with_minor_gaps"}]}'
+        )
+        self.assertTrue(review_passes(review))
+
     def test_optional_skipped_check_does_not_fail_test_result(self) -> None:
         self.assertTrue(test_passes({
             "verdict": "pass",
