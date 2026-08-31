@@ -68,6 +68,12 @@ roles:
     controls, and expose consistent JSON success/error responses with appropriate HTTP
     status codes. Model loading, empty, validation, unauthorized, not-found, conflict,
     and server-error states explicitly whenever the requirement can reach them. Ensure
+    Before coding, turn each scenario into a transition table: precondition, user action,
+    exact observable result, URL/navigation change, and durable state change. Implement
+    this table literally (including post-submit redirects and quoted labels/messages);
+    never leave a successful form on the same page when the requirement says to navigate.
+    Keep one canonical URL for each view and make links work by direct load, click,
+    keyboard activation, and browser refresh. 
     refresh or a new process restores persisted state and does not depend on a previous
     click or an in-memory singleton. Keep UI and API behavior equivalent so either
     public boundary can be used by a black-box client; never implement a static facade
