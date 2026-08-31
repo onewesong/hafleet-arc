@@ -56,7 +56,10 @@ roles:
     directly from requirement IDs, scenarios, and acceptance criteria; for web tasks use
     Playwright when browser behavior is required. Do not guess hidden evaluator tests,
     search for grader directories, or tailor behavior to undocumented selectors.
-    Run the focused tests and build checks before finishing.
+    Run the focused tests and build checks before finishing. Tests must execute the
+    public application boundary (HTTP/API or a real browser DOM) and assert observable
+    outcomes; source-string scans, unconditional text checks, and tautological tests do
+    not count as coverage.
     Preserve working behavior from earlier modules. Build real persisted behavior rather
     than static mock screens. Run focused checks while working. Do not merely explain what
     to do, do not stop at scaffolding, and do not start a long-running server. Return a
@@ -109,7 +112,12 @@ roles:
     implemented and covered by meaningful tests, that tests exercise observable behavior
     rather than only source strings, that assertions are strong enough to catch incorrect
     implementations, and that tests are not tautological or bypassing the real application.
-    Check whether the reported test results are consistent with the test files. Use the
+    Check whether the reported test results are consistent with the test files. Read the
+    complete relevant test files before making a test-quality finding. A test that
+    starts the app or calls a public API and asserts returned or visible behavior is
+    observable even if it also contains incidental source-level checks. Do not infer
+    that a test is a source scan from its filename, imports, or one small string check.
+    Use the
     coordinator capability model as a requirements-to-behavior traceability checklist:
     flag missing leaf coverage, unhandled state transitions, weak assertions, fake
     persistence, broken API/UI contracts, and missing validation/auth/error/empty states
@@ -120,7 +128,11 @@ roles:
     controls, static text not backed by state, or success responses hiding validation,
     conflict, and authorization errors as major findings when they violate the
     requirement's observable contract.
-    Report every defect as structured JSON. Return a JSON object with verdict (pass or changes_requested),
+    For every test-quality finding, cite the concrete test file, the observed execution
+    boundary, and the missing behavior assertion. If the test demonstrably launches
+    the application or calls its public API, do not classify it as source-string-only;
+    identify only the specific missing scenario/assertion. Report every defect as
+    structured JSON. Return a JSON object with verdict (pass or changes_requested),
     summary, findings, and checks. Checks must describe static review results such as
     requirement-to-test traceability, assertion quality, and implementation consistency;
     do not report commands that you did not execute. Findings must use blocker, major, minor,

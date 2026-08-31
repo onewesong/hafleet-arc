@@ -375,6 +375,10 @@ subtree and your plan at {plan_path or 'the module plan'}. Inspect the files you
 changed and perform a concise completeness pass. Build a requirement traceability
 matrix in your response (requirement/scenario -> implementation path -> observable
 check), then repair concrete omissions you can verify from the supplied requirements.
+Treat test quality as part of completeness: if existing tests only scan source strings,
+assert unconditional markup, or otherwise do not exercise behavior, replace them with
+real HTTP/API or browser-DOM checks and run them. Do not report a gap without editing
+the affected file when the supplied requirements make the correction actionable.
 For web tasks, use only a short-lived smoke server on port {self.smoke_port} and check
 the public URL/API contracts: direct navigation and refresh, semantic labels and
 accessible names, success/validation/conflict/not-found/error/empty states, and
@@ -599,7 +603,13 @@ Repair loop round {repair_round}. This is a resumed pipeline node. Reviewer feed
 You are the implementation agent. Modify only the current module/workspace, resolve
 all blocker and major findings, add or update executable tests that cover the repaired
 requirements, run those tests and focused build checks, and return a structured summary
-of changed_files, resolved_findings, remaining_findings, and checks.
+of changed_files, resolved_findings, remaining_findings, and checks. You must make the
+required edits in this turn; an explanation without a changed file is not a repair.
+If a finding says a test is a source-string scan, tautological, static, or otherwise
+not observable, replace it with a real black-box test that starts/uses the public
+application boundary (HTTP/API or browser DOM interactions) and asserts the resulting
+behavior. Do not "fix" such a finding by weakening the reviewer or merely adding more
+source text assertions. Re-run the relevant test and include its command and result.
 """
             if module:
                 self.checkpoint.update_pipeline(module.node_id, node="repair", loop_status="repairing", round_number=repair_round)
@@ -664,7 +674,8 @@ feedback is authoritative:
 
 You are the implementation agent. Modify only implementation files belonging to the
 current module, resolve the failing tests, and leave test files intact unless a test
-itself is demonstrably incorrect.
+itself is demonstrably incorrect. You must make a concrete file change when a failure
+is actionable and report changed_files; do not return only an explanation.
 """
                     self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", round_number=round_number, review_findings=test_result.get("findings", []))
                     repair_result = self._run_agent(repair_role, repair_prompt.strip(), module=module, phase="repair", round_number=round_number, workspace_dir=workspace_dir, parent_id=parent_id)
@@ -775,6 +786,12 @@ You are the implementation agent. Modify only the current module/workspace, reso
 all blocker and major findings, add or update executable regression tests derived from
 the original requirements, run those tests and focused build checks, and return a
 structured summary of changed_files, resolved_findings, remaining_findings, and checks.
+You must make the required edits in this turn; an explanation without a changed file
+is not a repair. If any finding identifies source-string-only, tautological, or static
+tests, rewrite those tests to exercise the public application over HTTP/API or through
+real browser DOM interactions, with behavior assertions that can fail for a broken
+implementation. Never satisfy a test-quality finding by adding more source scans or
+weakening the assertion. Re-run the focused tests and report the command/result.
 """
             repair_result = self._run_agent(
                 repair_role,
