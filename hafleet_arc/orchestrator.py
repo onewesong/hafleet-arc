@@ -320,6 +320,86 @@ class FleetOrchestrator:
             for node in self.pipeline.nodes
         )
 
+    def _self_check_enabled(self, module: RequirementModule | None) -> bool:
+        """Whether to run the short implementation self-check before review.
+
+        The check is deliberately derived only from the supplied requirement tree. It
+        gives an implementer a second, focused pass to catch omissions while the
+        module context is still warm, without reading evaluator tests or introducing
+        a product-specific validator. Empty synthetic modules used by legacy callers
+        keep the historical single-turn behaviour.
+        """
+        if module is None:
+            return False
+        setting = os.environ.get("HAFLEET_SELF_CHECK", "auto").strip().lower()
+        if setting in {"0", "false", "no"}:
+            return False
+        subtree = module.subtree if isinstance(module.subtree, dict) else {}
+        # A nested requirement tree (or explicit scenarios/acceptance) is enough
+        # evidence that a real module benefits from the extra pass.  Keep tiny
+        # synthetic ``{id, name}`` modules used by legacy integrations on the old
+        # single-turn path; operators can still force the check with
+        # ``HAFLEET_SELF_CHECK=1``.
+        meaningful = any(
+            key in subtree
+            for key in ("children", "requirements", "scenarios", "acceptance", "acceptance_criteria")
+        )
+        return setting in {"1", "true", "yes", "on"} or meaningful
+
+    def _run_implementer_self_check(
+        self,
+        module: RequirementModule,
+        base_prompt: str,
+        *,
+        workspace_dir: Path | None = None,
+        plan_path: Path | None = None,
+    ) -> Any:
+        """Run a bounded, requirement-derived implementation completeness pass.
+
+        This is intentionally an Implementer turn rather than a new role. It is a
+        short feedback-free audit that asks the same agent to inspect its own output,
+        exercise public contracts on the smoke port, and repair concrete omissions.
+        The final Reviewer remains read-only and authoritative for approval.
+        """
+        round_number = 0
+        self.checkpoint.update_pipeline(
+            module.node_id,
+            node="self_check",
+            phase="implement",
+            loop_status="self_checking",
+        )
+        prompt = base_prompt + f"""
+
+Implementation self-check (before read-only review). Re-read the complete requirement
+subtree and your plan at {plan_path or 'the module plan'}. Inspect the files you just
+changed and perform a concise completeness pass. Build a requirement traceability
+matrix in your response (requirement/scenario -> implementation path -> observable
+check), then repair concrete omissions you can verify from the supplied requirements.
+For web tasks, use only a short-lived smoke server on port {self.smoke_port} and check
+the public URL/API contracts: direct navigation and refresh, semantic labels and
+accessible names, success/validation/conflict/not-found/error/empty states, and
+durable state after reload where applicable. Run focused build/unit checks, but do
+not search for or infer hidden/evaluator tests. Keep changes inside this module and
+return JSON with changed_files, covered_requirements, checks, and remaining_risks.
+Do not merely describe gaps: fix concrete gaps before returning.
+"""
+        result = self._run_agent(
+            self.pipeline.role_for("implementer", "implementer"),
+            textwrap.dedent(prompt).strip(),
+            module=module,
+            phase="self-check",
+            round_number=round_number,
+            workspace_dir=workspace_dir,
+        )
+        self._message(
+            "agent.message",
+            self.pipeline.role_for("implementer", "implementer"),
+            module=module,
+            phase="self-check",
+            payload={"response": str(getattr(result, "final_response", "") or "")[:20000]},
+        )
+        return result
+
     @staticmethod
     def _ensure_plan_artifact(plan_path: Path, module: RequirementModule) -> None:
         """Ensure a durable plan exists when implementer-owned planning is used.
@@ -1041,6 +1121,9 @@ structured summary of changed_files, resolved_findings, remaining_findings, and 
                         self.runtime.events.mark_design_done(
                             module.node_id, "HAFleet implementer plan completed"
                         )
+                    if self._self_check_enabled(module):
+                        log(f"[hafleet]   implementer self-check: {module.node_id}", flush=True)
+                        self._run_implementer_self_check(module, base_prompt, plan_path=plan_path)
                     self._check_pause(module, "review")
                     self.checkpoint.mark_module_started(module.node_id, "review")
                     log(f"[hafleet]   reviewer started: {module.node_id}", flush=True)
@@ -1089,6 +1172,50 @@ structured summary of changed_files, resolved_findings, remaining_findings, and 
         if modules and not bool(self.checkpoint.read().get("final_review_completed")):
             self._check_pause(None, "final-review")
             module_ids = ", ".join(item.node_id for item in modules)
+            # Give the implementation agent one explicit, whole-project integration
+            # pass before the read-only final audit.  Module turns are intentionally
+            # scoped, but cross-module navigation/authentication/persistence bugs are
+            # only observable once all modules have landed.  This pass is driven by
+            # the supplied requirements (never evaluator tests) and is opt-out for
+            # legacy/expensive runs.
+            # Keep legacy runs lightweight unless explicitly enabled; production
+            # optimization runs set HAFLEET_FINAL_INTEGRATION=1.
+            integration_enabled = os.environ.get("HAFLEET_FINAL_INTEGRATION", "0").strip().lower() not in {
+                "0", "false", "no",
+            } and final_review_enabled
+            if integration_enabled and modules:
+                log("[hafleet] Final integration implementation pass started", flush=True)
+                integration_prompt = textwrap.dedent(
+                    f"""
+                    Perform a whole-project integration pass for ARC-Bench task type {self.task_type}.
+                    All feature modules are now implemented: {module_ids}.
+                    Read the complete original requirement tree from {self.requirements_dir},
+                    the architecture document {self.architecture_path}, and the current
+                    workspace. Do not access, search for, or infer hidden/evaluator tests.
+
+                    Audit and improve the running product across module boundaries. Exercise
+                    public behavior with focused smoke checks where useful, but do not start a
+                    long-lived server. Prioritize concrete requirement-derived gaps in:
+                    - navigation and direct URL/deep-link refresh between every user flow;
+                    - authentication/session/logout transitions and authorization guards;
+                    - API/UI state parity, validation/conflict/error/empty states;
+                    - deterministic app-owned seed/bootstrap records described by requirements;
+                    - durable persistence across refresh and process restart;
+                    - end-to-end handoffs such as search -> booking -> order -> payment and
+                      profile/passenger updates, when those concepts exist in the requirements.
+
+                    Preserve all already-implemented behavior and module boundaries. Make real
+                    source changes (not static text), update or add requirement-derived tests,
+                    and run the available build/focused checks. Do not tailor selectors or
+                    behavior to undocumented tests. Return a concise structured summary of
+                    changed_files, requirement_ids, checks, and unresolved risks.
+                    """
+                ).strip()
+                self._run_agent(
+                    self.pipeline.role_for("implementer", "implementer"),
+                    integration_prompt,
+                    phase="integration",
+                )
             if final_review_enabled:
                 log("[hafleet] Final integration review started", flush=True)
                 self._review_loop(
@@ -1194,6 +1321,13 @@ structured summary of changed_files, resolved_findings, remaining_findings, and 
         )
         if not planner_enabled:
             self._ensure_plan_artifact(plan_path, module)
+        if self._self_check_enabled(module):
+            self._run_implementer_self_check(
+                module,
+                base_prompt,
+                workspace_dir=workspace,
+                plan_path=plan_path,
+            )
         self._review_loop(module, base_prompt, workspace_dir=workspace)
         return plan_path
 
