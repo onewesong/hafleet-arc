@@ -13,6 +13,9 @@ from urllib.request import Request, urlopen
 from .postflight import cleanup_workspace_port
 
 
+ProjectCommand = tuple[list[str], Path, str, str]
+
+
 class TestExecutionError(RuntimeError):
     pass
 
@@ -118,7 +121,28 @@ def _safe_cwd(output_dir: Path, value: object) -> Path | None:
     return candidate if candidate.is_dir() else None
 
 
-def _verification_commands(output_dir: Path, module_id: str) -> list[tuple[list[str], Path, str]]:
+def _infer_server_mode(command: list[str], cwd: Path, output_dir: Path) -> str:
+    joined = " ".join(command).lower()
+    if any(marker in joined for marker in (" build", "compile", "lint", "typecheck")):
+        return "none"
+    source = ""
+    for argument in command[1:]:
+        try:
+            path = (cwd / argument).resolve()
+            path.relative_to(output_dir.resolve())
+            if path.is_file():
+                source += path.read_text(encoding="utf-8", errors="ignore")[:100_000].lower()
+        except (OSError, ValueError):
+            continue
+    if cwd.name == "backend" and (
+        ("spawn(" in source or "execfile(" in source or "npm start" in source)
+        and ("server.js" in source or "port" in source)
+    ):
+        return "self"
+    return "managed"
+
+
+def _verification_commands(output_dir: Path, module_id: str) -> list[ProjectCommand]:
     """Load project-owned commands without consulting any evaluator directory."""
 
     path = output_dir / ".arc" / "hafleet" / "verification.json"
@@ -129,7 +153,7 @@ def _verification_commands(output_dir: Path, module_id: str) -> list[tuple[list[
     raw = payload.get("commands") if isinstance(payload, dict) else None
     if not isinstance(raw, list):
         return []
-    commands: list[tuple[list[str], Path, str]] = []
+    commands: list[ProjectCommand] = []
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
             continue
@@ -148,12 +172,14 @@ def _verification_commands(output_dir: Path, module_id: str) -> list[tuple[list[
         joined = " ".join(normalized).lower()
         if "arc-bench/webapp" in joined or "benchmark/tests" in joined or "evaluator/tests" in joined:
             continue
-        commands.append((normalized, cwd, f"verification command {index + 1}"))
+        configured_mode = str(item.get("server_mode") or "").strip().lower()
+        mode = configured_mode if configured_mode in {"managed", "self", "none"} else _infer_server_mode(normalized, cwd, output_dir)
+        commands.append((normalized, cwd, f"verification command {index + 1}", mode))
     return commands
 
 
-def _package_test_commands(output_dir: Path) -> list[tuple[list[str], Path, str]]:
-    commands: list[tuple[list[str], Path, str]] = []
+def _package_test_commands(output_dir: Path) -> list[ProjectCommand]:
+    commands: list[ProjectCommand] = []
     for cwd in (output_dir, output_dir / "frontend", output_dir / "backend"):
         package_path = cwd / "package.json"
         try:
@@ -167,24 +193,26 @@ def _package_test_commands(output_dir: Path) -> list[tuple[list[str], Path, str]
         value = str(scripts.get(script) or "").strip()
         if not value or "no test specified" in value.lower():
             continue
-        commands.append((["npm", "run", script], cwd, f"{cwd.name or 'root'} npm run {script}"))
+        command = ["npm", "run", script]
+        commands.append((command, cwd, f"{cwd.name or 'root'} npm run {script}", _infer_server_mode(command, cwd, output_dir)))
     return commands
 
 
-def _fallback_test_commands(output_dir: Path) -> list[tuple[list[str], Path, str]]:
+def _fallback_test_commands(output_dir: Path) -> list[ProjectCommand]:
     """Run conventional project tests when an older output has no manifest/scripts."""
 
-    commands: list[tuple[list[str], Path, str]] = []
+    commands: list[ProjectCommand] = []
     backend = output_dir / "backend"
     if backend.is_dir():
         for path in sorted(backend.glob("test-*.mjs")) + sorted(backend.glob("test-*.js")):
-            commands.append((["node", path.name], backend, f"node {path.relative_to(output_dir)}"))
+            command = ["node", path.name]
+            commands.append((command, backend, f"node {path.relative_to(output_dir)}", _infer_server_mode(command, backend, output_dir)))
     if not commands and (output_dir / "tests").is_dir():
-        commands.append((["python3", "-m", "unittest", "discover", "-s", "tests"], output_dir, "python unittest discover"))
+        commands.append((["python3", "-m", "unittest", "discover", "-s", "tests"], output_dir, "python unittest discover", "none"))
     return commands
 
 
-def discover_project_test_commands(output_dir: Path, module_id: str = "ROOT") -> list[tuple[list[str], Path, str]]:
+def discover_project_test_commands(output_dir: Path, module_id: str = "ROOT") -> list[ProjectCommand]:
     """Return deterministic, workspace-confined verification commands."""
 
     return (
@@ -198,14 +226,14 @@ def has_project_tests(output_dir: Path, module_id: str = "ROOT") -> bool:
     return bool(discover_project_test_commands(output_dir, module_id))
 
 
-def _project_uses_playwright(output_dir: Path, commands: list[tuple[list[str], Path, str]]) -> bool:
+def _project_uses_playwright(output_dir: Path, commands: list[ProjectCommand]) -> bool:
     for package_path in (output_dir / "package.json", output_dir / "frontend" / "package.json", output_dir / "backend" / "package.json"):
         try:
             if "playwright" in package_path.read_text(encoding="utf-8", errors="ignore").lower():
                 return True
         except OSError:
             pass
-    for command, cwd, _label in commands:
+    for command, cwd, _label, _mode in commands:
         joined = " ".join(command).lower()
         if "playwright" in joined:
             return True
@@ -282,7 +310,7 @@ def run_project_tests(
             if backend_install_code != 0:
                 return _write_result(result_dir, round_number, {"verdict": "changes_requested", "summary": "Backend test dependency installation failed", "findings": [{"id": f"T-{module_id}-ENV", "severity": "blocker", "title": "Backend test dependencies unavailable", "description": backend_install_output}], "checks": checks, "tests": [], "artifacts": {}})
         playwright_enabled = _project_uses_playwright(output_dir, commands)
-        playwright_cwd = next((command_cwd for _command, command_cwd, _label in commands if (command_cwd / "node_modules").exists()), cwd)
+        playwright_cwd = next((command_cwd for _command, command_cwd, _label, _mode in commands if (command_cwd / "node_modules").exists()), cwd)
         install_browser = os.environ.get("HAFLEET_PLAYWRIGHT_INSTALL", "1").strip().lower() not in {"0", "false", "no"}
         if playwright_enabled and install_browser:
             browser_code, browser_output = _run(["npx", "playwright", "install", "chromium"], playwright_cwd, env, timeout)
@@ -299,45 +327,56 @@ def run_project_tests(
                 return _write_result(result_dir, round_number, {"verdict": "changes_requested", "summary": "Playwright browser is unavailable", "findings": [{"id": f"T-{module_id}-BROWSER", "severity": "blocker", "title": "Browser unavailable", "description": probe_output or "HAFLEET_PLAYWRIGHT_INSTALL=0 and Playwright is not available."}], "checks": checks, "tests": [], "artifacts": {}})
     else:
         commands = discover_project_test_commands(output_dir, module_id)
+        checks = []
         if not commands:
-            commands = [(["python3", "-m", "unittest", "discover"], output_dir, "python unittest discover")]
+            commands = [(["python3", "-m", "unittest", "discover"], output_dir, "python unittest discover", "none")]
 
     process: subprocess.Popen[str] | None = None
     backend = output_dir / "backend"
+
+    def start_managed_server() -> subprocess.Popen[str] | None:
+        if task_type != "web" or not (backend / "package.json").is_file():
+            return None
+        cleanup_workspace_port(smoke_port, output_dir)
+        candidate = subprocess.Popen(
+            ["npm", "start"],
+            cwd=backend,
+            env={**env, "PORT": str(smoke_port), "HOST": "127.0.0.1"},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + max(int(os.environ.get("HAFLEET_READY_TIMEOUT", "45")), 1)
+        while time.monotonic() < deadline and not _ready(smoke_port):
+            if candidate.poll() is not None:
+                break
+            time.sleep(0.5)
+        if _ready(smoke_port):
+            return candidate
+        _stop(candidate)
+        return None
+
     try:
-        if task_type == "web" and (backend / "package.json").is_file():
-            cleanup_workspace_port(smoke_port, output_dir)
-            process = subprocess.Popen(["npm", "start"], cwd=backend, env={**env, "PORT": str(smoke_port), "HOST": "127.0.0.1"}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, start_new_session=True)
-            deadline = time.monotonic() + max(int(os.environ.get("HAFLEET_READY_TIMEOUT", "45")), 1)
-            while time.monotonic() < deadline and not _ready(smoke_port):
-                if process.poll() is not None:
-                    break
-                time.sleep(0.5)
-            if not _ready(smoke_port):
-                output = ""
-                if process.poll() is not None:
-                    output = "backend process exited before smoke endpoint became ready"
-                return _write_result(result_dir, round_number, {"verdict": "changes_requested", "summary": "Test server did not become ready", "findings": [{"id": f"T-{module_id}-SERVER", "severity": "blocker", "title": "Test server unavailable", "description": output}], "checks": checks, "tests": [], "artifacts": {}})
-            reset_status, reset_output = _reset_test_state(smoke_port)
-            checks.append({"name": "POST /api/test/reset", "status": reset_status, "output": reset_output})
-            if reset_status == "failed":
-                return _write_result(result_dir, round_number, {
-                    "verdict": "changes_requested",
-                    "summary": "Test state reset failed",
-                    "findings": [{"id": f"T-{module_id}-RESET", "severity": "blocker", "title": "Test state reset failed", "description": reset_output}],
-                    "checks": checks, "tests": [], "artifacts": {},
-                })
         failures: list[str] = []
         browser_failure = False
-        for command, command_cwd, label in commands:
-            if task_type == "web":
+        for command, command_cwd, label, server_mode in commands:
+            if task_type == "web" and server_mode == "self":
+                _stop(process)
+                process = None
+                cleanup_workspace_port(smoke_port, output_dir)
+            elif task_type == "web" and server_mode == "managed" and process is None:
+                process = start_managed_server()
+                if process is None:
+                    return _write_result(result_dir, round_number, {"verdict": "changes_requested", "summary": "Test server did not become ready", "findings": [{"id": f"T-{module_id}-SERVER", "severity": "blocker", "title": "Test server unavailable", "description": "backend process exited before smoke endpoint became ready"}], "checks": checks, "tests": [], "artifacts": {}})
+            if task_type == "web" and server_mode == "managed":
                 reset_status, reset_output = _reset_test_state(smoke_port)
                 checks.append({"name": f"{label}: POST /api/test/reset", "status": reset_status, "output": reset_output})
                 if reset_status == "failed":
                     failures.append(f"{label}: {reset_output}")
                     continue
             code, output = _run(command, command_cwd, env, timeout)
-            checks.append({"name": label, "status": "passed" if code == 0 else "failed", "output": output})
+            checks.append({"name": label, "status": "passed" if code == 0 else "failed", "output": output, "server_mode": server_mode})
             if code != 0:
                 failures.append(f"{label} failed with exit code {code}:\n{output}")
                 browser_failure = browser_failure or _browser_error(output)

@@ -1215,7 +1215,10 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             Maintain the generated verification manifest at
             .arc/hafleet/verification.json. It must contain a JSON object with a
             `commands` array. Each command entry has `module_id`, `cwd`, and `command`
-            (an argv string array) and must execute requirement-derived tests through
+            (an argv string array), plus `server_mode`: use `managed` when the command
+            expects HAFleet to provide the smoke server, `self` when the test starts
+            and stops its own server, and `none` for build/static checks. Commands
+            without this field use conservative inference. Each command must execute requirement-derived tests through
             the public application boundary. Register every focused test command you
             actually ran. Never put evaluator paths or hidden tests in this manifest.
             """
