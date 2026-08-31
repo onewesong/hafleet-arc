@@ -218,6 +218,14 @@ ARC-Bench web delivery contract:
 - Before finishing a web turn, smoke-check each requirement-derived route directly
   (HTTP GET), then exercise one valid and one invalid form action. Record failures in
   the structured result instead of silently substituting static placeholder content.
+- Treat high-fan-out prerequisite flows as gates. In particular, assert the canonical
+  URL after account creation/sign-in and after primary search/navigation actions; a
+  success message or changed header alone is not evidence that dependent flows work.
+- Use ARC_TEST_DATE/current runtime time for app fixtures and executable tests. Do not
+  hard-code the date on which the project was generated.
+- Register project-owned verification commands in .arc/hafleet/verification.json using
+  JSON entries with module_id, cwd, and an argv-array command. Never reference evaluator
+  tests or directories outside the generated workspace.
 """
         thread = self._codex.thread_start(
             cwd=str(cwd),

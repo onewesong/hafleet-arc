@@ -115,6 +115,37 @@ class OrchestratorTests(unittest.TestCase):
             self.assertTrue(any(item["kind"] == "review.feedback" for item in messages))
             self.assertTrue(any(item["kind"] == "pipeline.state" and item["payload"].get("status") == "approved" for item in messages))
 
+    def test_project_owned_test_failure_loops_to_implementer_before_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class Driver:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append(role)
+                    return SimpleNamespace(final_response='{"verdict":"pass","summary":"ok","findings":[],"checks":[]}')
+
+            driver = Driver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            failed = {"verdict": "changes_requested", "summary": "failed", "findings": [{"id": "T-1", "severity": "major", "title": "failed"}], "checks": []}
+            passed = {"verdict": "pass", "summary": "passed", "findings": [], "checks": []}
+            with mock.patch("hafleet_arc.orchestrator.has_project_tests", return_value=True), mock.patch(
+                "hafleet_arc.orchestrator.run_project_tests", side_effect=[failed, passed]
+            ):
+                result = orchestrator._review_loop(self._module(1, "REQ-1"), "Review REQ-1")
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(driver.calls, ["implementer", "reviewer"])
+            self.assertTrue(any(item["kind"] == "test.failed" for item in orchestrator.bus.replay()))
+
     def test_requirement_modules_get_implementer_self_check(self) -> None:
         """Nested requirement modules receive a warm-context completeness pass."""
         with tempfile.TemporaryDirectory() as temporary:

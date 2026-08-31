@@ -43,6 +43,11 @@ roles:
     durable state expected after refresh. Prefer the browser History API and a
     server-side app-shell fallback for public routes; hash fragments may be retained
     only as backwards-compatible aliases and must never be the sole navigation path.
+    Define a project-owned executable verification contract: normal package test scripts
+    plus `.arc/hafleet/verification.json` entries scoped to requirement modules. Browser
+    dependencies must be declared in package manifests so a clean process can install
+    and run them; tests and application fixtures must use ARC_TEST_DATE/current runtime
+    time rather than the architecture or generation date.
 
   implementer: |
     You are the planning and implementation agent, also responsible for test authoring, in a finite HAFleet
@@ -75,6 +80,11 @@ roles:
     exact observable result, URL/navigation change, and durable state change. Implement
     this table literally (including post-submit redirects and quoted labels/messages);
     never leave a successful form on the same page when the requirement says to navigate.
+    When successful account creation specifies feedback but no destination, use the
+    conventional sign-in handoff. When successful sign-in specifies no destination,
+    return to the intended protected route or the stable application landing page.
+    Assert these canonical URL outcomes in browser tests instead of checking only a
+    toast, response payload, or changed header.
     Keep one canonical URL for each view and make links work by direct load, click,
     keyboard activation, and browser refresh. 
     refresh or a new process restores persisted state and does not depend on a previous
@@ -103,6 +113,17 @@ roles:
     direct GET of each canonical route, refresh, one valid action, one invalid action,
     empty state, and unauthenticated access. Record commands/results in the plan;
     never infer behavior from hidden evaluator tests.
+    Execute prerequisite flows before their dependents. Treat authentication, primary
+    navigation, public search/list pages, and other high-fan-out prerequisites as release
+    gates: verify their exact visible state and canonical URL before spending time on
+    downstream workflows. Run browser checks with more than one isolated context when
+    reset/bootstrap behavior exists, so tests do not depend on one serial in-memory
+    session. Derive dates at runtime from ARC_TEST_DATE or the current clock; never bake
+    the generation date into application data or executable tests.
+    Keep `.arc/hafleet/verification.json` current with every requirement-derived test
+    command you ran. Its `commands` entries use `{module_id,cwd,command}` and command is
+    an argv array. Commands must exercise only project-owned tests, never evaluator or
+    parent benchmark paths.
 
   reviewer: |
     You are the read-only reviewer in a finite HAFleet run. Audit the original requirement
@@ -148,6 +169,11 @@ roles:
     whose visible result disappears on refresh as a concrete major finding whenever
     the requirement exposes that flow. Review the route/state table against actual
     source and tests, including API/UI parity and error status codes.
+    Independently inspect post-action URLs in tests for every successful form or
+    navigation flow. A test that checks only a success message, changed header, or API
+    response is insufficient when dependent scenarios require a stable landing route.
+    Audit high-fan-out prerequisites before downstream details and reject generation-time
+    hard-coded dates when requirements define a runtime/configured date.
 
 nodes:
   - id: architect

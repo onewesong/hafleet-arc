@@ -26,7 +26,7 @@ from .message_bus import MessageBus
 from .models import RequirementModule
 from .pipeline import Pipeline, load_pipeline
 from .postflight import PostflightError, rehearse_web_app, validate_web_structure
-from .test_runner import persist_test_result, run_project_tests
+from .test_runner import has_project_tests, persist_test_result, run_project_tests
 from .log import log
 from .worktree import WorktreeConflict, WorktreeManager
 
@@ -419,7 +419,8 @@ future work is needed: make concrete source and executable-test changes in this 
 Prioritize domain entities/services and API contracts, then shared client state and
 canonical routes, then view details. Preserve existing working behavior and module
 boundaries. Do not search for or infer hidden/evaluator tests. Run focused tests/build
-checks and return JSON with changed_files, covered requirement IDs, checks, and any
+checks, register the exact argv commands in .arc/hafleet/verification.json, and return
+JSON with changed_files, covered requirement IDs, checks, and any
 remaining risks; an empty changed_files result is acceptable only when you can cite
 evidence for every leaf being implemented.
 """
@@ -477,7 +478,11 @@ For web tasks, use only a short-lived smoke server on port {self.smoke_port} and
 the public URL/API contracts: direct navigation and refresh, semantic labels and
 accessible names, success/validation/conflict/not-found/error/empty states, and
 durable state after reload where applicable. Run focused build/unit checks, but do
-not search for or infer hidden/evaluator tests. Keep changes inside this module and
+not search for or infer hidden/evaluator tests. Assert the canonical URL after every
+successful navigation/form transition, especially prerequisite auth and primary-list
+flows; success text alone is insufficient evidence. Use runtime/configured dates, not
+the generation date. Register every executed argv command in
+.arc/hafleet/verification.json. Keep changes inside this module and
 return JSON with changed_files, covered_requirements, checks, and remaining_risks.
 Do not merely describe gaps: fix concrete gaps before returning.
 """
@@ -656,6 +661,52 @@ implementation source files. Return the required structured Tester JSON response
         self.checkpoint.update_pipeline(module_id, test_status="passed" if test_passes(parsed) else "failed", last_test_message_id=completed["id"], last_test_hash=result_hash, test_results=parsed.get("tests", []))
         return parsed
 
+    def _run_registered_project_tests(
+        self,
+        module: RequirementModule | None,
+        *,
+        workspace_dir: Path | None,
+        round_number: int,
+        parent_id: str = "",
+    ) -> dict[str, Any]:
+        """Execute Implementer-authored tests without introducing a Tester role."""
+
+        workspace = workspace_dir or self.output_dir
+        module_id = module.node_id if module else "ROOT"
+        started = self._message(
+            "test.started",
+            "orchestrator",
+            module=module,
+            phase="verify",
+            round_number=round_number,
+            payload={"mode": "integration" if module is None else "module", "source": "project_verification"},
+            parent_id=parent_id,
+        )
+        result = run_project_tests(
+            workspace,
+            task_type=self.task_type,
+            module_id=module_id,
+            round_number=round_number,
+            smoke_port=self.smoke_port,
+        )
+        kind = "test.completed" if test_passes(result) else "test.failed"
+        completed = self._message(
+            kind,
+            "orchestrator",
+            module=module,
+            phase="verify",
+            round_number=round_number,
+            payload=result,
+            parent_id=started["id"],
+        )
+        self.checkpoint.update_pipeline(
+            module_id,
+            test_status="passed" if test_passes(result) else "failed",
+            last_test_message_id=completed["id"],
+            last_test_hash=test_hash(result),
+        )
+        return result
+
     def _review_loop(
         self,
         module: RequirementModule | None,
@@ -731,7 +782,50 @@ source text assertions. Re-run the relevant test and include its command and res
             first_round = repair_round + 1
         for round_number in range(first_round, max_rounds + 1):
             self._check_pause(module, "final-review" if final_review else "review")
-            if self._tester_enabled(module, workspace_dir):
+            tester_enabled = self._tester_enabled(module, workspace_dir)
+            project_test_setting = os.environ.get("HAFLEET_PROJECT_TESTS", "1").strip().lower()
+            project_tests_enabled = (
+                not tester_enabled
+                and project_test_setting not in {"0", "false", "no"}
+                and has_project_tests(workspace_dir or self.output_dir, module.node_id if module else "ROOT")
+            )
+            if project_tests_enabled:
+                test_result = self._run_registered_project_tests(
+                    module,
+                    workspace_dir=workspace_dir,
+                    round_number=round_number,
+                    parent_id=parent_id,
+                )
+                if not test_passes(test_result):
+                    current_hash = test_hash(test_result)
+                    current_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
+                    if current_hash == previous_hash and current_fingerprint == previous_fingerprint:
+                        self._defer_quality(module, "test", "project verification made no progress")
+                        return test_result
+                    if round_number >= max_rounds:
+                        self._defer_quality(module, "test", f"project verification exceeded {max_rounds} rounds")
+                        return test_result
+                    repair_prompt = base_prompt + f"""
+
+Deterministic execution of the project-owned verification commands failed in repair
+round {round_number}. These commands and diagnostics come only from tests generated
+inside the workspace from the supplied requirements; they are not evaluator tests:
+{json.dumps(test_result, ensure_ascii=False, indent=2)}
+
+Repair the implementation or its requirement-derived tests as appropriate. Preserve
+strong assertions: do not delete, skip, weaken, or replace a failing behavioral test
+with source inspection. Re-run the registered commands, update
+.arc/hafleet/verification.json, and report concrete changed_files and check results.
+Prioritize the earliest failed prerequisite because dependent workflows may be
+invalid until it passes.
+"""
+                    self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", round_number=round_number, review_findings=test_result.get("findings", []))
+                    repair_result = self._run_agent(repair_role, repair_prompt.strip(), module=module, phase="repair", round_number=round_number, workspace_dir=workspace_dir, parent_id=parent_id)
+                    self._message("agent.message", repair_role, module=module, phase="repair", round_number=round_number, payload={"response": str(getattr(repair_result, "final_response", "") or "")[:20000], "test_feedback": test_result}, parent_id=parent_id)
+                    previous_hash = current_hash
+                    previous_fingerprint = current_fingerprint
+                    continue
+            if tester_enabled:
                 tester_node = self.pipeline.node("final_test") if final_review else self.pipeline.node("tester")
                 tester_role = loop.test or (tester_node.role if tester_node else "") or self.pipeline.role_for("tester", "tester")
                 test_result = self._run_tester(
@@ -1053,6 +1147,8 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 collect_index(child)
         collect_index(self.requirement_tree or {})
         global_index_text = "\n".join(global_index) or "(unavailable)"
+        root_contracts = build_capability_model(self.requirement_tree or {}).get("seed_contracts", [])
+        root_contracts_text = json.dumps(root_contracts, ensure_ascii=False, indent=2)
         workspace_note = ""
         if workspace_dir is not None:
             workspace_note = textwrap.dedent(
@@ -1072,6 +1168,12 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             Whole-project requirement index (IDs/titles only; do not implement future
             modules by guessing details):
             {global_index_text}
+            Author-provided ROOT data/seed contracts (these are part of the public
+            requirements, not evaluator fixtures; preserve every prerequisite record
+            needed by this module and use the configured runtime date/environment):
+            ```json
+            {root_contracts_text}
+            ```
             Coordinator plan path: {plan_path}
             Global architecture document: {self.architecture_path}
 
@@ -1101,6 +1203,13 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             authorization, navigation, and refresh persistence when applicable. Do not
             access, search for, or mention external/hidden acceptance-test source files;
             the supplied requirement tree is the sole product specification.
+
+            Maintain the generated verification manifest at
+            .arc/hafleet/verification.json. It must contain a JSON object with a
+            `commands` array. Each command entry has `module_id`, `cwd`, and `command`
+            (an argv string array) and must execute requirement-derived tests through
+            the public application boundary. Register every focused test command you
+            actually ran. Never put evaluator paths or hidden tests in this manifest.
             """
         ).strip()
 

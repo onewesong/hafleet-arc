@@ -99,16 +99,57 @@ def _scenario(scenario: dict[str, Any], fallback_id: str, index: int) -> dict[st
             elif _text(step):
                 normalized_steps.append({"action": _text(step), "expected": ""})
     expected = _strings(scenario.get("expected") or scenario.get("outcomes") or scenario.get("acceptance"), 6)
+    given = [step["content"] for step in normalized_steps if step.get("keyword", "").upper() == "GIVEN" and step.get("content")]
+    when = [step["content"] for step in normalized_steps if step.get("keyword", "").upper() == "WHEN" and step.get("content")]
+    then = [step["content"] for step in normalized_steps if step.get("keyword", "").upper() in {"THEN", "AND_THEN"} and step.get("content")]
     return {
         "id": scenario_id,
         "name": name,
         "steps": normalized_steps,
+        "transition": {
+            "preconditions": given,
+            "actions": when,
+            "observable_results": then,
+        },
         "expected": expected,
         "references": _references(scenario.get("description"), scenario.get("text")),
     }
 
 
-def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) -> dict[str, Any]:
+def _root_data_contracts(tree: dict[str, Any], limit: int = 160) -> list[dict[str, Any]]:
+    """Preserve author-supplied seed/example records as first-class contracts.
+
+    These records are part of the requirement input, not evaluator fixtures.  Keeping
+    them in the compact model prevents feature-scoped turns from silently dropping
+    accounts, routes, empty states, or other prerequisite data described at ROOT.
+    """
+
+    raw = tree.get("data") or tree.get("fixtures") or tree.get("seed_data") or []
+    if not isinstance(raw, list):
+        return []
+    contracts: list[dict[str, Any]] = []
+    for group in raw:
+        if len(contracts) >= limit:
+            break
+        if isinstance(group, dict):
+            category = _text(group.get("category") or group.get("name") or group.get("title"), 160)
+            items = group.get("items") or group.get("records") or group.get("values") or []
+            if not isinstance(items, list):
+                items = [items]
+            for item in items:
+                statement = _text(item, 800)
+                if statement:
+                    contracts.append({"category": category, "statement": statement})
+                if len(contracts) >= limit:
+                    break
+        else:
+            statement = _text(group, 800)
+            if statement:
+                contracts.append({"category": "", "statement": statement})
+    return contracts
+
+
+def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 160) -> dict[str, Any]:
     """Return a bounded, deterministic capability matrix from any requirement tree."""
 
     requirements: list[dict[str, Any]] = []
@@ -166,9 +207,18 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
                     visit(child, req_id)
 
     visit(tree)
+    dependent_counts: dict[str, int] = {}
+    for requirement in requirements:
+        for dependency in requirement.get("dependencies", []):
+            dependent_counts[dependency] = dependent_counts.get(dependency, 0) + 1
+    for requirement in requirements:
+        count = dependent_counts.get(str(requirement.get("id") or ""), 0)
+        requirement["dependent_count"] = count
+        requirement["critical_prerequisite"] = count >= 2
     return {
         "source": "arc_requirement_tree",
         "requirements": requirements,
+        "seed_contracts": _root_data_contracts(tree),
         # This is a domain-neutral browser/API contract.  It gives an agent a
         # stable interoperability target without revealing evaluator details or
         # prescribing product-specific selectors.
@@ -179,6 +229,8 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
                 "Navigation uses real links/buttons with accessible names; hash-only navigation is not the sole way to reach a page.",
                 "Each route has one canonical spelling and normalizes trailing slashes, query defaults, and legacy aliases without losing state.",
                 "Authenticated routes have an explicit unauthenticated redirect or visible access-denied state.",
+                "Successful account creation hands off to sign-in unless the requirement explicitly establishes an authenticated session; successful sign-in returns to the intended route or the stable application landing page.",
+                "Every successful or rejected form action has an asserted canonical URL outcome, including the conventional outcome when prose specifies only success feedback.",
             ],
             "forms": [
                 "Every input, select, radio group, checkbox, and date control has a visible label or equivalent accessible name.",
@@ -196,6 +248,7 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
                 "Refresh/reload reconstructs state from the public API or durable storage rather than in-memory-only fixtures.",
                 "Every async view has explicit loading, empty, recoverable error, and retry states; stale data is not presented as a successful response.",
                 "Logout clears client credentials and protects authenticated views after reload.",
+                "Runtime dates and seeded records derive from the requirement-configured clock/environment rather than generation-time constants.",
             ],
         },
         "coverage_rules": [
@@ -204,6 +257,8 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
             "For each API cover input validation, authorization, success response, error status, and persistence where applicable.",
             "When requirements mention seeded/example records, verify a fresh process bootstraps deterministic app-owned data without evaluator setup.",
             "When author-provided visual references exist, verify the corresponding observable layout/content states without relying on hidden selectors.",
+            "Execute prerequisite scenarios before dependents and treat a failed high-fan-out prerequisite as blocking because it can invalidate many downstream flows.",
+            "For each scenario assert the full GIVEN/WHEN/THEN transition, including canonical URL, visible result, API state, and reload behavior where applicable.",
             "Do not invent hidden acceptance-test details; derive behavior only from the supplied requirements and observable contracts.",
         ],
     }

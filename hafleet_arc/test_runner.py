@@ -10,6 +10,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .postflight import cleanup_workspace_port
+
 
 class TestExecutionError(RuntimeError):
     pass
@@ -107,6 +109,117 @@ def _browser_error(output: str) -> bool:
     ))
 
 
+def _safe_cwd(output_dir: Path, value: object) -> Path | None:
+    try:
+        candidate = (output_dir / str(value or ".")).resolve()
+        candidate.relative_to(output_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_dir() else None
+
+
+def _verification_commands(output_dir: Path, module_id: str) -> list[tuple[list[str], Path, str]]:
+    """Load project-owned commands without consulting any evaluator directory."""
+
+    path = output_dir / ".arc" / "hafleet" / "verification.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    raw = payload.get("commands") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return []
+    commands: list[tuple[list[str], Path, str]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        owner = str(item.get("module_id") or "ROOT")
+        if module_id != "ROOT" and owner not in {module_id, "ROOT", "*"}:
+            continue
+        argv = item.get("command")
+        cwd = _safe_cwd(output_dir, item.get("cwd"))
+        if not isinstance(argv, list) or not argv or cwd is None:
+            continue
+        normalized = [str(part) for part in argv if str(part)]
+        if not normalized:
+            continue
+        # The manifest belongs to the generated project. Refuse path traversal or
+        # obvious benchmark/evaluator references even if an agent writes a bad entry.
+        joined = " ".join(normalized).lower()
+        if "arc-bench/webapp" in joined or "benchmark/tests" in joined or "evaluator/tests" in joined:
+            continue
+        commands.append((normalized, cwd, f"verification command {index + 1}"))
+    return commands
+
+
+def _package_test_commands(output_dir: Path) -> list[tuple[list[str], Path, str]]:
+    commands: list[tuple[list[str], Path, str]] = []
+    for cwd in (output_dir, output_dir / "frontend", output_dir / "backend"):
+        package_path = cwd / "package.json"
+        try:
+            package = json.loads(package_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        scripts = package.get("scripts") if isinstance(package, dict) else None
+        if not isinstance(scripts, dict):
+            continue
+        script = "test:e2e" if str(scripts.get("test:e2e") or "").strip() else "test"
+        value = str(scripts.get(script) or "").strip()
+        if not value or "no test specified" in value.lower():
+            continue
+        commands.append((["npm", "run", script], cwd, f"{cwd.name or 'root'} npm run {script}"))
+    return commands
+
+
+def _fallback_test_commands(output_dir: Path) -> list[tuple[list[str], Path, str]]:
+    """Run conventional project tests when an older output has no manifest/scripts."""
+
+    commands: list[tuple[list[str], Path, str]] = []
+    backend = output_dir / "backend"
+    if backend.is_dir():
+        for path in sorted(backend.glob("test-*.mjs")) + sorted(backend.glob("test-*.js")):
+            commands.append((["node", path.name], backend, f"node {path.relative_to(output_dir)}"))
+    if not commands and (output_dir / "tests").is_dir():
+        commands.append((["python3", "-m", "unittest", "discover", "-s", "tests"], output_dir, "python unittest discover"))
+    return commands
+
+
+def discover_project_test_commands(output_dir: Path, module_id: str = "ROOT") -> list[tuple[list[str], Path, str]]:
+    """Return deterministic, workspace-confined verification commands."""
+
+    return (
+        _verification_commands(output_dir, module_id)
+        or _package_test_commands(output_dir)
+        or _fallback_test_commands(output_dir)
+    )
+
+
+def has_project_tests(output_dir: Path, module_id: str = "ROOT") -> bool:
+    return bool(discover_project_test_commands(output_dir, module_id))
+
+
+def _project_uses_playwright(output_dir: Path, commands: list[tuple[list[str], Path, str]]) -> bool:
+    for package_path in (output_dir / "package.json", output_dir / "frontend" / "package.json", output_dir / "backend" / "package.json"):
+        try:
+            if "playwright" in package_path.read_text(encoding="utf-8", errors="ignore").lower():
+                return True
+        except OSError:
+            pass
+    for command, cwd, _label in commands:
+        joined = " ".join(command).lower()
+        if "playwright" in joined:
+            return True
+        for argument in command[1:]:
+            path = (cwd / argument).resolve()
+            try:
+                path.relative_to(output_dir.resolve())
+                if path.is_file() and "playwright" in path.read_text(encoding="utf-8", errors="ignore")[:20_000].lower():
+                    return True
+            except (OSError, ValueError):
+                continue
+    return False
+
+
 def run_project_tests(
     output_dir: Path,
     *,
@@ -150,22 +263,29 @@ def run_project_tests(
             package = json.loads(package_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             package = {}
-        scripts = package.get("scripts") if isinstance(package, dict) else {}
-        command = ["npm", "run", "test:e2e"] if isinstance(scripts, dict) and scripts.get("test:e2e") else ["npm", "test"]
-        if command[-1] == "test:e2e":
-            try:
-                retries = max(int(os.environ.get("HAFLEET_TEST_RETRIES", "1")), 0)
-            except ValueError:
-                retries = 1
-            command.extend(["--", "--retries", str(retries)])
+        commands = discover_project_test_commands(output_dir, module_id)
+        if not commands:
+            return _write_result(result_dir, round_number, {
+                "verdict": "changes_requested",
+                "summary": "No executable project verification command was registered",
+                "findings": [{"id": f"T-{module_id}-MISSING", "severity": "major", "title": "Executable tests missing", "description": "Add project-owned tests and register their commands in .arc/hafleet/verification.json or package.json."}],
+                "checks": [], "tests": [], "artifacts": {},
+            })
         install_code, install_output = _run(["npm", "install", "--no-audit", "--no-fund"], cwd, env, timeout)
         checks = [{"name": "npm install", "status": "passed" if install_code == 0 else "failed", "output": install_output}]
         if install_code != 0:
             return _write_result(result_dir, round_number, {"verdict": "changes_requested", "summary": "Test dependency installation failed", "findings": [{"id": f"T-{module_id}-ENV", "severity": "blocker", "title": "Test dependencies unavailable", "description": install_output}], "checks": checks, "tests": [], "artifacts": {}})
-        playwright_enabled = "playwright" in json.dumps(package).lower()
+        backend_dir = output_dir / "backend"
+        if (backend_dir / "package.json").is_file():
+            backend_install_code, backend_install_output = _run(["npm", "install", "--no-audit", "--no-fund"], backend_dir, env, timeout)
+            checks.append({"name": "backend npm install", "status": "passed" if backend_install_code == 0 else "failed", "output": backend_install_output})
+            if backend_install_code != 0:
+                return _write_result(result_dir, round_number, {"verdict": "changes_requested", "summary": "Backend test dependency installation failed", "findings": [{"id": f"T-{module_id}-ENV", "severity": "blocker", "title": "Backend test dependencies unavailable", "description": backend_install_output}], "checks": checks, "tests": [], "artifacts": {}})
+        playwright_enabled = _project_uses_playwright(output_dir, commands)
+        playwright_cwd = next((command_cwd for _command, command_cwd, _label in commands if (command_cwd / "node_modules").exists()), cwd)
         install_browser = os.environ.get("HAFLEET_PLAYWRIGHT_INSTALL", "1").strip().lower() not in {"0", "false", "no"}
         if playwright_enabled and install_browser:
-            browser_code, browser_output = _run(["npx", "playwright", "install", "chromium"], cwd, env, timeout)
+            browser_code, browser_output = _run(["npx", "playwright", "install", "chromium"], playwright_cwd, env, timeout)
             checks.append({"name": "playwright install chromium", "status": "passed" if browser_code == 0 else "failed", "output": browser_output})
             if browser_code != 0:
                 return _write_result(result_dir, round_number, {"verdict": "changes_requested", "summary": "Chromium installation failed", "findings": [{"id": f"T-{module_id}-BROWSER", "severity": "blocker", "title": "Browser unavailable", "description": browser_output}], "checks": checks, "tests": [], "artifacts": {}})
@@ -173,18 +293,20 @@ def run_project_tests(
             # Explicitly disabling installation must never silently downgrade a
             # missing browser into a normal test failure.  A no-install version
             # probe is cheap and works with both npm and pnpm projects.
-            probe_code, probe_output = _run(["npx", "--no-install", "playwright", "--version"], cwd, env, min(timeout, 30))
+            probe_code, probe_output = _run(["npx", "--no-install", "playwright", "--version"], playwright_cwd, env, min(timeout, 30))
             checks.append({"name": "playwright browser availability", "status": "passed" if probe_code == 0 else "failed", "output": probe_output})
             if probe_code != 0:
                 return _write_result(result_dir, round_number, {"verdict": "changes_requested", "summary": "Playwright browser is unavailable", "findings": [{"id": f"T-{module_id}-BROWSER", "severity": "blocker", "title": "Browser unavailable", "description": probe_output or "HAFLEET_PLAYWRIGHT_INSTALL=0 and Playwright is not available."}], "checks": checks, "tests": [], "artifacts": {}})
     else:
-        cwd = output_dir
-        command = ["npm", "test"] if (cwd / "package.json").is_file() else ["python3", "-m", "unittest", "discover"]
+        commands = discover_project_test_commands(output_dir, module_id)
+        if not commands:
+            commands = [(["python3", "-m", "unittest", "discover"], output_dir, "python unittest discover")]
 
     process: subprocess.Popen[str] | None = None
     backend = output_dir / "backend"
     try:
         if task_type == "web" and (backend / "package.json").is_file():
+            cleanup_workspace_port(smoke_port, output_dir)
             process = subprocess.Popen(["npm", "start"], cwd=backend, env={**env, "PORT": str(smoke_port), "HOST": "127.0.0.1"}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, start_new_session=True)
             deadline = time.monotonic() + max(int(os.environ.get("HAFLEET_READY_TIMEOUT", "45")), 1)
             while time.monotonic() < deadline and not _ready(smoke_port):
@@ -205,13 +327,28 @@ def run_project_tests(
                     "findings": [{"id": f"T-{module_id}-RESET", "severity": "blocker", "title": "Test state reset failed", "description": reset_output}],
                     "checks": checks, "tests": [], "artifacts": {},
                 })
-        code, output = _run(command, cwd, env, timeout)
-        checks.append({"name": " ".join(command), "status": "passed" if code == 0 else "failed", "output": output})
-        failure_severity = "blocker" if code != 0 and _browser_error(output) else "major"
-        payload: dict[str, Any] = {"verdict": "pass" if code == 0 else "changes_requested", "summary": "Tests passed" if code == 0 else "Tests failed", "findings": [] if code == 0 else [{"id": f"T-{module_id}-RUN", "severity": failure_severity, "title": "Browser unavailable" if failure_severity == "blocker" else "Required tests failed", "description": output}], "checks": checks, "tests": [], "artifacts": {"report": str(round_dir), "playwright_report": str(round_dir / "playwright-report"), "screenshots": str(round_dir / "screenshots"), "traces": str(round_dir / "traces")}}
+        failures: list[str] = []
+        browser_failure = False
+        for command, command_cwd, label in commands:
+            if task_type == "web":
+                reset_status, reset_output = _reset_test_state(smoke_port)
+                checks.append({"name": f"{label}: POST /api/test/reset", "status": reset_status, "output": reset_output})
+                if reset_status == "failed":
+                    failures.append(f"{label}: {reset_output}")
+                    continue
+            code, output = _run(command, command_cwd, env, timeout)
+            checks.append({"name": label, "status": "passed" if code == 0 else "failed", "output": output})
+            if code != 0:
+                failures.append(f"{label} failed with exit code {code}:\n{output}")
+                browser_failure = browser_failure or _browser_error(output)
+        combined = "\n\n".join(failures)[-_artifact_limit():]
+        failure_severity = "blocker" if browser_failure else "major"
+        payload: dict[str, Any] = {"verdict": "changes_requested" if failures else "pass", "summary": "Tests failed" if failures else "Tests passed", "findings": [] if not failures else [{"id": f"T-{module_id}-RUN", "severity": failure_severity, "title": "Browser unavailable" if failure_severity == "blocker" else "Required tests failed", "description": combined}], "checks": checks, "tests": [], "artifacts": {"report": str(round_dir), "playwright_report": str(round_dir / "playwright-report"), "screenshots": str(round_dir / "screenshots"), "traces": str(round_dir / "traces")}}
         return _write_result(result_dir, round_number, payload)
     finally:
         _stop(process)
+        if task_type == "web":
+            cleanup_workspace_port(smoke_port, output_dir)
 
 
 def _write_result(result_dir: Path, round_number: int, payload: dict[str, Any]) -> dict[str, Any]:
