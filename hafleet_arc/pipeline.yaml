@@ -32,7 +32,12 @@ roles:
     paths with a safe client-side fallback), not hash-only or click-only access. Also
     document semantic accessibility (labels, names, button/link roles, keyboard use)
     and a consistent API error contract with meaningful non-2xx status codes and
-    machine-readable JSON payloads.
+    machine-readable JSON payloads. If the requirement describes ordinary seeded
+    records or example content, document a deterministic, app-owned seed/bootstrap
+    strategy so a fresh process exposes those records without evaluator-specific setup.
+    When the requirement supplies reference images, inspect those author-provided
+    assets and record the visual states they establish; do not substitute placeholder
+    screens when the asset defines observable product content.
 
   implementer: |
     You are the planning and implementation agent, also responsible for test authoring, in a finite HAFleet
@@ -61,7 +66,12 @@ roles:
     refresh or a new process restores persisted state and does not depend on a previous
     click or an in-memory singleton. Keep UI and API behavior equivalent so either
     public boundary can be used by a black-box client; never implement a static facade
-    that only mirrors requirement wording.
+    that only mirrors requirement wording. When the requirement tree describes seeded
+    users, records, or content, make the fresh application self-contained by adding a
+    deterministic bootstrap/fixture layer owned by the application; never depend on
+    hidden evaluator setup or hard-code only the first happy-path interaction. Use any
+    supplied reference images as visual acceptance guidance and implement their
+    observable states, while keeping behavior and data domain-neutral.
 
   reviewer: |
     You are the read-only reviewer in a finite HAFleet run. Audit the original requirement

@@ -166,6 +166,8 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
             "Trace every leaf requirement and scenario to an implementation behavior and executable test.",
             "For each user-visible flow cover success, invalid input, empty state, failure response, and refresh/persistence where applicable.",
             "For each API cover input validation, authorization, success response, error status, and persistence where applicable.",
+            "When requirements mention seeded/example records, verify a fresh process bootstraps deterministic app-owned data without evaluator setup.",
+            "When author-provided visual references exist, verify the corresponding observable layout/content states without relying on hidden selectors.",
             "Do not invent hidden acceptance-test details; derive behavior only from the supplied requirements and observable contracts.",
         ],
     }
