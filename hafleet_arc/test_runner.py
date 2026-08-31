@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 class TestExecutionError(RuntimeError):
@@ -60,6 +60,26 @@ def _ready(port: int) -> bool:
         return exc.code < 500
     except (URLError, TimeoutError, OSError):
         return False
+
+
+def _reset_test_state(port: int) -> tuple[str, str]:
+    """Reset an isolated app when it advertises the generic test contract.
+
+    A 404 is intentionally treated as legacy compatibility (the endpoint is
+    optional for older outputs); other failures are surfaced to the caller.
+    """
+    request = Request(f"http://127.0.0.1:{port}/api/test/reset", method="POST")
+    try:
+        with urlopen(request, timeout=5) as response:
+            if response.status >= 400:
+                return "failed", f"POST /api/test/reset returned HTTP {response.status}"
+            return "passed", response.read(16_384).decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        if exc.code == 404:
+            return "skipped", "POST /api/test/reset is not implemented (legacy project)"
+        return "failed", f"POST /api/test/reset returned HTTP {exc.code}"
+    except (URLError, TimeoutError, OSError) as exc:
+        return "failed", f"POST /api/test/reset failed: {exc}"
 
 
 def _stop(process: subprocess.Popen[str] | None) -> None:
@@ -176,6 +196,15 @@ def run_project_tests(
                 if process.poll() is not None:
                     output = "backend process exited before smoke endpoint became ready"
                 return _write_result(result_dir, round_number, {"verdict": "changes_requested", "summary": "Test server did not become ready", "findings": [{"id": f"T-{module_id}-SERVER", "severity": "blocker", "title": "Test server unavailable", "description": output}], "checks": checks, "tests": [], "artifacts": {}})
+            reset_status, reset_output = _reset_test_state(smoke_port)
+            checks.append({"name": "POST /api/test/reset", "status": reset_status, "output": reset_output})
+            if reset_status == "failed":
+                return _write_result(result_dir, round_number, {
+                    "verdict": "changes_requested",
+                    "summary": "Test state reset failed",
+                    "findings": [{"id": f"T-{module_id}-RESET", "severity": "blocker", "title": "Test state reset failed", "description": reset_output}],
+                    "checks": checks, "tests": [], "artifacts": {},
+                })
         code, output = _run(command, cwd, env, timeout)
         checks.append({"name": " ".join(command), "status": "passed" if code == 0 else "failed", "output": output})
         failure_severity = "blocker" if code != 0 and _browser_error(output) else "major"
