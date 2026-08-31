@@ -1196,11 +1196,24 @@ structured summary of changed_files, resolved_findings, remaining_findings, and 
             # only observable once all modules have landed.  This pass is driven by
             # the supplied requirements (never evaluator tests) and is opt-out for
             # legacy/expensive runs.
-            # Keep legacy runs lightweight unless explicitly enabled; production
-            # optimization runs set HAFLEET_FINAL_INTEGRATION=1.
-            integration_enabled = os.environ.get("HAFLEET_FINAL_INTEGRATION", "0").strip().lower() not in {
+            # Enable by default for substantive requirement trees. Tiny adapter
+            # fixtures (and legacy smoke runs) skip the extra turn automatically;
+            # HAFLEET_FINAL_INTEGRATION=0 remains an explicit opt-out.
+            leaf_count = 0
+            def count_leaves(node: object) -> None:
+                nonlocal leaf_count
+                if not isinstance(node, dict):
+                    return
+                children = node.get("children") or node.get("requirements") or []
+                if isinstance(children, list) and children:
+                    for child in children:
+                        count_leaves(child)
+                else:
+                    leaf_count += 1
+            count_leaves(self.requirement_tree or {})
+            integration_enabled = os.environ.get("HAFLEET_FINAL_INTEGRATION", "1").strip().lower() not in {
                 "0", "false", "no",
-            } and final_review_enabled
+            } and final_review_enabled and leaf_count >= 4
             if integration_enabled and modules:
                 log("[hafleet] Final integration implementation pass started", flush=True)
                 integration_prompt = textwrap.dedent(
