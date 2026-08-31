@@ -790,6 +790,7 @@ source text assertions. Re-run the relevant test and include its command and res
             first_round = repair_round + 1
         for round_number in range(first_round, max_rounds + 1):
             self._check_pause(module, "final-review" if final_review else "review")
+            latest_test_result: dict[str, Any] | None = None
             tester_enabled = self._tester_enabled(module, workspace_dir)
             project_test_setting = os.environ.get("HAFLEET_PROJECT_TESTS", "1").strip().lower()
             project_tests_enabled = (
@@ -804,6 +805,7 @@ source text assertions. Re-run the relevant test and include its command and res
                     round_number=round_number,
                     parent_id=parent_id,
                 )
+                latest_test_result = test_result
                 if not test_passes(test_result):
                     current_hash = test_hash(test_result)
                     current_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
@@ -845,6 +847,7 @@ invalid until it passes.
                     mode=(tester_node.mode if tester_node and tester_node.mode else ("integration" if final_review else "module")),
                     parent_id=parent_id,
                 )
+                latest_test_result = test_result
                 if not test_passes(test_result):
                     current_hash = test_hash(test_result)
                     current_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
@@ -900,6 +903,16 @@ and source-string-only checks, and verify that the reported results are consiste
 the test files. Return ONLY a JSON review object followed by a short summary.
 Use verdict=pass only when all blocker/major findings are resolved and required checks pass.
 Do not edit project files or Git state.
+
+The Orchestrator executed this structured test result in the current round immediately
+before review. It is authoritative for current pass/fail status:
+```json
+{json.dumps(latest_test_result or {"verdict": "not_run", "summary": "No project test command was available in this round."}, ensure_ascii=False, indent=2)}
+```
+Older files under .arc/hafleet/test-results are historical audit artifacts. You may use
+them to understand prior failures, but must not report an older round as the latest
+result or contradict the current result solely because a stale higher-numbered file
+exists from an earlier resumed attempt.
 """
             result = self._run_agent(
                 reviewer_role,

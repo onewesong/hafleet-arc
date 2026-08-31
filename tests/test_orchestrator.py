@@ -146,6 +146,43 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(driver.calls, ["implementer", "reviewer"])
             self.assertTrue(any(item["kind"] == "test.failed" for item in orchestrator.bus.replay()))
 
+    def test_reviewer_receives_current_orchestrator_test_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class Driver:
+                def __init__(self) -> None:
+                    self.prompts: list[tuple[str, str]] = []
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.prompts.append((role, prompt))
+                    return SimpleNamespace(final_response='{"verdict":"pass","summary":"ok","findings":[],"checks":[]}')
+
+            driver = Driver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            passed = {
+                "verdict": "pass",
+                "summary": "current deterministic suite passed",
+                "findings": [],
+                "checks": [{"name": "focused suite", "status": "passed", "output": "ok"}],
+            }
+            with mock.patch("hafleet_arc.orchestrator.has_project_tests", return_value=True), mock.patch(
+                "hafleet_arc.orchestrator.run_project_tests", return_value=passed
+            ):
+                orchestrator._review_loop(self._module(1, "REQ-1"), "Review REQ-1")
+
+            review_prompt = next(prompt for role, prompt in driver.prompts if role == "reviewer")
+            self.assertIn("current deterministic suite passed", review_prompt)
+            self.assertIn("authoritative for current pass/fail status", review_prompt)
+            self.assertIn("historical audit artifacts", review_prompt)
+
     def test_registered_project_tests_restore_product_files_but_keep_arc_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
