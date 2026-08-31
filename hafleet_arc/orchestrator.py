@@ -1329,7 +1329,16 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 else:
                     resume_loop = False
 
-            if resume_loop and resume_feedback:
+            retry_deferred = module.node_id in deferred_modules
+            if retry_deferred:
+                # The implementation already exists and downstream work may depend
+                # on it. Resume at deterministic verification/review instead of
+                # spending another full agent turn re-implementing the requirement.
+                self._check_pause(module, "review")
+                self.checkpoint.mark_module_started(module.node_id, "review")
+                log(f"[hafleet]   retrying deferred quality: {module.node_id}", flush=True)
+                self._review_loop(module, base_prompt)
+            elif resume_loop and resume_feedback:
                 self._check_pause(module, "repair")
                 log(f"[hafleet]   resuming repair round {resume_round}: {module.node_id}", flush=True)
                 self._review_loop(

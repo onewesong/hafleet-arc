@@ -372,7 +372,8 @@ class OrchestratorTests(unittest.TestCase):
                 orchestrator.run([self._module(1, "REQ-1")])
 
             roles = [role for role, _ in driver.calls]
-            self.assertIn("implementer", roles)
+            self.assertNotIn("implementer", roles)
+            self.assertIn("reviewer", roles)
             self.assertEqual(checkpoint.read()["completed"], ["REQ-1"])
             self.assertEqual(checkpoint.read()["deferred_modules"], [])
 
@@ -409,7 +410,8 @@ class OrchestratorTests(unittest.TestCase):
             with mock.patch.dict("os.environ", {"HAFLEET_POSTFLIGHT": "0"}, clear=False):
                 orchestrator.run([self._module(1, "REQ-1")])
 
-            self.assertIn("implementer", [role for role, _ in driver.calls])
+            self.assertNotIn("implementer", [role for role, _ in driver.calls])
+            self.assertIn("reviewer", [role for role, _ in driver.calls])
             self.assertEqual(checkpoint.read()["completed"], ["REQ-1"])
             self.assertEqual(checkpoint.read()["deferred_modules"], [])
 
