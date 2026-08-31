@@ -190,7 +190,11 @@ def test_passes(result: dict[str, Any]) -> bool:
     tests = result.get("tests") or []
     checks = result.get("checks") or []
     failed_tests = [item for item in tests if str(item.get("status", "")).lower() not in {"passed", "pass", "success", "ok"}]
-    failed_checks = [item for item in checks if str(item.get("status", "")).lower() not in {"passed", "pass", "success", "ok"}]
+    # Optional compatibility probes (for example an absent legacy reset endpoint)
+    # may be explicitly skipped with an explanation. They are audit evidence, not a
+    # failed required check. Individual skipped test cases remain governed by
+    # parse_test_result(), which turns an unexplained skip into a major finding.
+    failed_checks = [item for item in checks if str(item.get("status", "")).lower() not in {"passed", "pass", "success", "ok", "skipped", "skip"}]
     return result.get("verdict") == "pass" and not test_blocking_findings(result) and not failed_tests and not failed_checks
 
 

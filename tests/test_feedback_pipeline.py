@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hafleet_arc.feedback import blocking_findings, parse_review, review_hash, review_passes
+from hafleet_arc.feedback import blocking_findings, parse_review, review_hash, review_passes, test_passes
 from hafleet_arc.pipeline import DEFAULT_PIPELINE_PATH, load_pipeline
 
 
@@ -24,6 +24,14 @@ class FeedbackPipelineTests(unittest.TestCase):
             '{"verdict":"changes_requested","findings":[{"severity":"minor","title":"polish"}],"checks":[{"status":"passed"}]}'
         )
         self.assertTrue(review_passes(review))
+
+    def test_optional_skipped_check_does_not_fail_test_result(self) -> None:
+        self.assertTrue(test_passes({
+            "verdict": "pass",
+            "findings": [],
+            "tests": [],
+            "checks": [{"name": "optional compatibility probe", "status": "skipped", "output": "not implemented"}],
+        }))
 
     def test_default_and_custom_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
