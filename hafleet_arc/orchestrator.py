@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .checkpoint import CheckpointStore
+from .capabilities import build_capability_model
 from .feedback import (
     blocking_findings,
     parse_review,
@@ -800,6 +801,10 @@ structured summary of changed_files, resolved_findings, remaining_findings, and 
             the full requirement tree yet. Do not put browser-loaded frontend modules
             under a top-level frontend/src/api path because the backend reserves
             /api/* for JSON endpoints; use frontend/src/client or frontend/src/services.
+            Define a testable state/data contract for each domain entity, including
+            validation, error and empty states, authorization boundaries, persistence,
+            and refresh semantics. Keep these contracts domain-neutral so later modules
+            and external evaluators can exercise behavior through public UI/API boundaries.
             """
         ).strip()
 
@@ -842,6 +847,21 @@ structured summary of changed_files, resolved_findings, remaining_findings, and 
             ```json
             {json.dumps(module.subtree, ensure_ascii=False, indent=2)}
             ```
+
+            Coordinator capability model (derived only from the requirement tree; do
+            not look for or infer hidden benchmark tests):
+            ```json
+            {json.dumps(build_capability_model(module.subtree), ensure_ascii=False, indent=2)}
+            ```
+
+            Treat the capability model as a traceability checklist, not as permission
+            to broaden scope. Before finishing, ensure every listed requirement and
+            scenario has an observable implementation path and a meaningful test.
+            Prefer real state transitions and persisted data over hard-coded fixtures.
+            For each flow consider success, validation/error, empty/loading states,
+            authorization, navigation, and refresh persistence when applicable. Do not
+            access, search for, or mention external/hidden acceptance-test source files;
+            the supplied requirement tree is the sole product specification.
             """
         ).strip()
 
