@@ -1226,6 +1226,21 @@ weakening the assertion. Re-run the focused tests and report the command/result.
         state = self.checkpoint.read()
         completed_ids = list(state["completed"])
         completed_set = set(completed_ids)
+        deferred_module = str(state.get("current_node_id") or "")
+        if state.get("quality_deferred") and deferred_module and deferred_module in completed_set:
+            # Migrate checkpoints created before deferred quality had its own durable
+            # state. An unattended run may advance, but resume must revisit failures.
+            self.checkpoint.mark_module_deferred(
+                deferred_module,
+                int(state.get("last_completed_index", 0) or 0),
+            )
+            completed_ids = [item for item in completed_ids if item != deferred_module]
+            completed_set.discard(deferred_module)
+            state = self.checkpoint.read()
+            log(
+                f"[hafleet] Reopening deferred quality module {deferred_module} on resume",
+                flush=True,
+            )
         self.plan_dir.mkdir(parents=True, exist_ok=True)
         log(
             f"[hafleet] orchestrator ready: {len(modules)} module(s), "
@@ -1403,7 +1418,10 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     f"[hafleet]   warning: {module.node_id} checkpoint carries deferred quality review",
                     flush=True,
                 )
-            self.checkpoint.mark_module_completed(module.node_id, module.index)
+            if quality_deferred:
+                self.checkpoint.mark_module_deferred(module.node_id, module.index)
+            else:
+                self.checkpoint.mark_module_completed(module.node_id, module.index)
             self.checkpoint.update_pipeline(module.node_id, message_cursor=self.bus.last_sequence)
             completed_ids.append(module.node_id)
             completed_set.add(module.node_id)

@@ -342,6 +342,40 @@ class OrchestratorTests(unittest.TestCase):
                 ["architect", "implementer", "reviewer", "reviewer"],
             )
 
+    def test_resume_reopens_legacy_completed_module_with_deferred_quality(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            checkpoint.mark_architecture_completed()
+            architecture = root / ".arc" / "hafleet" / "architecture.md"
+            architecture.parent.mkdir(parents=True, exist_ok=True)
+            architecture.write_text("# Existing architecture\n", encoding="utf-8")
+            checkpoint.mark_module_completed("REQ-1", 1)
+            checkpoint.update_pipeline(
+                "REQ-1",
+                node="checkpoint",
+                loop_status="deferred",
+                quality_deferred=True,
+                quality_exhaustion_reason="project verification exceeded budget",
+            )
+            driver = FakeDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+
+            with mock.patch.dict("os.environ", {"HAFLEET_POSTFLIGHT": "0"}, clear=False):
+                orchestrator.run([self._module(1, "REQ-1")])
+
+            roles = [role for role, _ in driver.calls]
+            self.assertIn("implementer", roles)
+            self.assertEqual(checkpoint.read()["completed"], ["REQ-1"])
+            self.assertEqual(checkpoint.read()["deferred_modules"], [])
+
     def test_completed_architecture_is_skipped_on_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

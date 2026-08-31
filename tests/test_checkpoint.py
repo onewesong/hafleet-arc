@@ -40,6 +40,19 @@ class CheckpointStoreTests(unittest.TestCase):
             store.mark_architecture_completed()
             self.assertTrue(store.read()["architecture_completed"])
 
+    def test_deferred_module_is_not_completed_and_can_later_be_approved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CheckpointStore(Path(temporary) / "checkpoint.json")
+            store.mark_module_completed("REQ-1", 1)
+            deferred = store.mark_module_deferred("REQ-1", 1)
+            self.assertEqual(deferred["completed"], [])
+            self.assertEqual(deferred["deferred_modules"], ["REQ-1"])
+            self.assertEqual(deferred["current_node_id"], "REQ-1")
+
+            approved = store.mark_module_completed("REQ-1", 1)
+            self.assertEqual(approved["completed"], ["REQ-1"])
+            self.assertEqual(approved["deferred_modules"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,7 @@ class CheckpointStore:
             "conflicted_modules": [],
             "last_completed_index": 0,
             "completed": [],
+            "deferred_modules": [],
             "paused": False,
             "final_review_completed": False,
             "current_pipeline_node": None,
@@ -57,6 +58,8 @@ class CheckpointStore:
             return default
         completed = payload.get("completed")
         payload["completed"] = [str(item) for item in completed] if isinstance(completed, list) else []
+        deferred = payload.get("deferred_modules")
+        payload["deferred_modules"] = [str(item) for item in deferred] if isinstance(deferred, list) else []
         payload["last_completed_index"] = max(int(payload.get("last_completed_index", 0) or 0), 0)
         payload.setdefault("version", 1)
         payload.setdefault("architecture_completed", False)
@@ -186,13 +189,36 @@ class CheckpointStore:
         completed = list(payload["completed"])
         if module_id not in completed:
             completed.append(module_id)
+        deferred = [item for item in payload.get("deferred_modules", []) if item != module_id]
         payload.update(
             {
                 "completed": completed,
+                "deferred_modules": deferred,
                 "last_completed_index": max(int(payload["last_completed_index"]), index),
                 "paused": False,
                 "current_node_id": None,
                 "current_phase": None,
+            }
+        )
+        self.write(payload)
+        return payload
+
+    def mark_module_deferred(self, module_id: str, index: int) -> dict[str, Any]:
+        """Advance unattended work without permanently approving failed quality."""
+
+        payload = self.read()
+        completed = [item for item in payload["completed"] if item != module_id]
+        deferred = list(payload.get("deferred_modules", []))
+        if module_id not in deferred:
+            deferred.append(module_id)
+        payload.update(
+            {
+                "completed": completed,
+                "deferred_modules": deferred,
+                "last_completed_index": max(int(payload["last_completed_index"]), index),
+                "paused": False,
+                "current_node_id": module_id,
+                "current_phase": "checkpoint",
             }
         )
         self.write(payload)
