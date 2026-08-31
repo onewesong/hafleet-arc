@@ -318,11 +318,24 @@ ARC-Bench web delivery contract:
                 continue
         return delays or list(DEFAULT_RETRY_DELAY_VALUES)
 
+    @staticmethod
+    def _progress_retry_prompt(role: str) -> str:
+        return f"""
+Continue the interrupted {role} task from the current workspace. The previous turn
+timed out after making persistent file changes, so do not restart planning or replace
+working code. Inspect the current git diff, the existing .arc/hafleet plan and
+architecture, and the registered verification manifest. Finish only the incomplete
+requirement-derived behavior and tests, run the focused registered checks, repair any
+failures, and return the required structured completion summary. Preserve all valid
+work already present and do not access external or hidden evaluator tests.
+""".strip()
+
     def run(self, role: str, prompt: str, workspace_dir: Path | None = None) -> Any:
         attempts = _positive_int_env("HAFLEET_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)
         timeout_s = _positive_int_env("HAFLEET_TURN_TIMEOUT", 1200)
         delays = self._retry_delays()
         workspace = (workspace_dir or self.output_dir).resolve()
+        attempt_prompt = prompt
         for attempt in range(1, attempts + 1):
             before = _workspace_fingerprint(workspace)
             log(
@@ -331,7 +344,7 @@ ARC-Bench web delivery contract:
                 flush=True,
             )
             try:
-                result = self._run_once(role, prompt, timeout_s, workspace)
+                result = self._run_once(role, attempt_prompt, timeout_s, workspace)
                 error = getattr(result, "error", None)
                 if error is not None:
                     raise RuntimeError(f"{role} agent failed: {error}")
@@ -345,6 +358,14 @@ ARC-Bench web delivery contract:
                 log(f"[hafleet] {role} turn failed: {exc}", flush=True)
                 if attempt >= attempts or not self._transient(exc):
                     raise
+                made_progress = before != _workspace_fingerprint(workspace)
+                if isinstance(exc, TurnTimeoutError) and made_progress and not self._read_only_role(role):
+                    attempt_prompt = self._progress_retry_prompt(role)
+                    log(
+                        f"[hafleet] {role} timeout preserved workspace progress; "
+                        "next attempt will continue from the existing diff",
+                        flush=True,
+                    )
                 self._threads.pop((role, str(workspace)), None)
                 delay = delays[min(attempt - 1, len(delays) - 1)]
                 log(

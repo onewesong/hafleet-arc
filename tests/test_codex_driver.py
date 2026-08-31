@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from hafleet_arc.codex_driver import CodexFleet
+from hafleet_arc.codex_driver import CodexFleet, TurnTimeoutError
 
 
 class FakeThread:
@@ -186,6 +186,31 @@ class CodexFleetRetryTests(unittest.TestCase):
                 fleet.run("reviewer", "review")
 
             self.assertEqual(codex.starts, 2)
+
+    def test_timeout_with_workspace_progress_uses_continuation_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fleet = CodexFleet(root)
+            prompts: list[str] = []
+
+            def run_once(role, prompt, timeout_s, workspace_dir=None):
+                prompts.append(prompt)
+                if len(prompts) == 1:
+                    (root / "partial.js").write_text("partial progress\n", encoding="utf-8")
+                    raise TurnTimeoutError("implementer turn timed out after 2s")
+                return SimpleNamespace(error=None, final_response="done")
+
+            with mock.patch.object(fleet, "_run_once", side_effect=run_once), mock.patch.dict(
+                "os.environ",
+                {"HAFLEET_MAX_ATTEMPTS": "2", "HAFLEET_RETRY_DELAYS": "0", "HAFLEET_TURN_TIMEOUT": "2"},
+                clear=False,
+            ):
+                result = fleet.run("implementer", "very large original requirement prompt")
+
+            self.assertEqual(result.final_response, "done")
+            self.assertEqual(prompts[0], "very large original requirement prompt")
+            self.assertIn("Continue the interrupted implementer task", prompts[1])
+            self.assertNotIn("very large original requirement prompt", prompts[1])
 
     def test_reviewer_uses_read_only_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
