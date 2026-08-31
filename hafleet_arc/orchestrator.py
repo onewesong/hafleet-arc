@@ -927,6 +927,21 @@ structured summary of changed_files, resolved_findings, remaining_findings, and 
         branch: str | None = None,
     ) -> str:
         completed = ", ".join(completed_ids) if completed_ids else "none"
+        # A compact index of the whole requirement tree prevents scoped module
+        # turns from inventing incompatible routes/entities while keeping the
+        # prompt bounded (the full subtree remains the authoritative detail).
+        global_index: list[str] = []
+        def collect_index(node: object) -> None:
+            if len(global_index) >= 120 or not isinstance(node, dict):
+                return
+            node_id = str(node.get("id") or node.get("req_id") or node.get("requirement_id") or "").strip()
+            title = str(node.get("name") or node.get("title") or "").strip()
+            if node_id:
+                global_index.append(f"{node_id}: {title or node_id}")
+            for child in (node.get("children") or node.get("requirements") or []):
+                collect_index(child)
+        collect_index(self.requirement_tree or {})
+        global_index_text = "\n".join(global_index) or "(unavailable)"
         workspace_note = ""
         if workspace_dir is not None:
             workspace_note = textwrap.dedent(
@@ -943,6 +958,9 @@ structured summary of changed_files, resolved_findings, remaining_findings, and 
             Module: {module.index}/{module.total} - {module.node_id} - {module.name}
             Requirement source directory: {self.requirements_dir}
             Previously completed ROOT modules: {completed}
+            Whole-project requirement index (IDs/titles only; do not implement future
+            modules by guessing details):
+            {global_index_text}
             Coordinator plan path: {plan_path}
             Global architecture document: {self.architecture_path}
 
