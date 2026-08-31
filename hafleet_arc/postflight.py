@@ -196,6 +196,25 @@ def _http_ready(port: int) -> bool:
         return False
 
 
+def _check_health_contract(port: int) -> list[str]:
+    """Validate the small, framework-independent readiness API contract."""
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/api/health", timeout=3) as response:
+            content_type = response.headers.get("content-type", "")
+            raw = response.read(16_384).decode("utf-8", errors="replace")
+            payload = json.loads(raw)
+    except (HTTPError, URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return [f"/api/health is not a valid JSON readiness response: {exc}"]
+    errors: list[str] = []
+    if response.status >= 400:
+        errors.append(f"/api/health returned HTTP {response.status}")
+    if "json" not in content_type.lower():
+        errors.append("/api/health must return an application/json content type")
+    if not isinstance(payload, dict) or str(payload.get("status", "")).lower() not in {"ok", "ready", "healthy"}:
+        errors.append("/api/health JSON must contain status=ok, ready, or healthy")
+    return errors
+
+
 _IMPORT_RE = re.compile(r"(?:from|import)\s*[\(]?\s*[\"']([^\"']+)")
 
 
@@ -277,6 +296,11 @@ def rehearse_web_app(output_dir: Path, smoke_port: int) -> None:
                         f"backend npm start exited early with code {process.returncode}:\n{output}"
                     )
                 if _http_ready(smoke_port):
+                    health_errors = _check_health_contract(smoke_port)
+                    if health_errors:
+                        raise PostflightError(
+                            "runtime health contract failed:\n- " + "\n- ".join(health_errors)
+                        )
                     module_errors = _check_frontend_module_graph(smoke_port)
                     if module_errors:
                         raise PostflightError(

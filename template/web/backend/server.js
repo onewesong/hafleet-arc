@@ -18,8 +18,16 @@ const contentTypes = {
 };
 
 function sendJson(response, status, payload) {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+  });
   response.end(JSON.stringify(payload));
+}
+
+function resetTestState() {
+  // Keep test reset deterministic and limited to the generated app's own store.
+  writeFileSync(databaseFile, JSON.stringify({ users: [], orders: [], passengers: [] }, null, 2));
 }
 
 function staticPath(urlPath) {
@@ -34,7 +42,22 @@ function staticPath(urlPath) {
 const server = createServer((request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
   if (url.pathname === "/api/health") {
-    sendJson(response, 200, { status: "ok" });
+    sendJson(response, 200, { status: "ok", service: "arcbench-app", test_mode: process.env.ARC_TEST_MODE === "1" });
+    return;
+  }
+  // ARC-Bench uses this endpoint to reset isolated E2E state between tests.
+  // Keep it disabled unless the runner explicitly enables test mode.
+  if (request.method === "POST" && url.pathname === "/api/test/reset") {
+    if (process.env.ARC_TEST_MODE !== "1") {
+      sendJson(response, 404, { error: "Not found" });
+      return;
+    }
+    try {
+      resetTestState();
+      sendJson(response, 200, { status: "ok", reset: true, message: "Test database reset." });
+    } catch {
+      sendJson(response, 500, { error: "Test database reset failed." });
+    }
     return;
   }
   // ARC-Bench uses this endpoint to reset isolated E2E state between tests.
