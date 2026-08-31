@@ -1226,21 +1226,39 @@ weakening the assertion. Re-run the focused tests and report the command/result.
         state = self.checkpoint.read()
         completed_ids = list(state["completed"])
         completed_set = set(completed_ids)
-        deferred_module = str(state.get("current_node_id") or "")
-        if state.get("quality_deferred") and deferred_module and deferred_module in completed_set:
-            # Migrate checkpoints created before deferred quality had its own durable
-            # state. An unattended run may advance, but resume must revisit failures.
+        deferred_modules = set(str(item) for item in state.get("deferred_modules", []))
+        current_module = str(state.get("current_node_id") or "")
+        if state.get("quality_deferred") and current_module:
+            deferred_modules.add(current_module)
+
+        # Legacy checkpoints had one global quality flag. Starting the next module
+        # cleared it, so reconstruct each module's last durable checkpoint verdict
+        # from the append-only message log. Later successful checkpoints override an
+        # earlier deferred one.
+        message_quality: dict[str, bool] = {}
+        for message in self.bus.replay():
+            if message.get("kind") != "checkpoint.created":
+                continue
+            module_id = str(message.get("module_id") or "")
+            payload = message.get("payload")
+            if module_id and isinstance(payload, dict) and "quality_deferred" in payload:
+                message_quality[module_id] = bool(payload.get("quality_deferred"))
+        deferred_modules.update(module_id for module_id, deferred in message_quality.items() if deferred)
+        deferred_modules.difference_update(module_id for module_id, deferred in message_quality.items() if not deferred)
+
+        module_indices = {module.node_id: module.index for module in modules}
+        for deferred_module in sorted(deferred_modules & completed_set):
             self.checkpoint.mark_module_deferred(
                 deferred_module,
-                int(state.get("last_completed_index", 0) or 0),
+                module_indices.get(deferred_module, int(state.get("last_completed_index", 0) or 0)),
             )
             completed_ids = [item for item in completed_ids if item != deferred_module]
             completed_set.discard(deferred_module)
-            state = self.checkpoint.read()
             log(
                 f"[hafleet] Reopening deferred quality module {deferred_module} on resume",
                 flush=True,
             )
+        state = self.checkpoint.read()
         self.plan_dir.mkdir(parents=True, exist_ok=True)
         log(
             f"[hafleet] orchestrator ready: {len(modules)} module(s), "

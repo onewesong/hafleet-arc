@@ -376,6 +376,43 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(checkpoint.read()["completed"], ["REQ-1"])
             self.assertEqual(checkpoint.read()["deferred_modules"], [])
 
+    def test_resume_recovers_deferred_module_from_message_log_after_flag_was_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            checkpoint.mark_architecture_completed()
+            architecture = root / ".arc" / "hafleet" / "architecture.md"
+            architecture.parent.mkdir(parents=True, exist_ok=True)
+            architecture.write_text("# Existing architecture\n", encoding="utf-8")
+            checkpoint.mark_module_completed("REQ-1", 1)
+            driver = FakeDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            orchestrator._message(
+                "checkpoint.created",
+                "orchestrator",
+                module=self._module(1, "REQ-1"),
+                phase="checkpoint",
+                payload={"committed": True, "quality_deferred": True},
+            )
+            # Starting a later module models the old behavior that erased the one
+            # global quality_deferred flag before the process was interrupted.
+            checkpoint.mark_module_started("REQ-2", "implement")
+            self.assertFalse(checkpoint.read()["quality_deferred"])
+
+            with mock.patch.dict("os.environ", {"HAFLEET_POSTFLIGHT": "0"}, clear=False):
+                orchestrator.run([self._module(1, "REQ-1")])
+
+            self.assertIn("implementer", [role for role, _ in driver.calls])
+            self.assertEqual(checkpoint.read()["completed"], ["REQ-1"])
+            self.assertEqual(checkpoint.read()["deferred_modules"], [])
+
     def test_completed_architecture_is_skipped_on_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
