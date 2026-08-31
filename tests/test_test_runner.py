@@ -46,6 +46,26 @@ class ProjectTestDiscoveryTests(unittest.TestCase):
             )
             self.assertEqual(discover_project_test_commands(root, "REQ-1")[0][3], "self")
 
+    def test_infers_self_hosted_test_referenced_by_package_script(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            frontend = root / "frontend"
+            (frontend / "test").mkdir(parents=True)
+            (frontend / "package.json").write_text(
+                json.dumps({"scripts": {"test:home": "node --test test/home.test.js"}}),
+                encoding="utf-8",
+            )
+            (frontend / "test" / "home.test.js").write_text(
+                'import { spawn } from "node:child_process";\nspawn("node", ["../backend/server.js"], { env: { PORT: "3100" } });\n',
+                encoding="utf-8",
+            )
+            (root / ".arc" / "hafleet").mkdir(parents=True)
+            (root / ".arc" / "hafleet" / "verification.json").write_text(
+                json.dumps({"commands": [{"module_id": "REQ-1", "cwd": "frontend", "command": ["npm", "run", "test:home"]}]}),
+                encoding="utf-8",
+            )
+            self.assertEqual(discover_project_test_commands(root, "REQ-1")[0][3], "self")
+
     def test_self_hosted_command_owns_smoke_port(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -125,16 +125,25 @@ def _infer_server_mode(command: list[str], cwd: Path, output_dir: Path) -> str:
     joined = " ".join(command).lower()
     if any(marker in joined for marker in (" build", "compile", "lint", "typecheck")):
         return "none"
-    source = ""
-    for argument in command[1:]:
+    referenced_arguments = list(command[1:])
+    if len(command) >= 3 and command[0] in {"npm", "pnpm", "yarn"} and command[1] == "run":
         try:
-            path = (cwd / argument).resolve()
+            package = json.loads((cwd / "package.json").read_text(encoding="utf-8"))
+            script = str((package.get("scripts") or {}).get(command[2]) or "") if isinstance(package, dict) else ""
+        except (OSError, json.JSONDecodeError):
+            script = ""
+        joined = f"{joined} {script.lower()}"
+        referenced_arguments.extend(script.replace("&&", " ").replace(";", " ").split())
+    source = ""
+    for argument in referenced_arguments:
+        try:
+            path = (cwd / argument.strip("'\" ,")).resolve()
             path.relative_to(output_dir.resolve())
             if path.is_file():
                 source += path.read_text(encoding="utf-8", errors="ignore")[:100_000].lower()
         except (OSError, ValueError):
             continue
-    if cwd.name == "backend" and (
+    if (
         ("spawn(" in source or "execfile(" in source or "npm start" in source)
         and ("server.js" in source or "port" in source)
     ):
