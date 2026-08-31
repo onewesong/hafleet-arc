@@ -70,7 +70,14 @@ def review_passes(review: dict[str, Any]) -> bool:
         item for item in checks
         if str(item.get("status", "")).strip().lower() not in passed_statuses
     ]
-    return review.get("verdict") == "pass" and not blocking_findings(review) and not failed_checks
+    # Only blocker/major findings are gate conditions. Reviewers sometimes retain
+    # ``changes_requested`` while reporting only minor/info observations; treating
+    # that wording as a hard failure wastes unattended repair rounds and contradicts
+    # the pipeline contract. Once all required checks pass and no blocking finding
+    # remains, the review is safe to advance while preserving the non-blocking notes
+    # in the audit log and Dashboard.
+    verdict = str(review.get("verdict") or "").strip().lower()
+    return verdict in {"pass", "changes_requested"} and not blocking_findings(review) and not failed_checks
 
 
 def review_hash(review: dict[str, Any]) -> str:

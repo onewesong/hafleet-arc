@@ -19,6 +19,12 @@ class FeedbackPipelineTests(unittest.TestCase):
         self.assertTrue(review_passes(parse_review('{"verdict":"pass","findings":[],"checks":[{"status":"passed"}]}')))
         self.assertFalse(review_passes(parse_review('{"verdict":"pass","findings":[],"checks":[{"status":"failed"}]}')))
 
+    def test_non_blocking_findings_do_not_block_review(self) -> None:
+        review = parse_review(
+            '{"verdict":"changes_requested","findings":[{"severity":"minor","title":"polish"}],"checks":[{"status":"passed"}]}'
+        )
+        self.assertTrue(review_passes(review))
+
     def test_default_and_custom_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
