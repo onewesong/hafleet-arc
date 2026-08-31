@@ -829,8 +829,12 @@ structured summary of changed_files, resolved_findings, remaining_findings, and 
             /api/* for JSON endpoints; use frontend/src/client or frontend/src/services.
             Define a testable state/data contract for each domain entity, including
             validation, error and empty states, authorization boundaries, persistence,
-            and refresh semantics. Keep these contracts domain-neutral so later modules
-            and external evaluators can exercise behavior through public UI/API boundaries.
+            and refresh semantics. For browser tasks, include a route table with stable
+            non-hash paths, direct-navigation/deep-link fallback behavior, and a
+            semantic form/API contract (labels, accessible names, keyboard behavior,
+            status codes, JSON error envelope). Keep these contracts domain-neutral so
+            later modules and external evaluators can exercise behavior through public
+            UI/API boundaries without relying on implementation-specific selectors.
             """
         ).strip()
 
