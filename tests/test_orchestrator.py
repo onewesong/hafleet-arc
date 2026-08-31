@@ -115,6 +115,47 @@ class OrchestratorTests(unittest.TestCase):
             self.assertTrue(any(item["kind"] == "review.feedback" for item in messages))
             self.assertTrue(any(item["kind"] == "pipeline.state" and item["payload"].get("status") == "approved" for item in messages))
 
+    def test_requirement_modules_get_implementer_self_check(self) -> None:
+        """Nested requirement modules receive a warm-context completeness pass."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class SelfCheckDriver:
+                def __init__(self) -> None:
+                    self.calls: list[tuple[str, str]] = []
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append((role, prompt))
+                    if role == "architect":
+                        marker = "Architecture document path: "
+                        path = Path(prompt.split(marker, 1)[1].splitlines()[0].strip())
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("# architecture\n", encoding="utf-8")
+                    return SimpleNamespace(final_response='{"verdict":"pass","summary":"ok","findings":[],"checks":[]}')
+
+            driver = SelfCheckDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            with mock.patch.dict("os.environ", {"HAFLEET_POSTFLIGHT": "0"}, clear=False):
+                orchestrator.run([
+                    RequirementModule(
+                        1,
+                        1,
+                        "REQ-1",
+                        "Demo",
+                        {"id": "REQ-1", "children": [{"id": "REQ-1.1", "scenarios": []}]},
+                    )
+                ])
+            implementer_prompts = [prompt for role, prompt in driver.calls if role == "implementer"]
+            self.assertEqual(len(implementer_prompts), 2)
+            self.assertIn("Implementation self-check", implementer_prompts[1])
+
     def test_quality_exhaustion_is_deferred_for_unattended_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
