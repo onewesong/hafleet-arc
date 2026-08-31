@@ -146,6 +146,47 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(driver.calls, ["implementer", "reviewer"])
             self.assertTrue(any(item["kind"] == "test.failed" for item in orchestrator.bus.replay()))
 
+    def test_registered_project_tests_restore_product_files_but_keep_arc_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            product_file = root / "backend" / "data" / "db.json"
+            product_file.parent.mkdir(parents=True)
+            product_file.write_text('{"seed":"original"}\n', encoding="utf-8")
+            source_file = root / "frontend" / "src" / "app.js"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("export const app = true;\n", encoding="utf-8")
+
+            orchestrator = FleetOrchestrator(
+                driver=FakeDriver(),
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+
+            def mutate_workspace(*args, **kwargs):
+                product_file.write_text('{"seed":"test-mutated"}\n', encoding="utf-8")
+                source_file.unlink()
+                generated = root / "frontend" / "dist" / "index.html"
+                generated.parent.mkdir(parents=True)
+                generated.write_text("generated\n", encoding="utf-8")
+                artifact = root / ".arc" / "hafleet" / "test-results" / "REQ-1.json"
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                artifact.write_text('{"verdict":"pass"}\n', encoding="utf-8")
+                return {"verdict": "pass", "summary": "passed", "findings": [], "checks": []}
+
+            with mock.patch("hafleet_arc.orchestrator.run_project_tests", side_effect=mutate_workspace):
+                result = orchestrator._run_registered_project_tests(
+                    self._module(1, "REQ-1"), workspace_dir=root, round_number=1
+                )
+
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(product_file.read_text(encoding="utf-8"), '{"seed":"original"}\n')
+            self.assertEqual(source_file.read_text(encoding="utf-8"), "export const app = true;\n")
+            self.assertFalse((root / "frontend" / "dist" / "index.html").exists())
+            self.assertTrue((root / ".arc" / "hafleet" / "test-results" / "REQ-1.json").exists())
+
     def test_requirement_modules_get_implementer_self_check(self) -> None:
         """Nested requirement modules receive a warm-context completeness pass."""
         with tempfile.TemporaryDirectory() as temporary:

@@ -682,13 +682,21 @@ implementation source files. Return the required structured Tester JSON response
             payload={"mode": "integration" if module is None else "module", "source": "project_verification"},
             parent_id=parent_id,
         )
-        result = run_project_tests(
-            workspace,
-            task_type=self.task_type,
-            module_id=module_id,
-            round_number=round_number,
-            smoke_port=self.smoke_port,
-        )
+        # Verification is observational. Tests may exercise real persistence, but
+        # their fixture mutations and generated build files must not become product
+        # changes or perturb no-progress detection. Preserve the exact project state
+        # while retaining .arc test reports and dependency caches.
+        before_files = _file_snapshot(workspace)
+        try:
+            result = run_project_tests(
+                workspace,
+                task_type=self.task_type,
+                module_id=module_id,
+                round_number=round_number,
+                smoke_port=self.smoke_port,
+            )
+        finally:
+            _restore_file_snapshot(workspace, before_files)
         kind = "test.completed" if test_passes(result) else "test.failed"
         completed = self._message(
             kind,
