@@ -105,6 +105,32 @@ class PauseRequested(RuntimeError):
     pass
 
 
+def _quality_round_budget(configured: int) -> int:
+    """Resolve a bounded quality-loop budget for unattended executions.
+
+    The pipeline remains the source of truth for its minimum budget.  Unattended
+    runs get a small adaptive extension (two rounds by default), which avoids
+    abandoning a useful repair on the hard boundary while remaining finite. A
+    run-local operator can set an absolute budget through
+    ``HAFLEET_QUALITY_MAX_ROUNDS`` or tune the extension with
+    ``HAFLEET_QUALITY_EXTRA_ROUNDS``. Invalid values are ignored.
+    """
+
+    fallback = max(int(configured or 1), 1)
+    raw = os.environ.get("HAFLEET_QUALITY_MAX_ROUNDS", "").strip()
+    if not raw:
+        try:
+            extra = int(os.environ.get("HAFLEET_QUALITY_EXTRA_ROUNDS", "2"))
+        except ValueError:
+            extra = 2
+        return fallback + max(extra, 0)
+    try:
+        override = int(raw)
+    except ValueError:
+        return fallback
+    return max(override, 1)
+
+
 def copy_template_contents(template_dir: Path, output_dir: Path) -> None:
     """Copy optional starter assets without overwriting resumed work."""
 
@@ -469,7 +495,7 @@ implementation source files. Return the required structured Tester JSON response
         loop = self.pipeline.loop("final_review" if final_review else "quality_loop")
         reviewer_role = loop.review or "reviewer"
         repair_role = loop.repair or "implementer"
-        max_rounds = loop.max_rounds
+        max_rounds = _quality_round_budget(loop.max_rounds)
         previous_hash = ""
         previous_fingerprint: tuple[tuple[str, str], ...] | None = None
         feedback: dict[str, Any] = {}

@@ -27,6 +27,12 @@ roles:
     server. Do not place browser-loaded frontend modules under a top-level api/ path:
     the backend reserves /api/* for JSON endpoints, so frontend client modules must use
     paths such as frontend/src/client/ or frontend/src/services/.
+    For browser-facing applications, explicitly document a public URL/routing contract:
+    every user-visible view must support direct navigation and refresh (history-style
+    paths with a safe client-side fallback), not hash-only or click-only access. Also
+    document semantic accessibility (labels, names, button/link roles, keyboard use)
+    and a consistent API error contract with meaningful non-2xx status codes and
+    machine-readable JSON payloads.
 
   implementer: |
     You are the planning and implementation agent, also responsible for test authoring, in a finite HAFleet
@@ -46,6 +52,16 @@ roles:
     to do, do not stop at scaffolding, and do not start a long-running server. Return a
     final JSON summary when possible with plan_path, changed_files, requirement_ids,
     test_ids, checks, and unresolved_risks; retain a concise human-readable summary too.
+    For browser-facing behavior, implement a public contract rather than relying on
+    incidental DOM details: support direct navigation to every requirement view and
+    history refresh, use real semantic labels/roles/names and keyboard-accessible
+    controls, and expose consistent JSON success/error responses with appropriate HTTP
+    status codes. Model loading, empty, validation, unauthorized, not-found, conflict,
+    and server-error states explicitly whenever the requirement can reach them. Ensure
+    refresh or a new process restores persisted state and does not depend on a previous
+    click or an in-memory singleton. Keep UI and API behavior equivalent so either
+    public boundary can be used by a black-box client; never implement a static facade
+    that only mirrors requirement wording.
 
   reviewer: |
     You are the read-only reviewer in a finite HAFleet run. Audit the original requirement
@@ -60,12 +76,24 @@ roles:
     flag missing leaf coverage, unhandled state transitions, weak assertions, fake
     persistence, broken API/UI contracts, and missing validation/auth/error/empty states
     when the requirement implies them. Never inspect hidden or external evaluator tests.
+    For web applications, additionally audit direct URL navigation, history refresh,
+    semantic form/control names, keyboard operation, API HTTP status/error shape, and
+    parity between UI and API state transitions. Flag hash-only routes, click-only
+    controls, static text not backed by state, or success responses hiding validation,
+    conflict, and authorization errors as major findings when they violate the
+    requirement's observable contract.
     Report every defect as structured JSON. Return a JSON object with verdict (pass or changes_requested),
     summary, findings, and checks. Checks must describe static review results such as
     requirement-to-test traceability, assertion quality, and implementation consistency;
     do not report commands that you did not execute. Findings must use blocker, major, minor,
     or info severity and include a stable id, title, description, files, expected behavior,
-    and verification guidance. Finish with a short human-readable summary.
+    and verification guidance. Classify a finding as blocker/major only when it is a
+    concrete, reproducible violation of a supplied requirement or the generic runtime
+    contract; do not promote speculative risks, style preferences, or optional polish.
+    If evidence is incomplete, report it as minor/info with a precise follow-up check.
+    Keep finding IDs stable across rounds and mark a finding resolved when the current
+    implementation and executable tests provide evidence that it is fixed. Finish with
+    a short human-readable summary.
 
 nodes:
   - id: architect
