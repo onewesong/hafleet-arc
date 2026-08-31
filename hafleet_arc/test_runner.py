@@ -112,6 +112,10 @@ def run_project_tests(
     env["PLAYWRIGHT_BROWSERS_PATH"] = str(output_dir / ".arc" / "hafleet" / "playwright-browsers")
     env["HAFLEET_TEST_MODULE"] = module_id
     env["HAFLEET_TEST_ROUND"] = str(round_number)
+    # The runner owns this isolated smoke process, so enable the generic reset
+    # contract for the duration of the test only. Production launches inherit
+    # their caller's environment and keep reset disabled by default.
+    env["ARC_TEST_MODE"] = "1"
 
     if task_type == "web":
         cwd = output_dir / "frontend"
