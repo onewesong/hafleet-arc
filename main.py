@@ -135,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime.git.ensure_repo()
     runtime.events.mark_run_started(f"HAFleet ARC started with {len(modules)} modules")
     _console(
-        "runtime initialized; entering architect/planner/implementer/reviewer pipeline "
+        "runtime initialized; entering architect/implementer/reviewer pipeline "
         f"(parallel={args.parallel}, max_workers={args.max_workers})"
     )
 

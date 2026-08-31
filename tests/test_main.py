@@ -133,7 +133,7 @@ class EntrypointSmokeTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(
                 FakeFleet.instances[-1].calls,
-                ["architect", "planner", "implementer", "reviewer"],
+                ["architect", "implementer", "reviewer"],
             )
             self.assertEqual(runtime.traceability.tree["id"], "ROOT")
             self.assertIn("mark_run_completed", runtime.events.states)

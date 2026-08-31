@@ -13,13 +13,30 @@ from .log import log
 from .pipeline import Pipeline, load_pipeline
 
 TRANSIENT_ERROR_MARKERS = (
+    # Provider/model capacity errors are retryable even when the SDK does not
+    # expose an HTTP status code (for example: "Selected model is at capacity").
+    "at capacity",
+    "capacity exceeded",
+    "capacity_exceeded",
+    "model_capacity",
+    "model overloaded",
+    "model_overloaded",
+    "overloaded",
+    "try a different model",
+    "try_a_different_model",
     "401",
     "403",
     "429",
+    "rate_limit_exceeded",
     "500",
     "502",
     "503",
     "504",
+    "520",
+    "521",
+    "522",
+    "524",
+    "529",
     "authentication failed",
     "connection",
     "empty turn",
@@ -27,15 +44,27 @@ TRANSIENT_ERROR_MARKERS = (
     "rate limit",
     "retry limit",
     "server busy",
+    "server_busy",
+    "server_error",
+    "internal server error",
+    "internal_server_error",
     "server overloaded",
     "stream disconnected",
     "streaming request",
     "temporarily unavailable",
+    "temporarily_unavailable",
     "timed out",
     "timeout",
     "transport closed",
     "unauthorized",
 )
+
+# Capacity incidents are often short-lived and may outlast a single provider
+# retry window. Keep the retry budget generous enough for unattended ARC-Bench
+# runs while allowing operators to override it through environment variables.
+DEFAULT_MAX_ATTEMPTS = 6
+DEFAULT_RETRY_DELAYS = "30,60,120,180,300"
+DEFAULT_RETRY_DELAY_VALUES = (30.0, 60.0, 120.0, 180.0, 300.0)
 
 
 class TurnTimeoutError(RuntimeError):
@@ -235,24 +264,32 @@ ARC-Bench web delivery contract:
 
     @staticmethod
     def _transient(error: BaseException) -> bool:
-        message = f"{type(error).__name__}: {error}".lower()
+        # SDK versions expose provider failures either as exception text or as
+        # structured attributes. Include both forms so capacity/rate-limit
+        # responses are retried consistently across adapters.
+        details = [f"{type(error).__name__}: {error}"]
+        for attribute in ("code", "type", "status", "status_code", "error_code", "message"):
+            value = getattr(error, attribute, None)
+            if value is not None:
+                details.append(str(value))
+        message = " ".join(details).lower()
         return isinstance(error, TurnTimeoutError) or any(
             marker in message for marker in TRANSIENT_ERROR_MARKERS
         )
 
     @staticmethod
     def _retry_delays() -> list[float]:
-        configured = os.environ.get("HAFLEET_RETRY_DELAYS", "30,60")
+        configured = os.environ.get("HAFLEET_RETRY_DELAYS", DEFAULT_RETRY_DELAYS)
         delays: list[float] = []
         for value in configured.split(","):
             try:
                 delays.append(max(float(value.strip()), 0.0))
             except ValueError:
                 continue
-        return delays or [30.0, 60.0]
+        return delays or list(DEFAULT_RETRY_DELAY_VALUES)
 
     def run(self, role: str, prompt: str, workspace_dir: Path | None = None) -> Any:
-        attempts = _positive_int_env("HAFLEET_MAX_ATTEMPTS", 3)
+        attempts = _positive_int_env("HAFLEET_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)
         timeout_s = _positive_int_env("HAFLEET_TURN_TIMEOUT", 1200)
         delays = self._retry_delays()
         workspace = (workspace_dir or self.output_dir).resolve()

@@ -53,8 +53,8 @@ HAFleet ARC MUST:
 2. preserve existing files when initializing or resuming an output workspace;
 3. create a global architecture contract before feature modules are implemented;
 4. process direct ROOT children in stable, dependency-aware order;
-5. give every module a plan, implementation turn, Tester execution, a
-   read-only review loop, and durable checkpoint;
+5. give every module one Implementer turn that plans, implements, authors and
+   executes tests, followed by a read-only review loop and durable checkpoint;
 6. emit machine-readable lifecycle and requirement-state events;
 7. keep runtime state, Codex home, checkpoints, and traceability under the
    output workspace unless explicitly configured otherwise;
@@ -65,15 +65,19 @@ HAFleet ARC MUST:
 11. leave a completed run with a runnable project and a final integration
     checkpoint.
 
-Tester is an optional-compatible quality stage. When enabled by the pipeline,
-the Tester may create or update only test sources, test configuration, and test
-dependency manifests. Web projects use Playwright against an isolated smoke
-port; results are persisted under `.arc/hafleet/test-results/<module>/` and
-published to the MessageBus. Failed required tests become blocking findings for
-the Implementer. Every Implementer repair re-runs Tester before Reviewer, with
-the same bounded loop and no-progress safeguards as review findings. Setting
-`HAFLEET_TESTER=0`, or omitting a Tester node from a legacy pipeline, preserves
-the pre-Tester flow.
+The default pipeline has no standalone Tester role. The Implementer authors or
+updates executable tests directly from requirement scenarios and runs them before
+finishing each turn. Web projects may use Playwright against the isolated smoke
+port; results are persisted under `.arc/hafleet/test-results/<module>/` when the
+project's test tooling emits them. The read-only Reviewer audits the original
+requirements, implementation, and test quality together. A run-local YAML may
+still add a dedicated Tester node for specialized legacy or future pipelines.
+
+Quality loops are bounded but do not terminate an unattended ARC-Bench run by
+default. When the round or no-progress budget is exhausted, HAFleet records a
+`quality_deferred` checkpoint and continues delivery so later modules and postflight
+can complete. Operators requiring a hard gate may set
+`HAFLEET_QUALITY_ON_EXHAUSTION=pause`.
 
 ### 2.2 Non-goals
 
@@ -98,7 +102,7 @@ HAFleet ARC does not:
      options.
    - Creates the runtime and owns the top-level process lifecycle.
 
-2. **Requirement loader and module planner**
+2. **Requirement loader and module ordering**
    - Loads `requirements.yaml`.
    - Requires a node with `id: ROOT` and at least one direct child.
    - Normalizes each direct child into a `RequirementModule`.
@@ -229,8 +233,7 @@ The run is one finite state machine:
 ```text
 initialized
   -> architecture
-  -> module.design
-  -> module.implement
+  -> module.implement (plan + implementation)
   -> module.review
   -> module.checkpoint
   -> next module
@@ -278,34 +281,33 @@ and MUST:
 The architecture checkpoint is `ROOT: architecture scaffold` and uses the
 `HAFleet-Architect <architect@hafleet.local>` identity by default.
 
-### 6.2 Planner
+### 6.2 Implementer (planning + implementation)
 
-For each incomplete module, the planner receives the module subtree, current
-repository context, completed module IDs, and architecture path. It MUST write
-only the concrete plan to:
+For each incomplete module, the implementer receives the module subtree, current
+repository context, completed module IDs, and architecture path. In one turn it
+MUST first write a concrete plan to:
 
 ```text
 .arc/hafleet/plans/<module-id>.md
 ```
 
 The plan SHOULD cover data model, routes/UI, persistence, validation,
-scenarios, and verification. A missing or empty plan is a planner failure and
-may trigger one corrective planner turn before the module fails.
-
-### 6.3 Implementer
-
-The implementer reads the architecture and module plan, then implements the
+scenarios, and verification. The same implementer turn then implements the
 entire module subtree. It MUST preserve earlier behavior, use real persistence
 where required, run focused checks, and avoid starting long-running servers.
 
+Legacy or run-local pipelines may still declare a standalone planner node; only
+those pipelines use the separate planning turn.
+
 ### 6.4 Reviewer
 
-The reviewer runs after implementation in a read-only sandbox. It MUST test
-against the requirement scenarios, inspect cross-module behavior, and return a
-structured verdict with blocker, major, minor, or info findings. It MUST NOT
-modify project files or Git state. Blocker/major findings are routed back to
-the implementer through the message bus; the reviewer runs again after repair
-until the loop passes or reaches its configured limit.
+The reviewer runs after implementation in a read-only sandbox. It MUST inspect
+the original requirement scenarios, cross-module behavior, implementation, and
+the Implementer's test cases and reported results. It MUST NOT execute tests,
+start servers, install dependencies, or modify project files or Git state.
+Blocker/major findings are routed back to the implementer through the message
+bus; the reviewer runs again after repair until the loop passes or reaches its
+configured limit.
 
 ### 6.5 Postflight
 
@@ -339,7 +341,7 @@ changed project files. A result with neither is an `empty turn` failure.
 
 The driver logs start, finish, failure, attempt number, timeout, and file-count
 delta. The orchestrator then validates required artifacts (for example, the
-planner file) before advancing.
+implementer-owned plan file) before advancing.
 
 ### 7.3 Runtime event messages
 
@@ -374,18 +376,15 @@ The stream is read-only and does not replace `/api/state` or session detail APIs
 
 For a sequential module, the required sequence is:
 
-1. checkpoint `design` and emit planner started;
-2. run planner and verify plan file;
-3. emit planner/design completed;
-4. checkpoint `implement` and emit implementer started;
-5. run implementer;
-6. checkpoint `review_loop` and run the read-only reviewer;
-7. route structured blocker/major feedback to implementer and repeat until
+1. checkpoint `implement` and emit implementer planning/implementation started;
+2. run implementer and verify its plan artifact;
+3. emit design and implementation completed;
+4. checkpoint `review_loop` and run the read-only reviewer;
+5. route structured blocker/major feedback to implementer and repeat until
    approved or bounded failure;
-8. emit implementation completed;
-9. commit the module checkpoint as reviewer;
-10. add the module to `checkpoint.json.completed`; and
-11. continue to the next module.
+6. commit the module checkpoint as reviewer;
+7. add the module to `checkpoint.json.completed`; and
+8. continue to the next module.
 
 The checkpoint MUST be created before the module is marked completed.
 
@@ -404,7 +403,7 @@ The orchestrator MUST:
 
 - create a worktree and branch per pending independent module;
 - record path, branch, base commit, and phase in `active_worktrees`;
-- run planner, implementer, and reviewer inside that worktree;
+  - run implementer (planning + implementation) and reviewer inside that worktree;
 - create a reviewer-authored module commit in the worktree;
 - cherry-pick module commits into the main workspace in module order;
 - copy the module plan into the main `.arc/hafleet/plans/` directory; and
@@ -526,7 +525,7 @@ not let browser code read the local filesystem directly.
 
 Dashboard file changes SHOULD be scoped by role and stage:
 
-- planner output: the selected module plan;
+- implementer output: the selected module plan and module source changes;
 - architect commit: the architecture checkpoint;
 - implementer/reviewer worktree: current active changes;
 - module checkpoint: the reviewed module commit; and
@@ -539,8 +538,8 @@ Implementations SHOULD preserve these reference variables:
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `HAFLEET_MAX_ATTEMPTS` | `3` | Maximum attempts per agent turn |
-| `HAFLEET_RETRY_DELAYS` | `30,60` | Retry delays in seconds |
+| `HAFLEET_MAX_ATTEMPTS` | `6` | Maximum attempts per agent turn, including the first try |
+| `HAFLEET_RETRY_DELAYS` | `30,60,120,180,300` | Retry delays in seconds; the last value is reused |
 | `HAFLEET_TURN_TIMEOUT` | `1200` | Agent turn timeout in seconds |
 | `HAFLEET_SMOKE_PORT` | `3100` | Safe web rehearsal port |
 | `HAFLEET_POSTFLIGHT_REPAIRS` | `2` | Implementer repairs after failed rehearsal |
@@ -564,8 +563,8 @@ The runtime additionally honors ARC-Bench paths such as
 
 ## 14. Security and safety posture
 
-The reference Codex sessions use full workspace access for Architect, Planner,
-and Implementer, while Reviewer sessions use `Sandbox.read_only`; approvals are
+The reference Codex sessions use full workspace access for Architect and
+Implementer, while Reviewer sessions use `Sandbox.read_only`; approvals are
 denied by the SDK configuration. This is a trusted-runner posture: the
 requirement bundle and agent prompts are inside the execution trust boundary.
 

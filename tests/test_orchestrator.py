@@ -115,7 +115,62 @@ class OrchestratorTests(unittest.TestCase):
             self.assertTrue(any(item["kind"] == "review.feedback" for item in messages))
             self.assertTrue(any(item["kind"] == "pipeline.state" and item["payload"].get("status") == "approved" for item in messages))
 
-    def test_runs_three_roles_and_checkpoints_each_module(self) -> None:
+    def test_quality_exhaustion_is_deferred_for_unattended_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class StuckDriver:
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    if role == "reviewer":
+                        return SimpleNamespace(
+                            final_response='{"verdict":"changes_requested","summary":"still broken","findings":[{"id":"F-1","severity":"major","title":"still broken"}],"checks":[]}'
+                        )
+                    if role == "implementer":
+                        (workspace_dir or root).joinpath("attempt.txt").write_text("attempt\n", encoding="utf-8")
+                    return SimpleNamespace(final_response='{"verdict":"changes_requested","summary":"repair attempted","findings":[],"checks":[]}')
+
+            orchestrator = FleetOrchestrator(
+                driver=StuckDriver(),
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            result = orchestrator._review_loop(self._module(1, "REQ-1"), "Review REQ-1")
+            self.assertEqual(result["verdict"], "changes_requested")
+            state = orchestrator.checkpoint.read()
+            self.assertFalse(state["paused"])
+            self.assertTrue(state["quality_deferred"])
+            self.assertEqual(state["loop_status"], "deferred")
+            self.assertTrue(any(item["payload"].get("status") == "quality_deferred" for item in orchestrator.bus.replay() if item["kind"] == "pipeline.state"))
+
+    def test_quality_exhaustion_can_use_strict_pause_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class StuckDriver:
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    if role == "reviewer":
+                        return SimpleNamespace(
+                            final_response='{"verdict":"changes_requested","summary":"still broken","findings":[{"id":"F-1","severity":"major","title":"still broken"}],"checks":[]}'
+                        )
+                    return SimpleNamespace(final_response="repair")
+
+            orchestrator = FleetOrchestrator(
+                driver=StuckDriver(),
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            with mock.patch.dict("os.environ", {"HAFLEET_QUALITY_ON_EXHAUSTION": "pause"}, clear=False):
+                with self.assertRaises(PauseRequested):
+                    orchestrator._review_loop(self._module(1, "REQ-1"), "Review REQ-1")
+            self.assertTrue(orchestrator.checkpoint.read()["paused"])
+
+    def test_runs_combined_implementer_and_checkpoints_each_module(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             driver = FakeDriver()
@@ -137,10 +192,8 @@ class OrchestratorTests(unittest.TestCase):
                 roles,
                 [
                     "architect",
-                    "planner",
                     "implementer",
                     "reviewer",
-                    "planner",
                     "implementer",
                     "reviewer",
                     "reviewer",
@@ -149,9 +202,10 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(checkpoint.read()["completed"], ["REQ-1", "REQ-2"])
             self.assertTrue(checkpoint.read()["architecture_completed"])
             self.assertEqual(len(runtime.git.messages), 4)
-            planner_prompt = next(prompt for role, prompt in driver.calls if role == "planner")
-            self.assertIn("architecture.md", planner_prompt)
-            self.assertIn("frontend/src/app.js", planner_prompt)
+            implementer_prompt = next(prompt for role, prompt in driver.calls if role == "implementer")
+            self.assertIn("architecture.md", implementer_prompt)
+            self.assertIn("planning and implementation", implementer_prompt)
+            self.assertIn("frontend/src/app.js", implementer_prompt)
 
     def test_resume_skips_completed_modules(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -172,7 +226,7 @@ class OrchestratorTests(unittest.TestCase):
 
             self.assertEqual(
                 [role for role, _ in driver.calls],
-                ["architect", "planner", "implementer", "reviewer", "reviewer"],
+                ["architect", "implementer", "reviewer", "reviewer"],
             )
 
     def test_completed_architecture_is_skipped_on_resume(self) -> None:

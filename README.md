@@ -1,7 +1,7 @@
 # HAFleet ARC
 
 HAFleet ARC is a finite-lifecycle multi-role coding agent for ARC-Bench. It keeps
-HAFleet's architect, planner, implementer, reviewer, task-state, and checkpoint concepts but
+HAFleet's architect, implementer, reviewer, task-state, and checkpoint concepts but
 does not start the HAFleet backend, tmux, Matrix, or dashboard services.
 
 ## Entrypoint
@@ -26,7 +26,7 @@ hosts may expose a read-only home directory.
 ## Fleet workflow
 
 HAFleet ARC runs a finite, resumable pipeline over the requirement tree. The
-four Codex roles share the same output workspace and keep persistent role
+Core Codex roles share the same output workspace and keep persistent role
 threads for the duration of the run.
 
 ```mermaid
@@ -36,9 +36,9 @@ flowchart TD
     C --> D["Order direct ROOT children by dependencies"]
     D --> E{"Module already completed?"}
     E -- "Yes" --> F["Skip module"]
-    E -- "No" --> G["Planner: write implementation plan"]
-    G --> H["Implementer: implement requirement subtree"]
-    H --> I["Reviewer: read-only JSON review"]
+    E -- "No" --> G["Implementer: plan + implement requirement subtree"]
+    G --> H["Implementer: write and run tests"]
+    H --> I["Reviewer: audit requirements, implementation, and tests"]
     I --> J{"Blocker/major findings?"}
     J -- "Yes" --> K["Implementer repairs from feedback"]
     K --> I
@@ -91,8 +91,8 @@ python3 main.py /path/to/requirements \
 ```
 
 Parallel mode is disabled by default. It can also be enabled with
-`HAFLEET_PARALLEL=1` and `HAFLEET_MAX_WORKERS=2`. Each module runs its planner,
-implementer, and reviewer in an isolated worktree; the main workspace cherry-picks
+`HAFLEET_PARALLEL=1` and `HAFLEET_MAX_WORKERS=2`. Each module runs its implementer
+(including test authoring) and reviewer in an isolated worktree; the main workspace cherry-picks
 modules in dependency order. Successful worktrees are removed, while failed or
 conflicted worktrees remain under `.arc/hafleet/worktrees/`.
 
@@ -101,11 +101,13 @@ conflicted worktrees remain under `.arc/hafleet/worktrees/`.
 The built-in pipeline is maintained in `hafleet_arc/pipeline.yaml` and can be
 overridden per output workspace with `.arc/hafleet/pipeline.yaml`. It uses versioned `agent`, `loop`, and `operation`
 nodes; the loop's `review`, `repair`, `until`, and `max_rounds` fields control the
-review/repair policy. Omit the file to use the default Architect → Planner →
-Implementer → Reviewer/Implementer loop → checkpoint → Postflight pipeline.
-Role prompts are maintained in the same YAML under `roles.<role>`. A run-local
+review/repair policy. Role prompts are maintained in the same YAML under
+`roles.<role>`. A run-local
 configuration may override only one prompt while inheriting the other built-in
-role prompts.
+role prompts. Omit the file to use the default Architect → Implementer →
+Reviewer loop → checkpoint → Postflight pipeline. The default module flow has no standalone Planner or Tester: Implementer writes
+the plan and applies it in one turn. A legacy/custom YAML that declares a `planner`
+agent continues to use the separate planning phase.
 
 Every turn and operation is appended to `.arc/hafleet/messages.jsonl`. The log is
 durable and can be replayed after a restart; the Dashboard's `/api/stream` endpoint
@@ -176,10 +178,10 @@ dependency-aware order. Dependencies on descendants do not constrain this
 top-level ordering, and dependency cycles fall back to source order instead of
 deadlocking the run.
 
-### 4. Plan the module
+### 4. Plan and implement the module
 
-The `planner` receives the complete requirement subtree, task type, previously
-completed module IDs, and current repository context. It writes a concrete
+The `implementer` receives the complete requirement subtree, task type, previously
+completed module IDs, and current repository context. It first writes a concrete
 implementation plan to:
 
 ```text
@@ -187,31 +189,25 @@ implementation plan to:
 ```
 
 The plan covers the data model, routes or UI, persistence, validation,
-requirement scenarios, and verification. The planner does not modify project
-files outside the plan.
-
-### 5. Implement the requirement subtree
-
-The `implementer` reads the coordinator plan and implements the entire subtree
-in the shared output workspace. It must preserve behavior from earlier modules,
+requirement scenarios, and verification. In the same turn, the implementer
+implements the entire subtree in the shared output workspace. It must preserve behavior from earlier modules,
 build real persisted behavior rather than static mock screens, and run focused
 checks while working.
 
-### 6. Test, review loop and repair
+### 5. Review loop and repair
 
-When enabled (the default for requirement subtrees with testable scenarios), the
-`tester` role generates executable project tests before review. Web projects use
-Playwright from `frontend/tests/e2e`; test results and screenshots are persisted
-under `.arc/hafleet/test-results`. Tester changes are restricted to test files,
-Playwright configuration, and dependency manifests. Failed required tests are
-sent to the implementer as blocking findings, so the tester runs again after each
-repair before the reviewer is invoked.
+The implementer generates or updates executable tests directly from the requirement
+scenarios and runs them before finishing the turn. Web projects may use Playwright
+from `frontend/tests/e2e`; test results and screenshots are persisted under
+`.arc/hafleet/test-results`. The read-only reviewer then audits the original
+requirements, implementation, and test quality together. Blocker/major findings
+route back to the implementer, which repairs code and tests before the next review.
 
-### 7. Review loop and repair
-
-The `reviewer` checks the implementation against its scenarios in a read-only
-Codex sandbox, runs practical tests or build checks, and returns a structured JSON
-verdict. It never edits source files or Git state. Findings use `blocker`, `major`,
+The `reviewer` checks the original requirements, implementation, and Implementer's
+test cases in a read-only Codex sandbox. It does not run tests, start servers, or
+install dependencies; it evaluates the reported test results and test quality
+statically, then returns a structured JSON verdict. It never edits source files or
+Git state. Findings use `blocker`, `major`,
 `minor`, or `info` severity. Blocker/major findings are appended to the message
 bus and routed to the `implementer`, which repairs the current module. The reviewer
 runs again until the module passes or the bounded loop pauses (three rounds by
@@ -275,8 +271,8 @@ foreign listener on a shared runner.
 
 | Environment variable | Default | Purpose |
 | --- | ---: | --- |
-| `HAFLEET_MAX_ATTEMPTS` | `3` | Maximum attempts for one Codex role turn |
-| `HAFLEET_RETRY_DELAYS` | `30,60` | Comma-separated retry delays in seconds |
+| `HAFLEET_MAX_ATTEMPTS` | `6` | Maximum attempts for one Codex role turn (including the first try) |
+| `HAFLEET_RETRY_DELAYS` | `30,60,120,180,300` | Comma-separated retry delays in seconds; the last value is reused |
 | `HAFLEET_TURN_TIMEOUT` | `1200` | Maximum seconds for one Codex turn |
 | `HAFLEET_SMOKE_PORT` | `3100` | Safe generation-time application port |
 | `HAFLEET_POSTFLIGHT_REPAIRS` | `2` | Implementer repair attempts after failed rehearsal |
@@ -293,15 +289,22 @@ override it with a role-specific variable, which takes precedence over `MODEL`:
 ```bash
 export MODEL=gpt-5.6-terra
 export HAFLEET_ARCHITECT_MODEL=gpt-5.6-sol
-export HAFLEET_PLANNER_MODEL=gpt-5.6-sol
 export HAFLEET_IMPLEMENTER_MODEL=gpt-5.6-terra
 export HAFLEET_REVIEWER_MODEL=gpt-5.6-terra
+export HAFLEET_TESTER_MODEL=gpt-5.6-terra
 ```
 
-Supported variables are `HAFLEET_ARCHITECT_MODEL`, `HAFLEET_PLANNER_MODEL`,
-`HAFLEET_IMPLEMENTER_MODEL`, and `HAFLEET_REVIEWER_MODEL`. If a role-specific
+Supported variables are `HAFLEET_ARCHITECT_MODEL`, `HAFLEET_IMPLEMENTER_MODEL`,
+`HAFLEET_REVIEWER_MODEL`, `HAFLEET_TESTER_MODEL`, and `HAFLEET_POSTFLIGHT_MODEL`.
+`HAFLEET_PLANNER_MODEL` remains available only for legacy/custom pipelines that
+declare a standalone planner. If a role-specific
 variable is unset or empty, the role falls back to `MODEL`; if neither is set, the
 Codex SDK selects its default model.
+
+Quality review loops are bounded. By default, reaching the round or no-progress
+limit records `quality_deferred` and continues unattended to the remaining modules
+and postflight. Set `HAFLEET_QUALITY_ON_EXHAUSTION=pause` when a strict manual gate
+is preferred.
 
 `HAFLEET_FINAL_REVIEW=0` skips the optional model review but still runs the
 deterministic postflight. `HAFLEET_POSTFLIGHT=0` is intended only for cheap

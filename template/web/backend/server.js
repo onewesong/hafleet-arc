@@ -1,10 +1,11 @@
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const backendDir = fileURLToPath(new URL(".", import.meta.url));
 const frontendDir = join(backendDir, "..", "frontend", "dist");
+const databaseFile = join(backendDir, "data", "db.json");
 const port = Number.parseInt(process.env.PORT || "3000", 10);
 const host = process.env.HOST || "0.0.0.0";
 
@@ -34,6 +35,21 @@ const server = createServer((request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
   if (url.pathname === "/api/health") {
     sendJson(response, 200, { status: "ok" });
+    return;
+  }
+  // ARC-Bench uses this endpoint to reset isolated E2E state between tests.
+  // Keep it disabled unless the runner explicitly enables test mode.
+  if (request.method === "POST" && url.pathname === "/api/test/reset") {
+    if (process.env.ARC_TEST_MODE !== "1") {
+      sendJson(response, 404, { error: "Not found" });
+      return;
+    }
+    try {
+      writeFileSync(databaseFile, JSON.stringify({ users: [], orders: [], passengers: [] }, null, 2));
+      sendJson(response, 200, { message: "Test database reset." });
+    } catch {
+      sendJson(response, 500, { error: "Test database reset failed." });
+    }
     return;
   }
   if (url.pathname.startsWith("/api/")) {

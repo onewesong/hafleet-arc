@@ -279,6 +279,42 @@ class FleetOrchestrator:
             return (frontend / "tests").exists() or (root / "tests").exists()
         return True
 
+    def _planner_enabled(self) -> bool:
+        """Return whether the configured pipeline still has a standalone planner.
+
+        The built-in pipeline deliberately folds planning into the implementer turn.
+        A run-local YAML may still declare a planner node, so retaining this check
+        keeps older/custom pipelines resumable without forcing the extra turn on new
+        runs.
+        """
+
+        return any(
+            node.type == "agent" and node.role.strip().lower() == "planner"
+            for node in self.pipeline.nodes
+        )
+
+    @staticmethod
+    def _ensure_plan_artifact(plan_path: Path, module: RequirementModule) -> None:
+        """Ensure a durable plan exists when implementer-owned planning is used.
+
+        The implementer is instructed to write the concrete plan. If an adapter
+        returns without creating it, retain a small requirement-derived artifact
+        rather than spending another model turn solely to recreate a missing file.
+        """
+
+        if plan_path.is_file() and plan_path.read_text(encoding="utf-8", errors="ignore").strip():
+            return
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        requirement = json.dumps(module.subtree, ensure_ascii=False, indent=2)
+        plan_path.write_text(
+            "# Implementation plan\n\n"
+            "Planning, implementation, and test authoring were performed by the "
+            "Implementer role in a single turn. The requirement context used for "
+            "that turn follows:\n\n"
+            "```json\n" + requirement + "\n```\n",
+            encoding="utf-8",
+        )
+
     def _run_tester(
         self,
         module: RequirementModule | None,
@@ -445,7 +481,8 @@ implementation source files. Return the required structured Tester JSON response
             if resume_round >= max_rounds:
                 if module:
                     self.checkpoint.update_pipeline(module.node_id, loop_status="blocked")
-                self._pause_pipeline(module, "review", f"review loop exceeded {max_rounds} rounds")
+                self._defer_quality(module, "review", f"review loop exceeded {max_rounds} rounds")
+                return resume_feedback
             repair_round = resume_round
             repair_prompt = base_prompt + f"""
 
@@ -453,8 +490,9 @@ Repair loop round {repair_round}. This is a resumed pipeline node. Reviewer feed
 {json.dumps(resume_feedback, ensure_ascii=False, indent=2)}
 
 You are the implementation agent. Modify only the current module/workspace, resolve
-all blocker and major findings, run focused checks, and return a structured summary of
-changed_files, resolved_findings, remaining_findings, and checks.
+all blocker and major findings, add or update executable tests that cover the repaired
+requirements, run those tests and focused build checks, and return a structured summary
+of changed_files, resolved_findings, remaining_findings, and checks.
 """
             if module:
                 self.checkpoint.update_pipeline(module.node_id, node="repair", loop_status="repairing", round_number=repair_round)
@@ -505,10 +543,12 @@ changed_files, resolved_findings, remaining_findings, and checks.
                             test_status="failed",
                             last_test_hash=current_hash,
                         )
-                        self._pause_pipeline(module, "test", "test loop made no progress")
+                        self._defer_quality(module, "test", "test loop made no progress")
+                        return test_result
                     if round_number >= max_rounds:
                         self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="blocked", loop_status="blocked", test_status="failed", last_test_hash=current_hash)
-                        self._pause_pipeline(module, "test", f"test loop exceeded {max_rounds} rounds")
+                        self._defer_quality(module, "test", f"test loop exceeded {max_rounds} rounds")
+                        return test_result
                     repair_prompt = base_prompt + f"""
 
 Test failures require repair before review. This is repair round {round_number}; test
@@ -537,8 +577,13 @@ itself is demonstrably incorrect.
             before = _content_fingerprint(review_workspace)
             review_prompt = base_prompt + f"""
 
-Review loop round {round_number}/{max_rounds}. You are read-only. Inspect the current
-implementation and return ONLY a JSON review object followed by a short summary.
+Review loop round {round_number}/{max_rounds}. You are read-only. Audit the original
+requirements, current implementation, executable test cases, and the Implementer's
+reported test results together. Do not execute test commands, start servers, install
+dependencies, or modify files. Verify every requirement scenario is implemented and
+meaningfully covered, inspect tests for weak assertions, false positives, tautologies,
+and source-string-only checks, and verify that the reported results are consistent with
+the test files. Return ONLY a JSON review object followed by a short summary.
 Use verdict=pass only when all blocker/major findings are resolved and required checks pass.
 Do not edit project files or Git state.
 """
@@ -598,10 +643,12 @@ Do not edit project files or Git state.
             fingerprint = after
             if current_hash == previous_hash and fingerprint == previous_fingerprint:
                 self.checkpoint.update_pipeline(module.node_id if module else "ROOT", loop_status="blocked", last_feedback_hash=current_hash, review_findings=feedback.get("findings", []))
-                self._pause_pipeline(module, "review", "review loop made no progress")
+                self._defer_quality(module, "review", "review loop made no progress")
+                return feedback
             if round_number >= max_rounds:
                 self.checkpoint.update_pipeline(module.node_id if module else "ROOT", loop_status="blocked", last_feedback_hash=current_hash, review_findings=feedback.get("findings", []))
-                self._pause_pipeline(module, "review", f"review loop exceeded {max_rounds} rounds")
+                self._defer_quality(module, "review", f"review loop exceeded {max_rounds} rounds")
+                return feedback
             if module:
                 self.checkpoint.update_pipeline(
                     module.node_id,
@@ -618,8 +665,9 @@ Repair loop round {round_number}. Reviewer feedback is authoritative:
 {json.dumps(feedback, ensure_ascii=False, indent=2)}
 
 You are the implementation agent. Modify only the current module/workspace, resolve
-all blocker and major findings, run focused checks, and return a structured summary
-of changed_files, resolved_findings, remaining_findings, and checks.
+all blocker and major findings, add or update executable regression tests derived from
+the original requirements, run those tests and focused build checks, and return a
+structured summary of changed_files, resolved_findings, remaining_findings, and checks.
 """
             repair_result = self._run_agent(
                 repair_role,
@@ -640,7 +688,8 @@ of changed_files, resolved_findings, remaining_findings, and checks.
                 parent_id=verdict["id"],
             )
             previous_hash, previous_fingerprint, parent_id = current_hash, fingerprint, verdict["id"]
-        self._pause_pipeline(module, "review", "review loop terminated without approval")
+        self._defer_quality(module, "review", "review loop terminated without approval")
+        return feedback
 
     def _commit(self, message: str, role: str) -> bool:
         """Commit with a role identity while keeping older RuntimeGit adapters working."""
@@ -698,6 +747,35 @@ of changed_files, resolved_findings, remaining_findings, and checks.
         """Persist a durable paused state before unwinding a bounded loop."""
         self.checkpoint.mark_paused(module.node_id if module else "ROOT", phase)
         raise PauseRequested(reason)
+
+    def _defer_quality(self, module: RequirementModule | None, phase: str, reason: str) -> None:
+        """Record bounded quality exhaustion without stopping unattended runs.
+
+        ARC-Bench executions are normally unattended. A review that cannot converge
+        within its configured budget should remain visible and auditable, but should
+        not terminate the whole delivery. Strict operators can restore the historical
+        pause behavior with ``HAFLEET_QUALITY_ON_EXHAUSTION=pause``.
+        """
+
+        policy = os.environ.get("HAFLEET_QUALITY_ON_EXHAUSTION", "defer").strip().lower()
+        if policy in {"pause", "stop", "fail"}:
+            self._pause_pipeline(module, phase, reason)
+        module_id = module.node_id if module else "ROOT"
+        self.checkpoint.update_pipeline(
+            module_id,
+            node="checkpoint",
+            loop_status="deferred",
+            quality_deferred=True,
+            quality_exhaustion_reason=reason,
+        )
+        self._message(
+            "pipeline.state",
+            "orchestrator",
+            module=module,
+            phase=phase,
+            payload={"status": "quality_deferred", "reason": reason},
+        )
+        log(f"[hafleet] quality deferred ({module_id}): {reason}; continuing unattended", flush=True)
 
     def _architecture_prompt(self, requirement_tree: dict[str, object]) -> str:
         return textwrap.dedent(
@@ -850,48 +928,69 @@ of changed_files, resolved_findings, remaining_findings, and checks.
                     resume_message_id=resume_message_id,
                 )
             else:
-                self._check_pause(module, "design")
-                self.checkpoint.mark_module_started(module.node_id, "design")
-                self.runtime.events.mark_design_started(module.node_id, "HAFleet planner started")
-                log(f"[hafleet]   planner started -> {plan_path}", flush=True)
-                try:
-                    self._run_agent(
-                        self.pipeline.role_for("planner", "planner"),
-                        base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
-                        module=module,
-                        phase="design",
-                    )
-                    if not plan_path.is_file() or not plan_path.read_text(
-                        encoding="utf-8", errors="ignore"
-                    ).strip():
+                planner_enabled = self._planner_enabled()
+                if planner_enabled:
+                    self._check_pause(module, "design")
+                    self.checkpoint.mark_module_started(module.node_id, "design")
+                    self.runtime.events.mark_design_started(module.node_id, "HAFleet planner started")
+                    log(f"[hafleet]   planner started -> {plan_path}", flush=True)
+                    try:
                         self._run_agent(
                             self.pipeline.role_for("planner", "planner"),
-                            base_prompt
-                            + f"\n\nThe required plan file was not created. Write a concrete plan now to exactly: {plan_path}",
+                            base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
                             module=module,
                             phase="design",
                         )
-                    if not plan_path.is_file() or not plan_path.read_text(
-                        encoding="utf-8", errors="ignore"
-                    ).strip():
-                        raise RuntimeError(f"planner did not create required plan: {plan_path}")
-                except Exception:
-                    self.runtime.events.mark_design_failed(module.node_id, "HAFleet planner failed")
-                    raise
-                self.runtime.events.mark_design_done(module.node_id, "HAFleet plan completed")
-                log(f"[hafleet]   planner finished ({plan_path.stat().st_size} bytes)", flush=True)
+                        if not plan_path.is_file() or not plan_path.read_text(
+                            encoding="utf-8", errors="ignore"
+                        ).strip():
+                            self._run_agent(
+                                self.pipeline.role_for("planner", "planner"),
+                                base_prompt
+                                + f"\n\nThe required plan file was not created. Write a concrete plan now to exactly: {plan_path}",
+                                module=module,
+                                phase="design",
+                            )
+                        if not plan_path.is_file() or not plan_path.read_text(
+                            encoding="utf-8", errors="ignore"
+                        ).strip():
+                            raise RuntimeError(f"planner did not create required plan: {plan_path}")
+                    except Exception:
+                        self.runtime.events.mark_design_failed(module.node_id, "HAFleet planner failed")
+                        raise
+                    self.runtime.events.mark_design_done(module.node_id, "HAFleet plan completed")
+                    log(f"[hafleet]   planner finished ({plan_path.stat().st_size} bytes)", flush=True)
 
                 self._check_pause(module, "implement")
                 self.checkpoint.mark_module_started(module.node_id, "implement")
-                self.runtime.events.mark_implementation_started(module.node_id, "HAFleet implementer started")
-                log(f"[hafleet]   implementer started: {module.node_id}", flush=True)
+                if not planner_enabled:
+                    self.runtime.events.mark_design_started(
+                        module.node_id, "HAFleet implementer planning started"
+                    )
+                self.runtime.events.mark_implementation_started(
+                    module.node_id, "HAFleet implementer started"
+                )
+                log(
+                    f"[hafleet]   implementer started{' (planning + implementation)' if not planner_enabled else ''}: {module.node_id}",
+                    flush=True,
+                )
                 try:
+                    implementer_prompt = base_prompt + (
+                        f"\n\nYou own planning and implementation, as well as test authoring, for this module. First write a concrete implementation plan to exactly: {plan_path}. Then implement the complete requirement subtree, create or update executable tests derived directly from its requirement IDs and scenarios, and run those tests plus focused build checks in the same turn. For web behavior use Playwright when appropriate. Do not delegate planning or testing to another role."
+                        if not planner_enabled
+                        else "\n\nRead the coordinator plan, then implement the complete subtree, create or update requirement-derived executable tests, and run those tests plus focused build checks now."
+                    )
                     self._run_agent(
                         self.pipeline.role_for("implementer", "implementer"),
-                        base_prompt + "\n\nRead the coordinator plan, then implement and verify the complete subtree now.",
+                        implementer_prompt,
                         module=module,
                         phase="implement",
                     )
+                    if not planner_enabled:
+                        self._ensure_plan_artifact(plan_path, module)
+                        self.runtime.events.mark_design_done(
+                            module.node_id, "HAFleet implementer plan completed"
+                        )
                     self._check_pause(module, "review")
                     self.checkpoint.mark_module_started(module.node_id, "review")
                     log(f"[hafleet]   reviewer started: {module.node_id}", flush=True)
@@ -904,18 +1003,24 @@ of changed_files, resolved_findings, remaining_findings, and checks.
 
             self.runtime.events.mark_implementation_done(module.node_id, "Implementation reviewed and repaired")
             checkpoint_message = f"{module.node_id}: implement and review {module.name}"
+            quality_deferred = bool(self.checkpoint.read().get("quality_deferred"))
             committed = self._commit_operation(checkpoint_message, "reviewer", module=module)
             self._message(
                 "checkpoint.created",
                 "orchestrator",
                 module=module,
                 phase="checkpoint",
-                payload={"message": checkpoint_message, "committed": committed},
+                payload={"message": checkpoint_message, "committed": committed, "quality_deferred": quality_deferred},
             )
             log(
                 f"[hafleet]   checkpoint {'created' if committed else 'skipped'}: {checkpoint_message}",
                 flush=True,
             )
+            if quality_deferred:
+                log(
+                    f"[hafleet]   warning: {module.node_id} checkpoint carries deferred quality review",
+                    flush=True,
+                )
             self.checkpoint.mark_module_completed(module.node_id, module.index)
             self.checkpoint.update_pipeline(module.node_id, message_cursor=self.bus.last_sequence)
             completed_ids.append(module.node_id)
@@ -942,10 +1047,12 @@ of changed_files, resolved_findings, remaining_findings, and checks.
                         f"""
                         Perform the final integration review for ARC-Bench task type {self.task_type}.
                         Completed ROOT modules: {module_ids}.
-                        Read {self.architecture_path} and preserve its module boundaries.
-                        Inspect the whole project and report regressions and integration gaps. For web
-                        smoke tests use only port {self.smoke_port}, stop every server afterward, and
-                        never bind the grading port. Do not modify project files.
+                        Read the original requirements from {self.requirements_dir} and read
+                        {self.architecture_path}. Audit the requirements, implementation, and all
+                        executable tests together while preserving module boundaries. Report missing
+                        coverage, weak or misleading tests, regressions, and integration gaps. Do not
+                        execute test commands, start servers, install dependencies, or modify project
+                        files.
                         """
                     ).strip(),
                     final_review=True,
@@ -1004,31 +1111,39 @@ of changed_files, resolved_findings, remaining_findings, and checks.
                     resume_message_id=feedback_id,
                 )
                 return plan_path
-        self._run_agent(
-            self.pipeline.role_for("planner", "planner"),
-            base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
-            module=module,
-            phase="design",
-            workspace_dir=workspace,
-        )
-        if not plan_path.is_file() or not plan_path.read_text(encoding="utf-8", errors="ignore").strip():
+        planner_enabled = self._planner_enabled()
+        if planner_enabled:
             self._run_agent(
                 self.pipeline.role_for("planner", "planner"),
-                base_prompt
-                + f"\n\nThe required plan file was not created. Write a concrete plan now to exactly: {plan_path}",
+                base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
                 module=module,
                 phase="design",
                 workspace_dir=workspace,
             )
-        if not plan_path.is_file() or not plan_path.read_text(encoding="utf-8", errors="ignore").strip():
-            raise RuntimeError(f"planner did not create required plan: {plan_path}")
+            if not plan_path.is_file() or not plan_path.read_text(encoding="utf-8", errors="ignore").strip():
+                self._run_agent(
+                    self.pipeline.role_for("planner", "planner"),
+                    base_prompt
+                    + f"\n\nThe required plan file was not created. Write a concrete plan now to exactly: {plan_path}",
+                    module=module,
+                    phase="design",
+                    workspace_dir=workspace,
+                )
+            if not plan_path.is_file() or not plan_path.read_text(encoding="utf-8", errors="ignore").strip():
+                raise RuntimeError(f"planner did not create required plan: {plan_path}")
         self._run_agent(
             self.pipeline.role_for("implementer", "implementer"),
-            base_prompt + "\n\nRead the coordinator plan, then implement and verify the complete subtree now.",
+            base_prompt + (
+                f"\n\nYou own planning and implementation, as well as test authoring, for this module. First write a concrete implementation plan to exactly: {plan_path}. Then implement the complete requirement subtree, create or update executable tests derived directly from its requirement IDs and scenarios, and run those tests plus focused build checks in the same turn. For web behavior use Playwright when appropriate. Do not delegate planning or testing to another role."
+                if not planner_enabled
+                else "\n\nRead the coordinator plan, then implement the complete subtree, create or update requirement-derived executable tests, and run those tests plus focused build checks now."
+            ),
             module=module,
             phase="implement",
             workspace_dir=workspace,
         )
+        if not planner_enabled:
+            self._ensure_plan_artifact(plan_path, module)
         self._review_loop(module, base_prompt, workspace_dir=workspace)
         return plan_path
 
@@ -1082,10 +1197,15 @@ of changed_files, resolved_findings, remaining_findings, and checks.
                         "path": str(workspace),
                         "branch": branch,
                         "base_commit": module_base,
-                        "phase": "planner",
+                        "phase": "design" if self._planner_enabled() else "implement",
                     },
                 )
-                self.runtime.events.mark_design_started(module.node_id, "HAFleet parallel planner started")
+                self.runtime.events.mark_design_started(
+                    module.node_id,
+                    "HAFleet parallel planner started"
+                    if self._planner_enabled()
+                    else "HAFleet parallel implementer planning started",
+                )
                 self.runtime.events.mark_implementation_started(
                     module.node_id, "HAFleet parallel implementer started"
                 )

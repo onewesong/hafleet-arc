@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -102,6 +103,55 @@ class CodexFleetRetryTests(unittest.TestCase):
 
             self.assertEqual(result.final_response, "done")
             self.assertEqual(codex.starts, 2)
+
+    def test_retries_model_capacity_response_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fleet = CodexFleet(Path(temporary))
+            codex = FakeCodex(
+                [
+                    RuntimeError("Selected model is at capacity. Please try a different model."),
+                    SimpleNamespace(error=None, final_response="done"),
+                ]
+            )
+            fleet._codex = codex
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HAFLEET_MAX_ATTEMPTS": "2",
+                    "HAFLEET_RETRY_DELAYS": "0",
+                    "HAFLEET_TURN_TIMEOUT": "2",
+                },
+                clear=False,
+            ):
+                result = fleet.run("reviewer", "review")
+
+            self.assertEqual(result.final_response, "done")
+            self.assertEqual(codex.starts, 2)
+
+    def test_default_retry_budget_survives_repeated_capacity_errors(self) -> None:
+        """The unattended default allows several provider capacity windows."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fleet = CodexFleet(Path(temporary))
+            codex = FakeCodex(
+                [
+                    RuntimeError("Selected model is at capacity. Please try a different model.")
+                    for _ in range(5)
+                ]
+                + [SimpleNamespace(error=None, final_response="done")]
+            )
+            fleet._codex = codex
+            with mock.patch.dict(
+                "os.environ",
+                {"HAFLEET_RETRY_DELAYS": "0"},
+                clear=False,
+            ):
+                # Ensure an ambient setting cannot mask the documented default.
+                os.environ.pop("HAFLEET_MAX_ATTEMPTS", None)
+                result = fleet.run("implementer", "implement")
+
+            self.assertEqual(result.final_response, "done")
+            self.assertEqual(codex.starts, 6)
 
     def test_does_not_retry_non_transient_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

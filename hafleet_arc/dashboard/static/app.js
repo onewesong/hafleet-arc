@@ -10,7 +10,12 @@ function characterSvg(role, status) { return `<img class="character-art ${status
 
 function renderRoom(data) {
   const characters = data.characters || [];
-  document.querySelector("#room").innerHTML = roles.map((role) => {
+  const planner = characters.find((character) => character.id === "planner");
+  const tester = characters.find((character) => character.id === "tester");
+  const hasLegacyPlanner = Boolean(planner && (planner.session_id || (planner.tasks || []).length));
+  const hasConfiguredTester = Boolean(tester && (tester.session_id || (tester.tasks || []).length));
+  const visibleRoles = roles.filter((role) => (role !== "planner" || hasLegacyPlanner) && (role !== "tester" || hasConfiguredTester));
+  document.querySelector("#room").innerHTML = visibleRoles.map((role) => {
     const item = characters.find((character) => character.id === role) || { id: role, label: labels[role], status: "idle", message: "Waiting for work" };
     return `<button class="workstation ${esc(item.status)}" data-character="${role}" aria-label="Open ${labels[role]} details"><div class="bubble">${esc(item.message || statusText(item.status))}</div><div class="monitor"><span>${icons[role]}</span><small>${esc(item.phase || "idle")}</small></div><div class="worker">${characterSvg(role, item.status)}<div class="worker-tag"><strong>${labels[role]}</strong><span>${esc(statusText(item.status))}</span></div></div><div class="task-cards">${(item.tasks || []).map((task) => `<span class="task-card" data-task-module="${esc(task.node_id)}">${esc(task.node_id)}</span>`).join("") || (item.module_id ? `<span class="task-card">${esc(item.module_id)}</span>` : "")}</div></button>`;
   }).join("");
@@ -23,7 +28,10 @@ function renderRoom(data) {
 
 function renderPipeline(data) {
   const active = (data.modules || []).find((item) => item.status === "running")?.phase || (data.runner?.state === "completed" ? "completed" : "architecture");
-  document.querySelector("#pipeline").innerHTML = stages.map((stage) => `<div class="pipeline-stage ${stage === active ? "active" : ""}"><span>${stage}</span></div>`).join("");
+  const tester = (data.characters || []).find((character) => character.id === "tester");
+  const hasConfiguredTester = Boolean(tester && (tester.session_id || (tester.tasks || []).length));
+  const visibleStages = stages.filter((stage) => stage !== "test" || hasConfiguredTester);
+  document.querySelector("#pipeline").innerHTML = visibleStages.map((stage) => `<div class="pipeline-stage ${stage === active ? "active" : ""}"><span>${stage}</span></div>`).join("");
 }
 
 function renderModules(data) {

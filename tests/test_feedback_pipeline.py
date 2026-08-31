@@ -42,6 +42,16 @@ class FeedbackPipelineTests(unittest.TestCase):
             self.assertEqual(role_only.loop().max_rounds, 3)
             self.assertEqual(role_only.prompt_for("reviewer"), "Custom review prompt")
 
+    def test_default_pipeline_folds_planning_into_implementer(self) -> None:
+        pipeline = load_pipeline(Path("/tmp/nonexistent-hafleet-output"))
+        self.assertIsNone(pipeline.node("planner"))
+        self.assertIsNone(pipeline.node("tester"))
+        self.assertIsNone(pipeline.node("final_test"))
+        self.assertIn("planning and implementation", pipeline.prompt_for("implementer"))
+        self.assertIn("test authoring", pipeline.prompt_for("implementer"))
+        self.assertIn("test cases", pipeline.prompt_for("reviewer"))
+        self.assertIn("Do not execute test commands", pipeline.prompt_for("reviewer"))
+
 
 if __name__ == "__main__":
     unittest.main()

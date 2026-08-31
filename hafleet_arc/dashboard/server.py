@@ -569,14 +569,18 @@ class DashboardCollector:
             node_id = str(module.get("node_id") or "")
             phases = history.get(node_id, {})
             if "design" in phases:
-                tasks["planner"].append(dict(phases["design"]))
+                design_task = dict(phases["design"])
+                # The built-in pipeline has no standalone Planner. Its design
+                # event is emitted by Implementer while planning and coding in
+                # one turn; retain planner task cards only for legacy runs.
+                if "implementer planning" in str(design_task.get("message") or "").lower():
+                    design_task["phase"] = "implement"
+                    tasks["implementer"].append(design_task)
+                else:
+                    tasks["planner"].append(design_task)
             if "implement" in phases:
                 tasks["implementer"].append(dict(phases["implement"]))
                 if phases["implement"].get("status") == "completed":
-                    tester_task = dict(phases["implement"])
-                    tester_task["phase"] = "test"
-                    tester_task["message"] = "Tester generated and executed tests"
-                    tasks["tester"].append(tester_task)
                     reviewer_task = dict(phases["implement"])
                     reviewer_task["phase"] = "review"
                     reviewer_task["message"] = "Reviewer completed"

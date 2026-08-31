@@ -44,6 +44,8 @@ class CheckpointStore:
             "last_test_hash": "",
             "test_results": [],
             "tester_write_violation": False,
+            "quality_deferred": False,
+            "quality_exhaustion_reason": "",
         }
         if not self.path.is_file():
             return default
@@ -78,6 +80,8 @@ class CheckpointStore:
         payload.setdefault("last_test_hash", "")
         payload.setdefault("test_results", [])
         payload.setdefault("tester_write_violation", False)
+        payload.setdefault("quality_deferred", False)
+        payload.setdefault("quality_exhaustion_reason", "")
         return payload
 
     def write(self, payload: dict[str, Any]) -> None:
@@ -89,7 +93,7 @@ class CheckpointStore:
 
     def mark_module_started(self, module_id: str, phase: str) -> dict[str, Any]:
         payload = self.read()
-        payload.update({"paused": False, "current_node_id": module_id, "current_phase": phase, "current_pipeline_node": phase, "current_round": 0, "loop_status": ""})
+        payload.update({"paused": False, "current_node_id": module_id, "current_phase": phase, "current_pipeline_node": phase, "current_round": 0, "loop_status": "", "quality_deferred": False, "quality_exhaustion_reason": ""})
         self.write(payload)
         return payload
 
