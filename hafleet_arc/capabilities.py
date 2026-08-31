@@ -120,6 +120,10 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
         if not req_id:
             req_id = parent_id or "REQUIREMENT"
         title = _text(node.get("name") or node.get("title")) or req_id
+        dependencies = node.get("dependencies") or node.get("depends_on") or []
+        if isinstance(dependencies, str):
+            dependencies = [dependencies]
+        dependencies = [_text(item, 120) for item in dependencies if _text(item, 120)][:16] if isinstance(dependencies, list) else []
         description = next((_text(node.get(key)) for key in _TEXT_KEYS if _text(node.get(key))), "")
         criteria: list[str] = []
         for key in _CRITERIA_KEYS:
@@ -133,6 +137,8 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
             {
                 "id": req_id,
                 "title": title,
+                "type": _text(node.get("type")) or "requirement",
+                "dependencies": dependencies,
                 "description": description,
                 "references": _references(node.get("description"), node.get("text"), node.get("acceptance")),
                 "observable_strings": _observable_strings(

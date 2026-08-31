@@ -11,12 +11,14 @@ class CapabilityModelTests(unittest.TestCase):
             {
                 "id": "REQ-2",
                 "name": "Search",
+                "dependencies": ["REQ-1"],
                 "acceptance_criteria": ["empty query is rejected; show 'Please enter a query.'"],
                 "scenarios": [{"id": "SC-1", "name": "valid search", "description": "See ![screen](./reference/search.png)", "steps": [{"keyword": "GIVEN", "content": "the form is visible"}, {"keyword": "THEN", "content": "results are shown"}]}],
                 "children": [{"id": "REQ-2.1", "description": "Persist recent searches", "scenarios": []}],
             }
         )
         self.assertEqual([item["id"] for item in model["requirements"]], ["REQ-2", "REQ-2.1"])
+        self.assertEqual(model["requirements"][0]["dependencies"], ["REQ-1"])
         self.assertEqual(model["requirements"][0]["scenarios"][0]["id"], "SC-1")
         scenario = model["requirements"][0]["scenarios"][0]
         self.assertEqual(scenario["steps"][0]["action"], "the form is visible")
