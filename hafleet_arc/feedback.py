@@ -199,5 +199,33 @@ def test_passes(result: dict[str, Any]) -> bool:
 
 
 def test_hash(result: dict[str, Any]) -> str:
-    payload = {key: result.get(key) for key in ("verdict", "tests", "findings", "checks")}
+    # Command output commonly contains durations, temporary paths, download progress,
+    # and other nondeterministic text. No-progress detection must compare semantic
+    # outcomes rather than those volatile diagnostics.
+    payload = {
+        "verdict": result.get("verdict"),
+        "tests": [
+            {
+                "id": item.get("id"),
+                "status": item.get("status"),
+                "requirement_ids": item.get("requirement_ids", []),
+            }
+            for item in (result.get("tests") or [])
+            if isinstance(item, dict)
+        ],
+        "findings": [
+            {
+                "id": item.get("id"),
+                "severity": item.get("severity"),
+                "title": item.get("title"),
+            }
+            for item in (result.get("findings") or [])
+            if isinstance(item, dict)
+        ],
+        "checks": [
+            {"name": item.get("name"), "status": item.get("status")}
+            for item in (result.get("checks") or [])
+            if isinstance(item, dict)
+        ],
+    }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()

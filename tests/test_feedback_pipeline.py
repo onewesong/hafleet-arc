@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hafleet_arc.feedback import blocking_findings, parse_review, review_hash, review_passes, test_passes
+from hafleet_arc.feedback import blocking_findings, parse_review, review_hash, review_passes, test_hash, test_passes
 from hafleet_arc.pipeline import DEFAULT_PIPELINE_PATH, load_pipeline
 
 
@@ -32,6 +32,11 @@ class FeedbackPipelineTests(unittest.TestCase):
             "tests": [],
             "checks": [{"name": "optional compatibility probe", "status": "skipped", "output": "not implemented"}],
         }))
+
+    def test_test_hash_ignores_volatile_command_output(self) -> None:
+        left = {"verdict": "changes_requested", "tests": [], "findings": [], "checks": [{"name": "browser", "status": "failed", "output": "duration 1.2s"}]}
+        right = {"verdict": "changes_requested", "tests": [], "findings": [], "checks": [{"name": "browser", "status": "failed", "output": "duration 9.8s"}]}
+        self.assertEqual(test_hash(left), test_hash(right))
 
     def test_default_and_custom_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
