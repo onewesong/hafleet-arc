@@ -11,7 +11,7 @@ class CapabilityModelTests(unittest.TestCase):
             {
                 "id": "REQ-2",
                 "name": "Search",
-                "acceptance_criteria": ["empty query is rejected"],
+                "acceptance_criteria": ["empty query is rejected; show 'Please enter a query.'"],
                 "scenarios": [{"id": "SC-1", "name": "valid search", "description": "See ![screen](./reference/search.png)", "steps": [{"keyword": "GIVEN", "content": "the form is visible"}, {"keyword": "THEN", "content": "results are shown"}]}],
                 "children": [{"id": "REQ-2.1", "description": "Persist recent searches", "scenarios": []}],
             }
@@ -23,6 +23,7 @@ class CapabilityModelTests(unittest.TestCase):
         self.assertEqual(scenario["steps"][1]["expected"], "results are shown")
         self.assertEqual(scenario["references"], ["./reference/search.png"])
         self.assertIn("empty query", model["requirements"][0]["acceptance"][0])
+        self.assertIn("Please enter a query.", model["requirements"][0]["observable_strings"])
         contract = model["requirements"][0]["observable_contract"]
         self.assertIn("success", contract)
         self.assertIn("navigation_and_refresh", contract)

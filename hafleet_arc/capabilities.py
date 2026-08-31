@@ -56,6 +56,26 @@ def _references(*values: Any, limit: int = 8) -> list[str]:
     return found
 
 
+def _observable_strings(*values: Any, limit: int = 24) -> list[str]:
+    """Extract author-provided UI/API literals without consulting evaluator data.
+
+    Requirement prose frequently embeds exact labels and error messages in quotes.
+    Keeping those literals separately prevents a bounded description field from
+    dropping the contract an implementer must expose, while remaining domain-neutral.
+    """
+    found: list[str] = []
+    pattern = re.compile(r"[\"“”']([^\"“”']{2,120})[\"“”']")
+    for value in values:
+        text = value if isinstance(value, str) else ""
+        for match in pattern.findall(text):
+            literal = " ".join(match.split()).strip()
+            if literal and literal not in found and not literal.startswith(("./", "/")):
+                found.append(literal)
+            if len(found) >= limit:
+                return found
+    return found
+
+
 def _scenario(scenario: dict[str, Any], fallback_id: str, index: int) -> dict[str, Any]:
     scenario_id = _text(scenario.get("id") or scenario.get("scenario_id")) or f"{fallback_id}-S{index:03d}"
     name = _text(scenario.get("name") or scenario.get("title")) or scenario_id
@@ -115,6 +135,12 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 80) 
                 "title": title,
                 "description": description,
                 "references": _references(node.get("description"), node.get("text"), node.get("acceptance")),
+                "observable_strings": _observable_strings(
+                    node.get("description"), node.get("text"), node.get("acceptance"),
+                    *criteria,
+                    *[step.get("action", "") for scenario in scenarios for step in scenario.get("steps", [])],
+                    *[step.get("expected", "") for scenario in scenarios for step in scenario.get("steps", [])],
+                ),
                 "acceptance": criteria[:12],
                 "scenarios": scenarios[:12],
                 "observable_contract": {
