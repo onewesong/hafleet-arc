@@ -79,6 +79,37 @@ def _restore_file_snapshot(root: Path, snapshot: dict[str, bytes]) -> None:
                 pass
 
 
+def _snapshot_changes(before: dict[str, bytes], after: dict[str, bytes], *, limit: int = 200) -> list[str]:
+    """Return a compact, deterministic change manifest between review passes."""
+
+    all_paths = sorted(set(before) | set(after))
+    changed: list[str] = []
+    for relative in all_paths:
+        if relative not in before:
+            changed.append(f"A {relative}")
+        elif relative not in after:
+            changed.append(f"D {relative}")
+        elif before[relative] != after[relative]:
+            changed.append(f"M {relative}")
+        if len(changed) >= max(int(limit), 1):
+            total = sum(1 for path in all_paths if before.get(path) != after.get(path))
+            if total > len(changed):
+                changed.append(f"... {total - len(changed)} additional changed files")
+            break
+    return changed
+
+
+def _review_context(review: dict[str, Any]) -> dict[str, Any]:
+    """Keep prior review context structured without duplicating the raw response."""
+
+    return {
+        "verdict": review.get("verdict"),
+        "summary": review.get("summary", ""),
+        "findings": review.get("findings", []),
+        "checks": review.get("checks", []),
+    }
+
+
 class FleetDriver(Protocol):
     def run(self, role: str, prompt: str, workspace_dir: Path | None = None) -> object: ...
 
@@ -732,9 +763,12 @@ implementation source files. Return the required structured Tester JSON response
         loop = self.pipeline.loop("final_review" if final_review else "quality_loop")
         reviewer_role = loop.review or "reviewer"
         repair_role = loop.repair or "implementer"
+        review_strategy = str(loop.options.get("review_strategy") or "full_then_incremental").strip().lower()
         max_rounds = _quality_round_budget(loop.max_rounds)
         previous_hash = ""
         previous_fingerprint: tuple[tuple[str, str], ...] | None = None
+        previous_review_feedback: dict[str, Any] | None = None
+        review_baseline_snapshot: dict[str, bytes] | None = None
         feedback: dict[str, Any] = {}
         parent_id = ""
         first_round = 1
@@ -748,10 +782,11 @@ implementation source files. Return the required structured Tester JSON response
                 self._defer_quality(module, "review", f"review loop exceeded {max_rounds} rounds")
                 return resume_feedback
             repair_round = resume_round
+            repair_baseline = _file_snapshot(workspace_dir or self.output_dir)
             repair_prompt = base_prompt + f"""
 
 Repair loop round {repair_round}. This is a resumed pipeline node. Reviewer feedback is authoritative:
-{json.dumps(resume_feedback, ensure_ascii=False, indent=2)}
+{json.dumps(_review_context(resume_feedback), ensure_ascii=False, indent=2)}
 
 You are the implementation agent. Modify only the current module/workspace, resolve
 all blocker and major findings, add or update executable tests that cover the repaired
@@ -786,6 +821,8 @@ source text assertions. Re-run the relevant test and include its command and res
             )
             previous_hash = review_hash(resume_feedback)
             previous_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
+            previous_review_feedback = resume_feedback
+            review_baseline_snapshot = repair_baseline
             parent_id = resume_message_id
             first_round = repair_round + 1
         for round_number in range(first_round, max_rounds + 1):
@@ -892,6 +929,58 @@ is actionable and report changed_files; do not return only an explanation.
             review_workspace = workspace_dir or self.output_dir
             before_files = _file_snapshot(review_workspace)
             before = _content_fingerprint(review_workspace)
+            review_scope = (
+                "incremental"
+                if review_strategy == "full_then_incremental" and previous_review_feedback is not None
+                else "full"
+            )
+            changed_since_review = (
+                _snapshot_changes(review_baseline_snapshot, before_files)
+                if review_baseline_snapshot is not None
+                else []
+            )
+            if review_scope == "incremental" and not changed_since_review:
+                self.checkpoint.update_pipeline(
+                    module.node_id if module else "ROOT",
+                    loop_status="blocked",
+                    review_findings=previous_review_feedback.get("findings", []),
+                )
+                self._defer_quality(
+                    module,
+                    "review",
+                    "implementer repair produced no project file changes",
+                )
+                return previous_review_feedback
+            if review_scope == "full":
+                scope_instructions = """
+This is the first Reviewer pass for this quality loop. Perform one complete baseline
+audit of the supplied requirement subtree, implementation, executable tests, public
+contracts, and current deterministic result. Establish stable finding IDs that later
+passes can verify incrementally.
+"""
+            else:
+                scope_instructions = f"""
+This is an incremental verification pass. Do not restart the whole-project audit and
+do not repeat already-established observations. Re-check every previously blocking
+finding against the current files, inspect the files changed since the preceding
+Reviewer pass, and inspect only directly affected dependencies, public contracts, and
+tests. Omit resolved findings from the returned findings list; retain stable IDs for
+anything still unresolved. Add a new blocker/major finding only when the repair caused
+a concrete regression or the changed surface exposes a requirement violation. Expand
+back to a full audit only if the change manifest is unexpectedly broad or crosses a
+high-risk shared boundary such as authentication, persistence, routing, concurrency,
+or a public API contract.
+
+Previous Reviewer feedback:
+```json
+{json.dumps(_review_context(previous_review_feedback), ensure_ascii=False, indent=2)}
+```
+
+Files changed since that Reviewer pass:
+```text
+{chr(10).join(changed_since_review) if changed_since_review else "(no project file changes detected)"}
+```
+"""
             review_prompt = base_prompt + f"""
 
 Review loop round {round_number}/{max_rounds}. You are read-only. Audit the original
@@ -903,6 +992,8 @@ and source-string-only checks, and verify that the reported results are consiste
 the test files. Return ONLY a JSON review object followed by a short summary.
 Use verdict=pass only when all blocker/major findings are resolved and required checks pass.
 Do not edit project files or Git state.
+
+{scope_instructions.strip()}
 
 The Orchestrator executed this structured test result in the current round immediately
 before review. It is authoritative for current pass/fail status:
@@ -942,6 +1033,8 @@ exists from an earlier resumed attempt.
             feedback = parse_review(response) if response.strip() else {
                 "verdict": "pass", "summary": "Reviewer completed without structured findings.", "findings": [], "checks": [], "raw": ""
             }
+            feedback["review_scope"] = review_scope
+            feedback["changed_files"] = changed_since_review
             current_hash = review_hash(feedback)
             feedback_message = self._message(
                 "review.feedback",
@@ -960,7 +1053,7 @@ exists from an earlier resumed attempt.
                 module=module,
                 phase="review",
                 round_number=round_number,
-                payload={"verdict": feedback["verdict"], "blocking_findings": blocking_findings(feedback), "passed": review_passes(feedback)},
+                payload={"verdict": feedback["verdict"], "blocking_findings": blocking_findings(feedback), "passed": review_passes(feedback), "review_scope": review_scope},
                 parent_id=parent_id,
             )
             if review_passes(feedback):
@@ -989,7 +1082,7 @@ exists from an earlier resumed attempt.
             repair_prompt = base_prompt + f"""
 
 Repair loop round {round_number}. Reviewer feedback is authoritative:
-{json.dumps(feedback, ensure_ascii=False, indent=2)}
+{json.dumps(_review_context(feedback), ensure_ascii=False, indent=2)}
 
 You are the implementation agent. Modify only the current module/workspace, resolve
 all blocker and major findings, add or update executable regression tests derived from
@@ -1002,6 +1095,8 @@ real browser DOM interactions, with behavior assertions that can fail for a brok
 implementation. Never satisfy a test-quality finding by adding more source scans or
 weakening the assertion. Re-run the focused tests and report the command/result.
 """
+            previous_review_feedback = feedback
+            review_baseline_snapshot = before_files
             repair_result = self._run_agent(
                 repair_role,
                 repair_prompt.strip(),
@@ -1168,8 +1263,13 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 collect_index(child)
         collect_index(self.requirement_tree or {})
         global_index_text = "\n".join(global_index) or "(unavailable)"
-        root_contracts = build_capability_model(self.requirement_tree or {}).get("seed_contracts", [])
+        root_capabilities = build_capability_model(self.requirement_tree or {})
+        root_contracts = root_capabilities.get("seed_contracts", [])
+        gateway_contracts = root_capabilities.get("gateway_contracts", [])
+        state_interference_contract = root_capabilities.get("state_interference_contract", {})
         root_contracts_text = json.dumps(root_contracts, ensure_ascii=False, indent=2)
+        gateway_contracts_text = json.dumps(gateway_contracts, ensure_ascii=False, indent=2)
+        state_interference_text = json.dumps(state_interference_contract, ensure_ascii=False, indent=2)
         workspace_note = ""
         if workspace_dir is not None:
             workspace_note = textwrap.dedent(
@@ -1194,6 +1294,19 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             needed by this module and use the configured runtime date/environment):
             ```json
             {root_contracts_text}
+            ```
+            Whole-project high-fan-out gateway contracts inferred only from repeated
+            public requirement preconditions. Treat these as prerequisite release
+            gates for this module; do not diagnose dependent behavior until its gate
+            has a passing observable check:
+            ```json
+            {gateway_contracts_text}
+            ```
+            Whole-project shared-state interference gate inferred only from public
+            state-changing requirements. When non-empty, implement and run its
+            multi-client and repeatability checks before declaring related flows done:
+            ```json
+            {state_interference_text}
             ```
             Coordinator plan path: {plan_path}
             Global architecture document: {self.architecture_path}
@@ -1479,9 +1592,17 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             "false",
             "no",
         }
-        if modules and not bool(self.checkpoint.read().get("final_review_completed")):
+        force_final_review = os.environ.get("HAFLEET_FORCE_FINAL_REVIEW", "0").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if modules and (force_final_review or not bool(self.checkpoint.read().get("final_review_completed"))):
+            if force_final_review and bool(self.checkpoint.read().get("final_review_completed")):
+                log("[hafleet] Forced final integration quality pass requested", flush=True)
             self._check_pause(None, "final-review")
             module_ids = ", ".join(item.node_id for item in modules)
+            root_capabilities = build_capability_model(self.requirement_tree or {})
+            gateway_contracts = root_capabilities.get("gateway_contracts", [])
+            state_interference_contract = root_capabilities.get("state_interference_contract", {})
             # Give the implementation agent one explicit, whole-project integration
             # pass before the read-only final audit.  Module turns are intentionally
             # scoped, but cross-module navigation/authentication/persistence bugs are
@@ -1516,20 +1637,70 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     the architecture document {self.architecture_path}, and the current
                     workspace. Do not access, search for, or infer hidden/evaluator tests.
 
+                    High-fan-out gateway contracts derived only from repeated GIVEN
+                    preconditions in the public requirements:
+                    ```json
+                    {json.dumps(gateway_contracts, ensure_ascii=False, indent=2)}
+                    ```
+
+                    Shared-state interference gate derived only from public mutable
+                    requirements:
+                    ```json
+                    {json.dumps(state_interference_contract, ensure_ascii=False, indent=2)}
+                    ```
+
                     Audit and improve the running product across module boundaries. Exercise
-                    public behavior with focused smoke checks where useful, but do not start a
-                    long-lived server. Prioritize concrete requirement-derived gaps in:
+                    public behavior with focused smoke checks, but do not start a long-lived
+                    server. First create or update a compact project-owned gateway smoke suite.
+                    For every gateway above, establish it from clean isolated state through the
+                    public UI/API, assert the exact visible state and canonical URL, then reload
+                    or use a second isolated context. Run these gates before downstream checks;
+                    if a gate fails, repair it before interpreting dependent failures. Prioritize
+                    concrete requirement-derived gaps in:
                     - navigation and direct URL/deep-link refresh between every user flow;
                     - authentication/session/logout transitions and authorization guards;
+                    - semantic public controls: correct link/button roles, stable accessible
+                      names, labels, dialogs, tables, alerts, and keyboard behavior;
                     - API/UI state parity, validation/conflict/error/empty states;
+                    - collection projection atomicity: filters, sorts, date switches and
+                      navigation presets must synchronously hide stale rows, then make the
+                      visible items/count/empty state and canonical URL describe the same
+                      query; verify every visible item and composed filters, not one match;
+                    - composite or multi-segment results: semantic item/card boundaries,
+                      visibly labeled segments, connection wait, total duration, price,
+                      action, deterministic order, and bounded result count;
                     - deterministic app-owned seed/bootstrap records described by requirements;
                     - durable persistence across refresh and process restart;
                     - end-to-end handoffs such as search -> booking -> order -> payment and
                       profile/passenger updates, when those concepts exist in the requirements.
 
+                    For every authentication/session gateway, the project-owned suite must use
+                    at least two isolated browser contexts or API clients. Log both clients into
+                    the same account concurrently when the public requirements permit it and prove
+                    the second login does not invalidate the first. Both clients must retain visible
+                    authenticated identity, protected navigation, and refresh recovery; logout must
+                    affect only its own session unless the public requirements explicitly demand a
+                    global or single-session policy. Repair shared-token, destructive session
+                    replacement, or lost-update persistence designs instead of serializing the test.
+
+                    For every public state-changing flow listed by the interference gate,
+                    run at least two isolated clients against the same service. Exercise a
+                    mutation while another client remains active, then verify owner scoping,
+                    unaffected sessions and unrelated records, dependent collection views,
+                    and refresh reconstruction. Include credential/profile changes and
+                    destructive collection/order/inventory transitions when present in the
+                    requirements. Repeat the project-owned stateful suite from deterministic
+                    reset persistence and repair stale read-modify-write persistence, fixture
+                    consumption, and cross-client contamination rather than forcing serial
+                    execution or adding evaluator-only behavior.
+
                     Preserve all already-implemented behavior and module boundaries. Make real
                     source changes (not static text), update or add requirement-derived tests,
-                    and run the available build/focused checks. Do not tailor selectors or
+                    run the available build/focused checks, then repeat the gateway smoke suite
+                    once against freshly reset persistence to prove it is deterministic. Register
+                    the integration/gateway command in .arc/hafleet/verification.json with
+                    module_id `ROOT`, an argv-array command, and the correct server_mode so the
+                    Orchestrator independently reruns it before final review. Do not tailor selectors or
                     behavior to undocumented tests. Return a concise structured summary of
                     changed_files, requirement_ids, checks, and unresolved risks.
                     """
@@ -1552,7 +1723,23 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                         executable tests together while preserving module boundaries. Report missing
                         coverage, weak or misleading tests, regressions, and integration gaps. Do not
                         execute test commands, start servers, install dependencies, or modify project
-                        files.
+                        files. Treat authentication/session handling as a high-fan-out release gate:
+                        require project-owned executable evidence that two isolated clients can keep
+                        concurrent sessions for the same account unless the public requirements demand
+                        single-session behavior, and that refresh, protected navigation, and per-session
+                        logout remain correct. Missing evidence or destructive token replacement is a
+                        major finding because it invalidates dependent workflows. Also treat
+                        public mutable-state interference as a release gate: require tests with
+                        two isolated clients against one service, actor-scoped data, unaffected
+                        active sessions, refresh-visible mutation results, atomic persistence,
+                        and a second clean invocation of destructive scenarios. Serial-only
+                        evidence or tests that consume shared seed fixtures are major gaps. Also treat
+                        collection projection as a release gate: reject a filter/sort/date or
+                        navigation transition if the canonical URL can change while stale prior
+                        rows remain visible, or if tests do not inspect every visible item, count,
+                        empty state, composed query, and refresh result. Composite results must
+                        expose semantic item boundaries and visibly labeled segment/wait/total
+                        duration/price/action data with deterministic ordering and limits.
                         """
                     ).strip(),
                     final_review=True,

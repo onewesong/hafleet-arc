@@ -100,8 +100,10 @@ conflicted worktrees remain under `.arc/hafleet/worktrees/`.
 
 The built-in pipeline is maintained in `hafleet_arc/pipeline.yaml` and can be
 overridden per output workspace with `.arc/hafleet/pipeline.yaml`. It uses versioned `agent`, `loop`, and `operation`
-nodes; the loop's `review`, `repair`, `until`, and `max_rounds` fields control the
-review/repair policy. Role prompts are maintained in the same YAML under
+nodes; the loop's `review`, `repair`, `until`, `max_rounds`, and `review_strategy`
+fields control the review/repair policy. The default `full_then_incremental` strategy
+performs one baseline audit and scopes later passes to unresolved findings and changed
+files; `full_each_round` remains available for custom pipelines. Role prompts are maintained in the same YAML under
 `roles.<role>`. A run-local
 configuration may override only one prompt while inheriting the other built-in
 role prompts. Omit the file to use the default Architect → Implementer →
@@ -207,12 +209,25 @@ The `reviewer` checks the original requirements, implementation, and Implementer
 test cases in a read-only Codex sandbox. It does not run tests, start servers, or
 install dependencies; it evaluates the reported test results and test quality
 statically, then returns a structured JSON verdict. It never edits source files or
-Git state. Findings use `blocker`, `major`,
+Git state. The first Reviewer pass performs the complete requirement/implementation/
+test audit and establishes stable finding IDs. Later passes are incremental: they
+verify the previous blocking findings, the Implementer's changed-file manifest, and
+only directly affected contracts. A later pass expands back to a full audit only for
+broad changes or shared authentication, persistence, routing, concurrency, or API
+boundaries. Findings use `blocker`, `major`,
 `minor`, or `info` severity. Blocker/major findings are appended to the message
 bus and routed to the `implementer`, which repairs the current module. The reviewer
-runs again until the module passes or the bounded loop pauses (three rounds by
-default). Minor/info findings remain visible in the Dashboard but do not block a
+runs again until the module passes or the bounded loop is exhausted. The YAML default
+is three rounds and unattended runs receive a bounded two-round adaptive extension.
+Minor/info findings remain visible in the Dashboard but do not block a
 checkpoint.
+
+For public requirements that mutate credentials, profiles, collections, inventory,
+or orders, the capability model adds a shared-state interference release gate. The
+Implementer must run project-owned tests with at least two isolated clients against
+one service, verify actor/session isolation and atomic persistence, and repeat
+destructive scenarios from reset state. These checks are derived only from public
+requirements and never expose evaluator tests.
 
 When the module passes review, the orchestrator:
 
@@ -279,6 +294,8 @@ foreign listener on a shared runner.
 | `HAFLEET_NPM_TIMEOUT` | `600` | Timeout for each postflight npm command |
 | `HAFLEET_READY_TIMEOUT` | `45` | Backend readiness timeout during rehearsal |
 | `HAFLEET_FINAL_REVIEW` | `1` | Enable the whole-project reviewer pass |
+| `HAFLEET_FINAL_INTEGRATION` | `1` | Enable the whole-project Implementer hardening pass for substantive requirement trees |
+| `HAFLEET_FORCE_FINAL_REVIEW` | `0` | Re-run integration hardening and final review for an already completed output directory |
 | `HAFLEET_POSTFLIGHT` | `1` | Enable the mandatory delivery rehearsal |
 | `HAFLEET_PARALLEL` | `0` | Enable independent ROOT module worktrees |
 | `HAFLEET_MAX_WORKERS` | `2` | Maximum concurrent parallel module worktrees |

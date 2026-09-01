@@ -147,6 +147,9 @@ def _parse(payload: dict[str, Any]) -> Pipeline:
             mode = str(raw.get("mode") or "module").strip().lower()
             if mode not in {"module", "integration"}:
                 raise ValueError(f"unsupported loop mode: {mode!r}")
+            review_strategy = str(raw.get("review_strategy") or "full_then_incremental").strip().lower()
+            if review_strategy not in {"full_then_incremental", "full_each_round"}:
+                raise ValueError(f"unsupported review strategy: {review_strategy!r}")
         seen.add(node_id)
         max_rounds = max(int(raw.get("max_rounds", 3) or 3), 1)
         nodes.append(

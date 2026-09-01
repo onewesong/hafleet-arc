@@ -8,6 +8,7 @@ domains while giving the implementer a compact, traceable execution contract.
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from typing import Any, Iterable
 
 
@@ -116,6 +117,133 @@ def _scenario(scenario: dict[str, Any], fallback_id: str, index: int) -> dict[st
     }
 
 
+def _gateway_key(value: str) -> str:
+    """Normalize a public GIVEN precondition for cross-scenario grouping.
+
+    Requirement authors often repeat the same prerequisite with only case,
+    whitespace, or terminal-punctuation differences.  Keep the original public
+    wording for agents, but use this conservative key to discover fan-out without
+    inventing domain semantics or consulting evaluator tests.
+    """
+
+    normalized = " ".join(str(value or "").casefold().split()).strip()
+    return normalized.rstrip(". ;:")
+
+
+def _gateway_contracts(requirements: list[dict[str, Any]], limit: int = 32) -> list[dict[str, Any]]:
+    consumers: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"precondition": "", "scenario_ids": [], "requirement_ids": []}
+    )
+    for requirement in requirements:
+        requirement_id = str(requirement.get("id") or "")
+        for scenario in requirement.get("scenarios", []):
+            scenario_id = str(scenario.get("id") or "")
+            transition = scenario.get("transition") if isinstance(scenario, dict) else {}
+            preconditions = transition.get("preconditions", []) if isinstance(transition, dict) else []
+            seen_in_scenario: set[str] = set()
+            for raw in preconditions if isinstance(preconditions, list) else []:
+                wording = " ".join(str(raw or "").split()).strip()
+                key = _gateway_key(wording)
+                if not key or key in seen_in_scenario:
+                    continue
+                seen_in_scenario.add(key)
+                entry = consumers[key]
+                entry["precondition"] = entry["precondition"] or wording
+                if scenario_id and scenario_id not in entry["scenario_ids"]:
+                    entry["scenario_ids"].append(scenario_id)
+                if requirement_id and requirement_id not in entry["requirement_ids"]:
+                    entry["requirement_ids"].append(requirement_id)
+
+    result = []
+    for entry in consumers.values():
+        count = len(entry["scenario_ids"])
+        if count < 2:
+            continue
+        result.append(
+            {
+                **entry,
+                "consumer_count": count,
+                "release_gate": True,
+                "verification_contract": [
+                    "Establish this prerequisite through the public UI/API from a clean isolated state.",
+                    "Assert its visible state and canonical URL before running dependent scenarios.",
+                    "Reload or open a second isolated context and prove the prerequisite can be reconstructed.",
+                    "When the prerequisite establishes authentication or another client session, prove two isolated clients can hold it concurrently unless the public requirement explicitly requires single-session behavior.",
+                    "If this gate fails, repair it before interpreting downstream failures.",
+                ],
+            }
+        )
+    result.sort(key=lambda item: (-int(item["consumer_count"]), str(item["precondition"]).casefold()))
+    return result[:limit]
+
+
+def _state_interference_contract(requirements: list[dict[str, Any]], limit: int = 80) -> dict[str, Any]:
+    """Derive a bounded concurrency contract from public state-changing scenarios.
+
+    The classification is intentionally coarse and domain-neutral. It tells agents
+    which supplied requirements can interfere when exercised against one service,
+    without inventing evaluator fixtures, selectors, or product-specific behavior.
+    """
+
+    mutation = re.compile(
+        r"\b(add|create|register|save|update|change|edit|modify|delete|remove|cancel|refund|pay|book|reserve|confirm|reset)\b",
+        re.IGNORECASE,
+    )
+    credential = re.compile(r"\b(password|credential|e-?mail|mailbox|mobile|phone|security|login|account)\b", re.IGNORECASE)
+    destructive = re.compile(r"\b(delete|remove|cancel|refund|reset|revoke)\b", re.IGNORECASE)
+    mutable_requirement_ids: list[str] = []
+    credential_requirement_ids: list[str] = []
+    destructive_requirement_ids: list[str] = []
+    scenario_ids: list[str] = []
+
+    for requirement in requirements:
+        requirement_id = str(requirement.get("id") or "")
+        # Titles and explicit WHEN/action text are strong signals. Descriptions,
+        # acceptance prose, and THEN results often mention related operations only
+        # as navigation context, which would over-classify broad parent sections.
+        requirement_text = str(requirement.get("title") or "")
+        matched = bool(mutation.search(requirement_text))
+        credential_matched = bool(credential.search(requirement_text) and mutation.search(requirement_text))
+        destructive_matched = bool(destructive.search(requirement_text))
+        for scenario in requirement.get("scenarios", []):
+            transition = scenario.get("transition") if isinstance(scenario, dict) else {}
+            scenario_text = " ".join(
+                [str(scenario.get("name") or "")]
+                + list(transition.get("actions", []) if isinstance(transition, dict) else [])
+            )
+            if mutation.search(scenario_text):
+                matched = True
+                scenario_id = str(scenario.get("id") or "")
+                if scenario_id and scenario_id not in scenario_ids and len(scenario_ids) < limit:
+                    scenario_ids.append(scenario_id)
+            credential_matched = credential_matched or bool(credential.search(scenario_text) and mutation.search(scenario_text))
+            destructive_matched = destructive_matched or bool(destructive.search(scenario_text))
+        if matched and requirement_id and requirement_id not in mutable_requirement_ids and len(mutable_requirement_ids) < limit:
+            mutable_requirement_ids.append(requirement_id)
+        if credential_matched and requirement_id and requirement_id not in credential_requirement_ids and len(credential_requirement_ids) < limit:
+            credential_requirement_ids.append(requirement_id)
+        if destructive_matched and requirement_id and requirement_id not in destructive_requirement_ids and len(destructive_requirement_ids) < limit:
+            destructive_requirement_ids.append(requirement_id)
+
+    if not mutable_requirement_ids:
+        return {}
+    return {
+        "mutable_requirement_ids": mutable_requirement_ids,
+        "credential_requirement_ids": credential_requirement_ids,
+        "destructive_requirement_ids": destructive_requirement_ids,
+        "scenario_ids": scenario_ids,
+        "release_gate": True,
+        "verification_contract": [
+            "Exercise state-changing scenarios against one running service with at least two isolated clients, not only one serial in-memory client.",
+            "While one client mutates state, prove another active client keeps its independent session and unrelated actor-owned data; a credential change must not silently destroy already-authenticated sessions unless the public requirement explicitly says so.",
+            "After create/update/delete/cancel/refund operations, verify the resulting owner-scoped collection and dependent views through the public API/UI and after refresh.",
+            "Run destructive scenarios from deterministic reset state and repeat the same project-owned suite; a prior invocation must not consume fixtures required by the next invocation.",
+            "Use atomic persistence updates so concurrent session, collection, inventory, or order mutations cannot overwrite unrelated state through a stale read-modify-write cycle.",
+            "Do not solve interference by serializing all tests, adding evaluator-only reset hooks, or weakening observable assertions.",
+        ],
+    }
+
+
 def _root_data_contracts(tree: dict[str, Any], limit: int = 160) -> list[dict[str, Any]]:
     """Preserve author-supplied seed/example records as first-class contracts.
 
@@ -219,6 +347,8 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 160)
         "source": "arc_requirement_tree",
         "requirements": requirements,
         "seed_contracts": _root_data_contracts(tree),
+        "gateway_contracts": _gateway_contracts(requirements),
+        "state_interference_contract": _state_interference_contract(requirements),
         # This is a domain-neutral browser/API contract.  It gives an agent a
         # stable interoperability target without revealing evaluator details or
         # prescribing product-specific selectors.
@@ -234,6 +364,7 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 160)
             ],
             "forms": [
                 "Every input, select, radio group, checkbox, and date control has a visible label or equivalent accessible name.",
+                "Choose native control semantics that match the requirement and authored reference: enumerable choices use a labeled select/radio group, while free-form values use inputs; dialogs and expandable forms expose a stable accessible region name.",
                 "Required fields expose required semantics and deterministic validation messages without losing entered values.",
                 "Validation is enforced at the API boundary as well as the UI; errors identify the field or business conflict and use a non-2xx status for rejected mutations.",
                 "Submit controls expose a stable accessible name and prevent duplicate submissions while pending.",
@@ -245,10 +376,19 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 160)
             ],
             "state": [
                 "Successful auth and mutations update navigation and visible state immediately.",
+                "Creating a new authenticated session for an account must not invalidate another active client session unless the public requirement explicitly specifies single-session behavior.",
+                "Authentication gateways must be proven with at least two isolated clients: both clients remain authenticated, refresh reconstructs each identity, protected navigation works, and logout affects only the initiating session unless global logout is explicitly required.",
                 "Refresh/reload reconstructs state from the public API or durable storage rather than in-memory-only fixtures.",
                 "Every async view has explicit loading, empty, recoverable error, and retry states; stale data is not presented as a successful response.",
                 "Logout clears client credentials and protects authenticated views after reload.",
                 "Runtime dates and seeded records derive from the requirement-configured clock/environment rather than generation-time constants.",
+            ],
+            "collections": [
+                "A filter, sort, pagination, date switch, or navigation preset must project the actual visible collection, update its count and empty state, and preserve the same projection in the canonical URL and after refresh.",
+                "When a requirement says the current actor, account holder, owner, or self record always appears and cannot be deleted, derive that protected row from the authenticated durable identity on every read, deduplicate legacy persisted owner rows, omit destructive controls for it, and prove ordinary collection mutations and restart cannot remove it.",
+                "When a collection query changes, stale rows must be hidden or marked busy synchronously before the URL/result transition; clients must never observe the new query together with rows from the previous projection.",
+                "Executable tests must inspect every visible data item after each composed filter, not merely wait for one matching item that was already present before the transition.",
+                "Composite or multi-segment results use a semantic list item/article/card boundary and visibly label every segment, connection/wait duration, total duration, price, and action; ordering and result limits are deterministic.",
             ],
         },
         "coverage_rules": [
@@ -258,6 +398,13 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 160)
             "When requirements mention seeded/example records, verify a fresh process bootstraps deterministic app-owned data without evaluator setup.",
             "When author-provided visual references exist, verify the corresponding observable layout/content states without relying on hidden selectors.",
             "Execute prerequisite scenarios before dependents and treat a failed high-fan-out prerequisite as blocking because it can invalidate many downstream flows.",
+            "Build a compact smoke gate for every repeated GIVEN precondition in gateway_contracts and run those gates before dependent scenarios.",
+            "For authentication/session gateways, exercise two isolated clients concurrently and reject implementations where a later login silently invalidates an earlier active session without an explicit requirement.",
+            "For public state-changing scenarios, run two isolated clients against one service and prove credential, profile, collection, inventory, and order mutations preserve unrelated sessions and actor-owned state.",
+            "Repeat destructive project-owned scenarios from deterministic reset state and reject non-atomic persistence or fixture consumption that makes a second invocation fail.",
+            "For collection filters and sorts, prove the URL, visible count, empty state, and every visible item describe one atomic projection; a stale pre-transition row is a failed gate.",
+            "For protected self/owner collection entries, delete all optional persisted owner copies in a test fixture and prove the authenticated actor is still projected exactly once, has no destructive action, and remains after deleting unrelated rows and restarting.",
+            "For composite results, verify semantic item boundaries and labeled aggregate values in addition to segment details and ordering.",
             "For each scenario assert the full GIVEN/WHEN/THEN transition, including canonical URL, visible result, API state, and reload behavior where applicable.",
             "Do not invent hidden acceptance-test details; derive behavior only from the supplied requirements and observable contracts.",
         ],

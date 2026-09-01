@@ -89,9 +89,11 @@ class OrchestratorTests(unittest.TestCase):
             class LoopDriver:
                 def __init__(self) -> None:
                     self.calls: list[str] = []
+                    self.prompts: list[tuple[str, str]] = []
 
                 def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
                     self.calls.append(role)
+                    self.prompts.append((role, prompt))
                     if role == "reviewer" and self.calls.count("reviewer") == 1:
                         return SimpleNamespace(final_response='{"verdict":"changes_requested","summary":"fix","findings":[{"id":"F-1","severity":"major","title":"missing"}],"checks":[]}')
                     if role == "implementer":
@@ -111,8 +113,15 @@ class OrchestratorTests(unittest.TestCase):
             result = orchestrator._review_loop(self._module(1, "REQ-1"), "Review REQ-1")
             self.assertEqual(result["verdict"], "pass")
             self.assertEqual(driver.calls, ["reviewer", "implementer", "reviewer"])
+            review_prompts = [prompt for role, prompt in driver.prompts if role == "reviewer"]
+            self.assertIn("first Reviewer pass", review_prompts[0])
+            self.assertIn("incremental verification pass", review_prompts[1])
+            self.assertIn('"id": "F-1"', review_prompts[1])
+            self.assertIn("A workspace/fixed.txt", review_prompts[1])
             messages = orchestrator.bus.replay()
             self.assertTrue(any(item["kind"] == "review.feedback" for item in messages))
+            feedback = [item for item in messages if item["kind"] == "review.feedback"]
+            self.assertEqual([item["payload"]["review_scope"] for item in feedback], ["full", "incremental"])
             self.assertTrue(any(item["kind"] == "pipeline.state" and item["payload"].get("status") == "approved" for item in messages))
 
     def test_project_owned_test_failure_loops_to_implementer_before_review(self) -> None:
@@ -122,9 +131,11 @@ class OrchestratorTests(unittest.TestCase):
             class Driver:
                 def __init__(self) -> None:
                     self.calls: list[str] = []
+                    self.prompts: list[tuple[str, str]] = []
 
                 def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
                     self.calls.append(role)
+                    self.prompts.append((role, prompt))
                     return SimpleNamespace(final_response='{"verdict":"pass","summary":"ok","findings":[],"checks":[]}')
 
             driver = Driver()
@@ -144,7 +155,44 @@ class OrchestratorTests(unittest.TestCase):
                 result = orchestrator._review_loop(self._module(1, "REQ-1"), "Review REQ-1")
             self.assertEqual(result["verdict"], "pass")
             self.assertEqual(driver.calls, ["implementer", "reviewer"])
+            review_prompt = next(prompt for role, prompt in driver.prompts if role == "reviewer")
+            self.assertIn("first Reviewer pass", review_prompt)
+            feedback = [item for item in orchestrator.bus.replay() if item["kind"] == "review.feedback"]
+            self.assertEqual(feedback[0]["payload"]["review_scope"], "full")
             self.assertTrue(any(item["kind"] == "test.failed" for item in orchestrator.bus.replay()))
+
+    def test_incremental_review_skips_reviewer_when_repair_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class Driver:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append(role)
+                    if role == "reviewer":
+                        return SimpleNamespace(final_response='{"verdict":"changes_requested","summary":"fix","findings":[{"id":"F-1","severity":"major","title":"missing"}],"checks":[]}')
+                    return SimpleNamespace(final_response='{"changed_files":[],"resolved_findings":[],"checks":[]}')
+
+            driver = Driver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+
+            result = orchestrator._review_loop(self._module(1, "REQ-1"), "Review REQ-1")
+
+            self.assertEqual(result["verdict"], "changes_requested")
+            self.assertEqual(driver.calls, ["reviewer", "implementer"])
+            self.assertIn(
+                "no project file changes",
+                orchestrator.checkpoint.read()["quality_exhaustion_reason"],
+            )
 
     def test_reviewer_receives_current_orchestrator_test_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -378,6 +426,57 @@ class OrchestratorTests(unittest.TestCase):
                 [role for role, _ in driver.calls],
                 ["architect", "implementer", "reviewer", "reviewer"],
             )
+
+    def test_force_final_review_reruns_integration_for_completed_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            checkpoint.mark_architecture_completed()
+            checkpoint.mark_module_completed("REQ-1", 1)
+            checkpoint.mark_final_review_completed()
+            architecture = root / ".arc" / "hafleet" / "architecture.md"
+            architecture.parent.mkdir(parents=True, exist_ok=True)
+            architecture.write_text("# Existing architecture\n", encoding="utf-8")
+            module = RequirementModule(
+                index=1,
+                total=1,
+                node_id="REQ-1",
+                name="REQ-1",
+                subtree={
+                    "id": "REQ-1",
+                    "children": [{"id": f"REQ-1.{index}"} for index in range(1, 5)],
+                },
+            )
+            driver = FakeDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HAFLEET_FORCE_FINAL_REVIEW": "1",
+                    "HAFLEET_POSTFLIGHT": "0",
+                },
+                clear=False,
+            ):
+                orchestrator.run([module])
+
+            roles = [role for role, _ in driver.calls]
+            self.assertEqual(roles, ["implementer", "reviewer"])
+            integration_prompt = driver.calls[0][1]
+            self.assertIn("gateway smoke suite", integration_prompt)
+            self.assertIn("same account concurrently", integration_prompt)
+            self.assertIn("collection projection atomicity", integration_prompt)
+            review_prompt = driver.calls[1][1]
+            self.assertIn("two isolated clients", review_prompt)
+            self.assertIn("collection projection as a release gate", review_prompt)
+            self.assertTrue(checkpoint.read()["final_review_completed"])
 
     def test_resume_reopens_legacy_completed_module_with_deferred_quality(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

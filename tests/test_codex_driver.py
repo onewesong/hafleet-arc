@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from hafleet_arc.codex_driver import CodexFleet, TurnTimeoutError
+from hafleet_arc.codex_driver import CodexFleet, TurnTimeoutError, _sync_parent_auth
 
 
 class FakeThread:
@@ -33,6 +33,27 @@ class FakeCodex:
 
 
 class CodexFleetRetryTests(unittest.TestCase):
+    def test_refreshes_isolated_auth_from_launcher_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            isolated = root / "isolated"
+            source.mkdir()
+            isolated.mkdir()
+            (source / "auth.json").write_text(
+                '{"tokens":{"access_token":"current"}}', encoding="utf-8"
+            )
+            (isolated / "auth.json").write_text(
+                '{"OPENAI_API_KEY":"stale"}', encoding="utf-8"
+            )
+
+            self.assertTrue(_sync_parent_auth(source, isolated))
+            self.assertEqual(
+                (isolated / "auth.json").read_text(encoding="utf-8"),
+                '{"tokens":{"access_token":"current"}}',
+            )
+            self.assertEqual((isolated / "auth.json").stat().st_mode & 0o777, 0o600)
+
     def test_role_model_overrides_global_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fleet = CodexFleet(Path(temporary))

@@ -51,6 +51,7 @@ class FeedbackPipelineTests(unittest.TestCase):
             self.assertTrue(DEFAULT_PIPELINE_PATH.is_file())
             default = load_pipeline(root)
             self.assertEqual(default.loop().max_rounds, 3)
+            self.assertEqual(default.loop().options["review_strategy"], "full_then_incremental")
             config = root / ".arc" / "hafleet" / "pipeline.yaml"
             config.parent.mkdir(parents=True)
             config.write_text(
@@ -68,6 +69,15 @@ class FeedbackPipelineTests(unittest.TestCase):
             self.assertEqual(role_only.loop().max_rounds, 3)
             self.assertEqual(role_only.prompt_for("reviewer"), "Custom review prompt")
 
+            config.write_text(
+                "version: 1\n"
+                "nodes:\n"
+                "  - {id: loop, type: loop, review: reviewer, repair: implementer, review_strategy: unknown}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "unsupported review strategy"):
+                load_pipeline(root)
+
     def test_default_pipeline_folds_planning_into_implementer(self) -> None:
         pipeline = load_pipeline(Path("/tmp/nonexistent-hafleet-output"))
         self.assertIsNone(pipeline.node("planner"))
@@ -75,8 +85,11 @@ class FeedbackPipelineTests(unittest.TestCase):
         self.assertIsNone(pipeline.node("final_test"))
         self.assertIn("planning and implementation", pipeline.prompt_for("implementer"))
         self.assertIn("test authoring", pipeline.prompt_for("implementer"))
+        self.assertIn("protected projection", pipeline.prompt_for("implementer"))
+        self.assertIn("native select/radio controls", pipeline.prompt_for("implementer"))
         self.assertIn("test cases", pipeline.prompt_for("reviewer"))
         self.assertIn("Do not execute test commands", pipeline.prompt_for("reviewer"))
+        self.assertIn("non-deletable current-user/account-holder row", pipeline.prompt_for("reviewer"))
 
 
 if __name__ == "__main__":

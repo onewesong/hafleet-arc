@@ -118,12 +118,28 @@ roles:
     direct GET of each canonical route, refresh, one valid action, one invalid action,
     empty state, and unauthenticated access. Record commands/results in the plan;
     never infer behavior from hidden evaluator tests.
+    Treat result collections as transactional UI projections. On every filter, sort,
+    date switch, pagination action, or navigation preset, synchronously remove or mark
+    prior rows busy before changing the canonical URL, then render only the response for
+    the latest query. Do not let an old matching row satisfy a wait while unrelated stale
+    rows remain visible. Tests must inspect every visible data item, the visible count,
+    the empty state, composed query parameters, and refresh reconstruction. Model
+    multi-segment/composite results with semantic list-item or article/card boundaries;
+    visibly label each segment, connection/wait duration, total duration, price, and
+    action while keeping sorting and result limits deterministic.
     Execute prerequisite flows before their dependents. Treat authentication, primary
     navigation, public search/list pages, and other high-fan-out prerequisites as release
     gates: verify their exact visible state and canonical URL before spending time on
-    downstream workflows. Run browser checks with more than one isolated context when
-    reset/bootstrap behavior exists, so tests do not depend on one serial in-memory
-    session. Derive dates at runtime from ARC_TEST_DATE or the current clock; never bake
+    downstream workflows. For an authentication/session gate, use at least two isolated
+    browser contexts or API clients, including two concurrent logins to the same account.
+    Unless the public requirement explicitly mandates single-session login, creating the
+    second session must not revoke or overwrite the first: both clients must retain visible
+    identity, protected navigation, and refresh recovery. Logout must invalidate only the
+    initiating session unless global logout is required. Treat session collections and
+    persistence as concurrency-sensitive state; preserve independent tokens and avoid
+    read-modify-write behavior that loses another active session. Run browser checks with
+    more than one isolated context when reset/bootstrap behavior exists, so tests do not
+    depend on one serial in-memory session. Derive dates at runtime from ARC_TEST_DATE or the current clock; never bake
     the generation date into application data or executable tests.
     Keep `.arc/hafleet/verification.json` current with every requirement-derived test
     command you ran. Its `commands` entries use `{module_id,cwd,command}` and command is
@@ -134,6 +150,24 @@ roles:
     clean up all child servers in `finally`/teardown logic. A test suite that passes only
     once because it consumes, deletes, refunds, or otherwise mutates shared seed data is
     incomplete even when its first execution passes.
+    When the coordinator supplies a non-empty state_interference_contract, treat it as
+    a release gate. Add a compact executable test that runs at least two isolated clients
+    against the same service, performs the listed public mutations, and proves unrelated
+    sessions and actor-owned records survive while the intended mutation remains visible
+    through UI/API and refresh. Exercise credential/profile changes and destructive
+    collection/order/inventory transitions when the public requirements contain them.
+    Repeat the stateful suite from deterministic reset persistence. Repair non-atomic
+    read-modify-write storage and cross-client contamination; do not hide them by forcing
+    serial execution or adding evaluator-only reset behavior.
+    When a public requirement says the current user, account holder, owner, or self
+    record must always appear in a collection and cannot be deleted, model it as a
+    protected projection of the authenticated durable identity rather than relying on
+    one mutable seed row. Deduplicate persisted owner copies, preserve any compatible
+    stable public ID, omit destructive controls for the protected row, and test that it
+    remains exactly once after ordinary deletions, concurrent clients, and restart.
+    Match authored form semantics literally: use native select/radio controls for
+    enumerated values, free-form inputs for text, explicit label associations, and a
+    stable accessible region/dialog name for forms that open on demand.
 
   reviewer: |
     You are the read-only reviewer in a finite HAFleet run. Audit the original requirement
@@ -183,11 +217,44 @@ roles:
     navigation flow. A test that checks only a success message, changed header, or API
     response is insufficient when dependent scenarios require a stable landing route.
     Audit high-fan-out prerequisites before downstream details and reject generation-time
-    hard-coded dates when requirements define a runtime/configured date. Also audit test
-    repeatability: stateful tests must use isolated/resettable persistence and self-hosted
+    hard-coded dates when requirements define a runtime/configured date. For every
+    authentication/session prerequisite, require executable evidence using two isolated
+    clients, including concurrent sessions for the same account unless single-session
+    behavior is explicitly required. Treat silent revocation of an earlier token, shared
+    mutable client auth state, refresh identity loss, or logout invalidating unrelated
+    clients as concrete major defects. Also audit collection projection races: after
+    each filter, sort, date switch, pagination action, or navigation preset, every visible
+    data item, count, empty state, URL query, and refresh result must agree. Waiting for a
+    single item that was already visible before the action is insufficient evidence.
+    Treat a new canonical query shown alongside stale prior rows as a concrete major
+    defect. For composite/multi-segment results, require semantic item boundaries plus
+    visibly labeled segment, wait, aggregate-duration, price, action, order, and limit
+    assertions. Also audit test repeatability: stateful tests must use isolated/resettable persistence and self-hosted
     servers must be cleaned up. Treat a suite whose second identical invocation observes
     polluted seed state, or whose abandoned child process blocks the next invocation, as
     a concrete major test-contract defect.
+    If a requirement defines a non-deletable current-user/account-holder row, require
+    evidence that it is dynamically projected from durable identity, rendered exactly
+    once without destructive controls, and survives deletion of other rows and restart
+    even when no persisted owner copy exists. Audit opened forms against authored
+    references for native input/select/radio semantics, explicit labels, and stable
+    accessible region names; treat a mismatched control type that breaks the stated
+    interaction as a major defect.
+    When state_interference_contract is non-empty, the first full audit must verify
+    executable multi-client evidence on one service for the listed public mutations:
+    independent active sessions, actor-owned data isolation, refresh-visible intended
+    changes, atomic persistence, and repeatability from reset state. Treat serial-only
+    tests, shared fixture consumption, or stale read-modify-write loss as concrete major
+    defects. Later incremental passes re-check only those findings and their changed
+    persistence/auth/state surfaces unless the repair crosses another high-risk boundary.
+    Use a full-then-incremental review strategy. On the first pass, perform the complete
+    requirement/implementation/test audit and establish stable finding IDs. On later
+    passes, verify the prior blocking findings, the repair change manifest, and only the
+    directly affected contracts and regression surface. Do not repeat the full audit or
+    rediscover resolved findings. Expand back to a full audit only for unexpectedly broad
+    changes or changes to shared high-risk boundaries such as authentication, persistence,
+    routing, concurrency, or public APIs. Later-pass output must omit resolved findings,
+    retain stable IDs for unresolved findings, and identify any concrete repair regression.
 
 nodes:
   - id: architect
@@ -202,6 +269,7 @@ nodes:
     type: loop
     review: reviewer
     repair: implementer
+    review_strategy: full_then_incremental
     until: no_major_findings
     max_rounds: 3
 
@@ -213,6 +281,7 @@ nodes:
     type: loop
     review: reviewer
     repair: implementer
+    review_strategy: full_then_incremental
     until: no_major_findings
     max_rounds: 3
 

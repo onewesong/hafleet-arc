@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -11,6 +12,25 @@ from typing import Any, Self
 
 from .log import log
 from .pipeline import Pipeline, load_pipeline
+
+
+def _sync_parent_auth(source_home: Path, isolated_home: Path) -> bool:
+    """Refresh a resumed run's isolated Codex credential from its launcher."""
+
+    source = source_home.expanduser() / "auth.json"
+    target = isolated_home / "auth.json"
+    try:
+        if not source.is_file() or source.resolve() == target.resolve():
+            return False
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        temporary = isolated_home / ".auth.json.tmp"
+        shutil.copyfile(source, temporary)
+        temporary.chmod(0o600)
+        temporary.replace(target)
+        return True
+    except OSError:
+        # API-key mode remains available when launcher auth is absent/read-only.
+        return False
 
 TRANSIENT_ERROR_MARKERS = (
     # Provider/model capacity errors are retryable even when the SDK does not
@@ -145,11 +165,14 @@ class CodexFleet:
             raise RuntimeError("Install requirements.txt before running HAFleet ARC.") from exc
 
         env = os.environ.copy()
+        parent_codex_home = Path(env.get("CODEX_HOME") or (Path.home() / ".codex"))
         # ARC-Bench containers may expose a read-only /root. Codex persists its
         # SQLite state under CODEX_HOME, so keep all ephemeral agent state in the
         # writable output workspace instead of inheriting ~/.codex.
         codex_home = self.output_dir / ".arc" / "hafleet" / "codex-home"
         codex_home.mkdir(parents=True, exist_ok=True)
+        if not os.environ.get("OPENAI_API_KEY", "").strip():
+            _sync_parent_auth(parent_codex_home, codex_home)
         env["CODEX_HOME"] = str(codex_home)
         env["ARCBENCH_WEB_PORT"] = str(self.grading_port)
         env["HAFLEET_SMOKE_PORT"] = str(self.smoke_port)
