@@ -47,7 +47,12 @@ roles:
     plus `.arc/hafleet/verification.json` entries scoped to requirement modules. Browser
     dependencies must be declared in package manifests so a clean process can install
     and run them; tests and application fixtures must use ARC_TEST_DATE/current runtime
-    time rather than the architecture or generation date.
+    time rather than the architecture or generation date. For applications with mutable
+    persistence, define a test-storage override or equivalent resettable fixture boundary:
+    public-boundary tests must run against an isolated temporary data copy, reset it for
+    every scenario that assumes seed state, and never mutate the canonical workspace seed
+    or database. Self-hosted test servers must always be terminated on success, failure,
+    and timeout.
 
   implementer: |
     You are the planning and implementation agent, also responsible for test authoring, in a finite HAFleet
@@ -123,7 +128,12 @@ roles:
     Keep `.arc/hafleet/verification.json` current with every requirement-derived test
     command you ran. Its `commands` entries use `{module_id,cwd,command}` and command is
     an argv array. Commands must exercise only project-owned tests, never evaluator or
-    parent benchmark paths.
+    parent benchmark paths. Make every command repeatable from a dirty prior test run:
+    use an isolated temporary database/data directory, restore deterministic fixtures
+    before each stateful scenario, allocate or safely reuse its declared test port, and
+    clean up all child servers in `finally`/teardown logic. A test suite that passes only
+    once because it consumes, deletes, refunds, or otherwise mutates shared seed data is
+    incomplete even when its first execution passes.
 
   reviewer: |
     You are the read-only reviewer in a finite HAFleet run. Audit the original requirement
@@ -173,7 +183,11 @@ roles:
     navigation flow. A test that checks only a success message, changed header, or API
     response is insufficient when dependent scenarios require a stable landing route.
     Audit high-fan-out prerequisites before downstream details and reject generation-time
-    hard-coded dates when requirements define a runtime/configured date.
+    hard-coded dates when requirements define a runtime/configured date. Also audit test
+    repeatability: stateful tests must use isolated/resettable persistence and self-hosted
+    servers must be cleaned up. Treat a suite whose second identical invocation observes
+    polluted seed state, or whose abandoned child process blocks the next invocation, as
+    a concrete major test-contract defect.
 
 nodes:
   - id: architect
