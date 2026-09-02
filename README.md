@@ -1,3 +1,5 @@
+[English](README.md) | [中文](README.zh-CN.md)
+
 # HAFleet ARC
 
 HAFleet ARC is a finite-lifecycle multi-role coding agent for ARC-Bench. It keeps
