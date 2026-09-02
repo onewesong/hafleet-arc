@@ -111,8 +111,23 @@ roles:
     a visible label or equivalent accessible name, grouped options use fieldset/
     legend, required fields expose required/aria-required, and validation errors are
     connected with aria-describedby and remain visible after failed submit. Submit
+    Choose native interactive elements by intent: use anchors with real href values for
+    navigation and buttons for submissions, sign-out, delete, pay, cancel, toggles, and
+    every other state-changing action. Never emulate an action with an anchor plus
+    preventDefault or a navigation entry with a span/div. Every requirement-named
+    clickable affordance must be discoverable by semantic role and accessible name. If
+    an authenticated identity is the visible entry to an available account/profile
+    center, render that identity as a real named link and verify it after login/refresh.
+    Submit
     buttons need deterministic names, pending/disabled semantics, and duplicate-
-    request protection. After each mutation update URL and visible state immediately,
+    request protection. For wizards, dialogs, expandable panels, conditional forms,
+    and elements using the hidden attribute, verify the inactive state is actually
+    absent from layout, pointer interaction, focus order, and the accessibility tree;
+    author CSS must not override hidden semantics. Browser tests must assert that only
+    the active control set is visible before and after each transition. If a role/name
+    query finds duplicate controls because an inactive step is still rendered, repair
+    the UI state instead of merely narrowing the test locator. After each mutation
+    update URL and visible state immediately,
     then verify the same state through the public API and after a reload. Before
     finishing, exercise a compact smoke matrix derived from the requirement tree:
     direct GET of each canonical route, refresh, one valid action, one invalid action,
@@ -123,7 +138,14 @@ roles:
     prior rows busy before changing the canonical URL, then render only the response for
     the latest query. Do not let an old matching row satisfy a wait while unrelated stale
     rows remain visible. Tests must inspect every visible data item, the visible count,
-    the empty state, composed query parameters, and refresh reconstruction. Model
+    the empty state, composed query parameters, and refresh reconstruction. Seed or
+    construct non-vacuous data for each filter and sort: at least one item must be
+    excluded or reordered, and multiple distinct values must exercise each selectable
+    facet. Verify the actual collection order in both required directions rather than
+    treating a changed query string as sorting evidence. Preserve the interaction
+    modality stated by the requirement: hover, focus, keyboard activation, click, drag,
+    and native selection are distinct observable behaviors and tests must exercise the
+    specified one without substituting an easier action. Model
     multi-segment/composite results with semantic list-item or article/card boundaries;
     visibly label each segment, connection/wait duration, total duration, price, and
     action while keeping sorting and result limits deterministic.
@@ -141,6 +163,16 @@ roles:
     more than one isolated context when reset/bootstrap behavior exists, so tests do not
     depend on one serial in-memory session. Derive dates at runtime from ARC_TEST_DATE or the current clock; never bake
     the generation date into application data or executable tests.
+    When public requirements accept multiple login identifiers or define multiple seeded
+    accounts, implement one canonical identity resolver and give every app-owned seed
+    account unique values for every accepted unique identifier. Never use a first-record
+    fallback for duplicate username, e-mail, mobile/phone, or alias matches. Add a compact
+    project-owned identity matrix test that iterates every public seeded account through
+    every supported identifier and asserts the returned durable identity, protected route,
+    refresh state, and concurrent-session ownership. If password/account recovery exists,
+    keep challenges token-scoped: creating or consuming one challenge must not erase a
+    different still-valid challenge unless the requirement explicitly says so. Repeat the
+    identity matrix after restart and any supported persisted-data migration.
     Keep `.arc/hafleet/verification.json` current with every requirement-derived test
     command you ran. Its `commands` entries use `{module_id,cwd,command}` and command is
     an argv array. Commands must exercise only project-owned tests, never evaluator or
@@ -156,6 +188,14 @@ roles:
     sessions and actor-owned records survive while the intended mutation remains visible
     through UI/API and refresh. Exercise credential/profile changes and destructive
     collection/order/inventory transitions when the public requirements contain them.
+    For workflows that reserve or consume finite resources, measure public inventory or
+    capacity before the mutation, after the reservation, and after cancel/refund/expiry;
+    prove restoration or finalization happens exactly once under concurrent clients.
+    Reap expired reservations before every public availability projection and competing
+    reservation attempt, without requiring the original owner to revisit an order. For
+    countdowns, expirations, polling, progress, or other time-driven UI, observe at least
+    two distinct values or the specified terminal transition. A static timer-shaped label
+    is not executable evidence of liveness.
     Repeat the stateful suite from deterministic reset persistence. Repair non-atomic
     read-modify-write storage and cross-client contamination; do not hide them by forcing
     serial execution or adding evaluator-only reset behavior.
@@ -192,7 +232,11 @@ roles:
     parity between UI and API state transitions. Flag hash-only routes, click-only
     controls, static text not backed by state, or success responses hiding validation,
     conflict, and authorization errors as major findings when they violate the
-    requirement's observable contract.
+    requirement's observable contract. Audit conditional and multi-step UI in both
+    directions: inactive steps, closed panels, and hidden controls must be absent from
+    layout, pointer interaction, focus order, and the accessibility tree. Treat a
+    duplicate role/name match caused by an inactive control set remaining visible as
+    an implementation defect; do not accept a test-only locator narrowing as the fix.
     For every test-quality finding, cite the concrete test file, the observed execution
     boundary, and the missing behavior assertion. If the test demonstrably launches
     the application or calls its public API, do not classify it as source-string-only;
@@ -213,6 +257,19 @@ roles:
     whose visible result disappears on refresh as a concrete major finding whenever
     the requirement exposes that flow. Review the route/state table against actual
     source and tests, including API/UI parity and error status codes.
+    Audit native control semantics as observable behavior: real links navigate and real
+    buttons mutate state. Treat a sign-out/delete/pay/cancel action implemented as an
+    intercepted anchor, a required navigation item implemented as a span/div, or an
+    account identity that should enter an available profile center but is not a named
+    link as a concrete major defect. Verify these roles through real browser assertions
+    before accepting dependent authenticated flows.
+    When a flow reserves finite inventory or capacity, audit executable before/reserved/
+    cancelled-or-expired observations and concurrent ownership. Require a second client
+    to read availability and reserve immediately after expiry before the original owner
+    calls any order endpoint; missing eager restoration or double release is a major
+    defect. When a requirement exposes a countdown, expiry,
+    polling, or progress state, require evidence that its value changes or reaches the
+    required terminal transition instead of accepting a static formatted string.
     Independently inspect post-action URLs in tests for every successful form or
     navigation flow. A test that checks only a success message, changed header, or API
     response is insufficient when dependent scenarios require a stable landing route.
@@ -222,10 +279,23 @@ roles:
     clients, including concurrent sessions for the same account unless single-session
     behavior is explicitly required. Treat silent revocation of an earlier token, shared
     mutable client auth state, refresh identity loss, or logout invalidating unrelated
-    clients as concrete major defects. Also audit collection projection races: after
+    clients as concrete major defects. When public requirements expose multiple accounts,
+    login identifiers, or recovery, require an executable identity matrix rather than one
+    happy-path login: every app-owned public seed identifier must uniquely resolve to its
+    owning durable identity, ambiguous matches must be rejected, and overlapping reset
+    challenges must remain independent. Treat first-record credential lookup, duplicated
+    seed identifiers, cross-account session identity, or destructive challenge replacement
+    as concrete major defects. Also audit collection projection races: after
     each filter, sort, date switch, pagination action, or navigation preset, every visible
     data item, count, empty state, URL query, and refresh result must agree. Waiting for a
     single item that was already visible before the action is insufficient evidence.
+    Reject vacuous filter/sort tests whose fixtures contain only one selectable value,
+    whose selected facet already matches every row, or whose assertion checks only the
+    URL: require a changed collection and inspect every resulting item/order in each
+    specified direction. If requirement prose names an interaction modality such as
+    hover, focus, keyboard activation, click, drag, or native selection, require the
+    executable browser test to perform that exact public interaction while retaining
+    accessible alternatives.
     Treat a new canonical query shown alongside stale prior rows as a concrete major
     defect. For composite/multi-segment results, require semantic item boundaries plus
     visibly labeled segment, wait, aggregate-duration, price, action, order, and limit

@@ -27,6 +27,26 @@ class PostflightTests(unittest.TestCase):
     def test_bundled_template_satisfies_structure_contract(self) -> None:
         self.assertEqual(validate_web_structure(self.template), [])
 
+    def test_modular_backend_config_can_receive_process_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "project"
+            shutil.copytree(self.template, output)
+            server = output / "backend" / "server.js"
+            server.write_text(
+                'import { config } from "./src/config.js";\n'
+                'const settings = config(process.env);\n'
+                'server.listen(settings.port);\n',
+                encoding="utf-8",
+            )
+            config = output / "backend" / "src" / "config.js"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(
+                'export const config = (env) => ({ port: Number(env.PORT || 3000) });\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(validate_web_structure(output), [])
+
     def test_bundled_template_passes_grader_startup_rehearsal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "project"

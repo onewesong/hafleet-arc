@@ -8,6 +8,18 @@ from hafleet_arc.checkpoint import CheckpointStore
 
 
 class CheckpointStoreTests(unittest.TestCase):
+    def test_review_and_verification_cursors_are_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CheckpointStore(Path(temporary) / "checkpoint.json")
+            store.mark_module_started("REQ-1", "review")
+            state = store.update_pipeline(
+                "REQ-1", review_round=2, current_verification_attempt=4
+            )
+
+            self.assertEqual(state["current_round"], 2)
+            self.assertEqual(state["current_review_round"], 2)
+            self.assertEqual(state["current_verification_attempt"], 4)
+
     def test_tracks_started_completed_and_paused_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = CheckpointStore(Path(temporary) / ".arc" / "checkpoint.json")

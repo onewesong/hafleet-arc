@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -55,6 +56,42 @@ def _run(command: list[str], cwd: Path, env: dict[str, str], timeout: int) -> tu
         return 124, f"timed out after {timeout}s\n{str(stdout or '')[-_artifact_limit():]}"
     except OSError as exc:
         return 127, str(exc)
+
+
+def _bounded_node_test_command(command: list[str], cwd: Path) -> list[str]:
+    """Make direct Node test-runner commands terminate after reporting results.
+
+    Browser-backed ``node --test`` suites commonly leave HTTP, browser, or
+    keep-alive handles open after their assertions finish. Node then waits for
+    those handles indefinitely and hides actionable failures until the outer
+    HAFleet timeout expires. ``--test-force-exit`` preserves the test result
+    while bounding that lifecycle. Package scripts are expanded only when they
+    are a simple direct Node test command; compound or custom scripts remain
+    untouched.
+    """
+
+    resolved = list(command)
+    executable = Path(resolved[0]).name.lower() if resolved else ""
+    if executable in {"npm", "pnpm"}:
+        script_name = ""
+        if len(resolved) == 2 and resolved[1] == "test":
+            script_name = "test"
+        elif len(resolved) >= 3 and resolved[1] == "run":
+            script_name = resolved[2]
+        if script_name:
+            try:
+                package = json.loads((cwd / "package.json").read_text(encoding="utf-8"))
+                script = str((package.get("scripts") or {}).get(script_name) or "")
+                expanded = shlex.split(script)
+            except (OSError, json.JSONDecodeError, ValueError):
+                expanded = []
+            if expanded and Path(expanded[0]).name.lower() in {"node", "node.exe"} and "--test" in expanded:
+                resolved = expanded
+                executable = Path(resolved[0]).name.lower()
+    if executable in {"node", "node.exe"} and "--test" in resolved and "--test-force-exit" not in resolved:
+        test_index = resolved.index("--test")
+        resolved.insert(test_index + 1, "--test-force-exit")
+    return resolved
 
 
 def _ready(port: int) -> bool:
@@ -254,6 +291,26 @@ def _project_uses_playwright(output_dir: Path, commands: list[ProjectCommand]) -
                     return True
             except (OSError, ValueError):
                 continue
+    # A generated project may import Playwright directly from a test file while
+    # relying on a workspace/root installation, so neither package.json nor the
+    # registered command necessarily contains the word "playwright". Inspect a
+    # bounded set of project-owned test sources before deciding browser setup is
+    # unnecessary. Never traverse dependency, build, Git, or ARC artifact trees.
+    inspected = 0
+    for base in (output_dir / "test", output_dir / "tests", output_dir / "frontend" / "test", output_dir / "frontend" / "tests", output_dir / "backend" / "test", output_dir / "backend" / "tests"):
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if inspected >= 200:
+                return False
+            if not path.is_file() or path.suffix.lower() not in {".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"}:
+                continue
+            inspected += 1
+            try:
+                if "playwright" in path.read_text(encoding="utf-8", errors="ignore")[:20_000].lower():
+                    return True
+            except OSError:
+                continue
     return False
 
 
@@ -384,7 +441,8 @@ def run_project_tests(
                 if reset_status == "failed":
                     failures.append(f"{label}: {reset_output}")
                     continue
-            code, output = _run(command, command_cwd, env, timeout)
+            executable_command = _bounded_node_test_command(command, command_cwd)
+            code, output = _run(executable_command, command_cwd, env, timeout)
             checks.append({"name": label, "status": "passed" if code == 0 else "failed", "output": output, "server_mode": server_mode})
             if code != 0:
                 failures.append(f"{label} failed with exit code {code}:\n{output}")

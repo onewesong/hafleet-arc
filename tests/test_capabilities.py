@@ -93,6 +93,36 @@ class CapabilityModelTests(unittest.TestCase):
         self.assertIn("two isolated clients", state_contract)
         self.assertIn("later login silently invalidates an earlier", coverage)
 
+    def test_derives_identity_consistency_gate_from_public_auth_requirements(self) -> None:
+        model = build_capability_model({
+            "id": "ROOT",
+            "data": [{"category": "Accounts", "items": ["A seeded user can sign in with username or mobile."]}],
+            "children": [
+                {
+                    "id": "AUTH",
+                    "name": "Log in with a username, e-mail, or mobile number",
+                    "scenarios": [{"id": "AUTH-S1", "name": "Sign in to the account"}],
+                },
+                {
+                    "id": "RESET",
+                    "name": "Reset a forgotten password with a verification token",
+                },
+            ],
+        })
+        contract = model["identity_consistency_contract"]
+        self.assertTrue(contract["release_gate"])
+        self.assertIn("AUTH", contract["identifier_requirement_ids"])
+        self.assertIn("RESET", contract["recovery_requirement_ids"])
+        self.assertEqual(len(contract["seed_signals"]), 1)
+        rules = "\n".join(contract["verification_contract"])
+        self.assertIn("exactly one owning account", rules)
+        self.assertIn("overlapping challenges", rules)
+        self.assertIn("migrated older persisted data", rules)
+
+    def test_does_not_invent_identity_gate_for_unrelated_requirements(self) -> None:
+        model = build_capability_model({"id": "ROOT", "children": [{"id": "SEARCH", "name": "Search trains"}]})
+        self.assertEqual(model["identity_consistency_contract"], {})
+
     def test_web_contract_requires_atomic_collection_projections(self) -> None:
         model = build_capability_model({"id": "ROOT"})
         collections = "\n".join(model["web_contract"]["collections"])
@@ -101,12 +131,22 @@ class CapabilityModelTests(unittest.TestCase):
         self.assertIn("stale rows must be hidden", collections)
         self.assertIn("every visible data item", collections)
         self.assertIn("semantic list item/article/card", collections)
+        self.assertIn("non-vacuous", collections)
+        self.assertIn("exact interaction modality", collections)
         self.assertIn("protected row", collections)
         self.assertIn("deduplicate legacy persisted owner rows", collections)
         self.assertIn("enumerable choices", forms)
         self.assertIn("accessible region name", forms)
+        self.assertIn("anchors with real href", forms)
+        self.assertIn("state-changing actions", forms)
+        self.assertIn("authenticated identity", forms)
+        self.assertIn("author CSS must not accidentally override", forms)
         self.assertIn("one atomic projection", coverage)
+        self.assertIn("complete order in every required direction", coverage)
+        self.assertIn("hover, focus, keyboard activation", coverage)
+        self.assertIn("native semantic roles", coverage)
         self.assertIn("persisted owner copies", coverage)
+        self.assertIn("Do not silence duplicate-control failures", coverage)
 
     def test_derives_state_interference_gate_from_public_mutations(self) -> None:
         model = build_capability_model({
@@ -141,6 +181,9 @@ class CapabilityModelTests(unittest.TestCase):
         self.assertIn("two isolated clients", rules)
         self.assertIn("Run destructive scenarios", rules)
         self.assertIn("atomic persistence", rules)
+        self.assertIn("finite resource", rules)
+        self.assertIn("time-driven UI", rules)
+        self.assertIn("before every public availability projection", rules)
 
 
 if __name__ == "__main__":

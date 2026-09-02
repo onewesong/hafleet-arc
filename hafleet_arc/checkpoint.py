@@ -34,6 +34,8 @@ class CheckpointStore:
             "final_review_completed": False,
             "current_pipeline_node": None,
             "current_round": 0,
+            "current_review_round": 0,
+            "current_verification_attempt": 0,
             "loop_status": "",
             "last_feedback_message_id": "",
             "last_feedback_hash": "",
@@ -72,6 +74,8 @@ class CheckpointStore:
         payload.setdefault("final_review_completed", False)
         payload.setdefault("current_pipeline_node", None)
         payload.setdefault("current_round", 0)
+        payload.setdefault("current_review_round", int(payload.get("current_round", 0) or 0))
+        payload.setdefault("current_verification_attempt", 0)
         payload.setdefault("loop_status", "")
         payload.setdefault("last_feedback_message_id", "")
         payload.setdefault("last_feedback_hash", "")
@@ -96,7 +100,7 @@ class CheckpointStore:
 
     def mark_module_started(self, module_id: str, phase: str) -> dict[str, Any]:
         payload = self.read()
-        payload.update({"paused": False, "current_node_id": module_id, "current_phase": phase, "current_pipeline_node": phase, "current_round": 0, "loop_status": "", "quality_deferred": False, "quality_exhaustion_reason": ""})
+        payload.update({"paused": False, "current_node_id": module_id, "current_phase": phase, "current_pipeline_node": phase, "current_round": 0, "current_review_round": 0, "current_verification_attempt": 0, "loop_status": "", "quality_deferred": False, "quality_exhaustion_reason": ""})
         self.write(payload)
         return payload
 
@@ -114,6 +118,11 @@ class CheckpointStore:
                 payload["current_pipeline_node"] = normalized.pop("node")
             if "round_number" in normalized:
                 payload["current_round"] = int(normalized.pop("round_number") or 0)
+            if "review_round" in normalized:
+                value = int(normalized.pop("review_round") or 0)
+                payload["current_review_round"] = value
+                # Keep the original field as the public compatibility cursor.
+                payload["current_round"] = value
             payload.update(normalized)
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix(self.path.suffix + ".tmp")

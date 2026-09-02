@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import subprocess
+import shutil
 from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
@@ -82,6 +83,49 @@ class OrchestratorTests(unittest.TestCase):
     def _module(self, index: int, node_id: str) -> RequirementModule:
         return RequirementModule(index, 2, node_id, node_id, {"id": node_id})
 
+    def test_agent_conversations_follow_module_and_decision_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class ThreadAwareDriver:
+                def __init__(self) -> None:
+                    self.resets: list[tuple[str, Path | None]] = []
+                    self.calls: list[tuple[str, str]] = []
+
+                def reset_thread(self, role: str, workspace_dir: Path | None = None) -> None:
+                    self.resets.append((role, workspace_dir))
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append((role, prompt))
+                    return SimpleNamespace(final_response="done")
+
+            driver = ThreadAwareDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            first = self._module(1, "REQ-1")
+            second = self._module(2, "REQ-2")
+
+            orchestrator._run_agent("implementer", "implement one", module=first, phase="implement")
+            orchestrator._run_agent("implementer", "self check", module=first, phase="self-check")
+            orchestrator._run_agent("implementer", "complete", module=first, phase="completion")
+            orchestrator._run_agent("reviewer", "review", module=first, phase="review")
+            orchestrator._run_agent("implementer", "repair", module=first, phase="repair")
+            orchestrator._run_agent("reviewer", "review again", module=first, phase="review")
+            orchestrator._run_agent("implementer", "implement two", module=second, phase="implement")
+            orchestrator._run_agent("implementer", "integrate", phase="integration")
+
+            self.assertEqual(
+                [role for role, _ in driver.resets],
+                ["implementer", "reviewer", "implementer", "reviewer", "implementer", "implementer"],
+            )
+            self.assertEqual(len(driver.calls), 8)
+
     def test_reviewer_feedback_loops_back_to_implementer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -160,6 +204,65 @@ class OrchestratorTests(unittest.TestCase):
             feedback = [item for item in orchestrator.bus.replay() if item["kind"] == "review.feedback"]
             self.assertEqual(feedback[0]["payload"]["review_scope"], "full")
             self.assertTrue(any(item["kind"] == "test.failed" for item in orchestrator.bus.replay()))
+
+    def test_project_verification_repairs_do_not_consume_reviewer_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class Driver:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+                    self.prompts: list[tuple[str, str]] = []
+                    self.repairs = 0
+                    self.reviews = 0
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append(role)
+                    self.prompts.append((role, prompt))
+                    if role == "implementer":
+                        self.repairs += 1
+                        (workspace_dir or root).joinpath("repair.txt").write_text(
+                            f"repair {self.repairs}\n", encoding="utf-8"
+                        )
+                        return SimpleNamespace(final_response='{"changed_files":["repair.txt"]}')
+                    self.reviews += 1
+                    if self.reviews == 1:
+                        return SimpleNamespace(final_response='{"verdict":"changes_requested","summary":"fix review finding","findings":[{"id":"F-1","severity":"major","title":"missing"}],"checks":[]}')
+                    return SimpleNamespace(final_response='{"verdict":"pass","summary":"ok","findings":[],"checks":[]}')
+
+            failed_one = {"verdict": "changes_requested", "summary": "first failure", "findings": [{"id": "T-1", "severity": "major", "title": "failed"}], "checks": []}
+            failed_two = {"verdict": "changes_requested", "summary": "second failure", "findings": [{"id": "T-2", "severity": "major", "title": "failed again"}], "checks": []}
+            passed = {"verdict": "pass", "summary": "passed", "findings": [], "checks": []}
+            driver = Driver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"HAFLEET_QUALITY_MAX_ROUNDS": "2", "HAFLEET_VERIFICATION_MAX_REPAIRS": "3"},
+                clear=False,
+            ), mock.patch("hafleet_arc.orchestrator.has_project_tests", return_value=True), mock.patch(
+                "hafleet_arc.orchestrator.run_project_tests",
+                side_effect=[failed_one, failed_two, passed, passed],
+            ):
+                result = orchestrator._review_loop(self._module(1, "REQ-1"), "Review REQ-1")
+
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(driver.calls, ["implementer", "implementer", "reviewer", "implementer", "reviewer"])
+            review_prompts = [prompt for role, prompt in driver.prompts if role == "reviewer"]
+            self.assertIn("Review loop round 1/2", review_prompts[0])
+            self.assertIn("Review loop round 2/2", review_prompts[1])
+            verification_prompts = [prompt for role, prompt in driver.prompts if role == "implementer" and "Deterministic execution" in prompt]
+            self.assertEqual(len(verification_prompts), 2)
+            self.assertTrue(all("before Reviewer round\n1/2" in prompt for prompt in verification_prompts))
+            state = orchestrator.checkpoint.read()
+            self.assertEqual(state["current_review_round"], 2)
+            self.assertEqual(state["current_verification_attempt"], 3)
 
     def test_incremental_review_skips_reviewer_when_repair_changes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -590,6 +693,37 @@ class OrchestratorTests(unittest.TestCase):
                 orchestrator.run([self._module(1, "REQ-1")])
 
             self.assertFalse(orchestrator.checkpoint.read()["architecture_completed"])
+
+    def test_resume_recovers_completed_architecture_before_restarting_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            template = Path(__file__).resolve().parents[1] / "template" / "web"
+            shutil.copytree(template, root, dirs_exist_ok=True)
+            driver = FakeDriver()
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            orchestrator.requirement_tree = {"id": "ROOT", "children": []}
+            orchestrator.architecture_path.parent.mkdir(parents=True, exist_ok=True)
+            orchestrator.architecture_path.write_text("# Completed architecture\n", encoding="utf-8")
+            orchestrator._message(
+                "turn.completed",
+                "architect",
+                phase="architecture",
+                payload={"response": "completed"},
+            )
+
+            orchestrator._run_architecture()
+
+            self.assertTrue(checkpoint.read()["architecture_completed"])
+            self.assertNotIn("architect", [role for role, _ in driver.calls])
+            self.assertEqual(len(orchestrator.runtime.git.messages), 1)
 
     def test_architecture_pause_records_root_phase(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

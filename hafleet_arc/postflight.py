@@ -64,15 +64,36 @@ def validate_web_structure(output_dir: Path) -> list[str]:
         for path in backend.rglob(suffix)
         if "node_modules" not in path.parts
     ]
+    # Accept both direct reads and a modular configuration boundary such as
+    # `createConfig(process.env)` plus `env.PORT` in another backend module.
+    # The later startup rehearsal remains the authoritative proof that the
+    # injected port is actually honored, so this structural gate should not
+    # reject a thin server entrypoint merely because configuration is delegated.
+    direct_port = re.compile(
+        r"\bprocess\s*\.\s*env\s*(?:\??\.\s*PORT|\[\s*['\"]PORT['\"]\s*\])"
+    )
+    indirect_port = re.compile(
+        r"\b(?:env|environment)\s*(?:\??\.\s*PORT|\[\s*['\"]PORT['\"]\s*\])"
+    )
+    destructured_port = re.compile(
+        r"\{[^}]*\bPORT\b[^}]*\}\s*=\s*(?:process\s*\.\s*)?env\b"
+    )
+    reads_process_env = False
+    reads_indirect_port = False
     reads_port = False
     for source in backend_sources:
         try:
             text = source.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        if "process.env.PORT" in text or "process.env['PORT']" in text or 'process.env["PORT"]' in text:
+        reads_process_env = reads_process_env or bool(re.search(r"\bprocess\s*\.\s*env\b", text))
+        reads_indirect_port = reads_indirect_port or bool(
+            indirect_port.search(text) or destructured_port.search(text)
+        )
+        if direct_port.search(text):
             reads_port = True
             break
+    reads_port = reads_port or (reads_process_env and reads_indirect_port)
     if not reads_port:
         errors.append("backend must read the PORT environment variable")
     return errors

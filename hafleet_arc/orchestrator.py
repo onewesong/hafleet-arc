@@ -162,6 +162,23 @@ def _quality_round_budget(configured: int) -> int:
     return max(override, 1)
 
 
+def _verification_repair_budget(review_rounds: int) -> int:
+    """Return an independent bounded budget for deterministic test repairs.
+
+    Verification failures must not consume Reviewer passes. Operators may still
+    cap unattended repair work separately so a broken or flaky project command
+    cannot loop forever.
+    """
+
+    raw = os.environ.get("HAFLEET_VERIFICATION_MAX_REPAIRS", "").strip()
+    if not raw:
+        return max(int(review_rounds or 1), 1)
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        return max(int(review_rounds or 1), 1)
+
+
 def copy_template_contents(template_dir: Path, output_dir: Path) -> None:
     """Copy optional starter assets without overwriting resumed work."""
 
@@ -274,11 +291,14 @@ class FleetOrchestrator:
             parent_id=request["id"],
         )
         try:
-            # Keep the initial implementation context warm, but isolate corrective
-            # turns from stale model conclusions. The complete requirement subtree,
-            # plan, and structured feedback are supplied again, while workspace files
-            # and MessageBus history remain durable across the fresh conversation.
-            if phase in {"review", "final-review", "repair", "completion", "self-check"}:
+            # Conversation lifetime follows module and decision boundaries:
+            # - every module implementation starts fresh, preventing requirement
+            #   context from leaking or accumulating across REQ modules;
+            # - self-check/completion stay warm because they are consecutive work on
+            #   the same module and benefit from the implementer's local reasoning;
+            # - repairs, reviews, and final integration start fresh because their
+            #   structured prompts/files are the durable source of truth.
+            if phase in {"implement", "review", "final-review", "repair", "integration"}:
                 reset_thread = getattr(self.driver, "reset_thread", None)
                 if callable(reset_thread):
                     reset_thread(role, workspace_dir=workspace_dir)
@@ -765,8 +785,12 @@ implementation source files. Return the required structured Tester JSON response
         repair_role = loop.repair or "implementer"
         review_strategy = str(loop.options.get("review_strategy") or "full_then_incremental").strip().lower()
         max_rounds = _quality_round_budget(loop.max_rounds)
+        max_verification_repairs = _verification_repair_budget(max_rounds)
         previous_hash = ""
         previous_fingerprint: tuple[tuple[str, str], ...] | None = None
+        previous_test_hash = ""
+        previous_test_fingerprint: tuple[tuple[str, str], ...] | None = None
+        verification_repairs = 0
         previous_review_feedback: dict[str, Any] | None = None
         review_baseline_snapshot: dict[str, bytes] | None = None
         feedback: dict[str, Any] = {}
@@ -825,7 +849,8 @@ source text assertions. Re-run the relevant test and include its command and res
             review_baseline_snapshot = repair_baseline
             parent_id = resume_message_id
             first_round = repair_round + 1
-        for round_number in range(first_round, max_rounds + 1):
+        round_number = first_round
+        while round_number <= max_rounds:
             self._check_pause(module, "final-review" if final_review else "review")
             latest_test_result: dict[str, Any] | None = None
             tester_enabled = self._tester_enabled(module, workspace_dir)
@@ -836,6 +861,12 @@ source text assertions. Re-run the relevant test and include its command and res
                 and has_project_tests(workspace_dir or self.output_dir, module.node_id if module else "ROOT")
             )
             if project_tests_enabled:
+                verification_attempt = verification_repairs + 1
+                self.checkpoint.update_pipeline(
+                    module.node_id if module else "ROOT",
+                    current_verification_attempt=verification_attempt,
+                    review_round=round_number,
+                )
                 test_result = self._run_registered_project_tests(
                     module,
                     workspace_dir=workspace_dir,
@@ -846,16 +877,21 @@ source text assertions. Re-run the relevant test and include its command and res
                 if not test_passes(test_result):
                     current_hash = test_hash(test_result)
                     current_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
-                    if current_hash == previous_hash and current_fingerprint == previous_fingerprint:
+                    if current_hash == previous_test_hash and current_fingerprint == previous_test_fingerprint:
                         self._defer_quality(module, "test", "project verification made no progress")
                         return test_result
-                    if round_number >= max_rounds:
-                        self._defer_quality(module, "test", f"project verification exceeded {max_rounds} rounds")
+                    if verification_repairs >= max_verification_repairs:
+                        self._defer_quality(
+                            module,
+                            "test",
+                            f"project verification exceeded {max_verification_repairs} repair attempts",
+                        )
                         return test_result
                     repair_prompt = base_prompt + f"""
 
-Deterministic execution of the project-owned verification commands failed in repair
-round {round_number}. These commands and diagnostics come only from tests generated
+Deterministic execution of the project-owned verification commands failed in verification
+repair attempt {verification_attempt}/{max_verification_repairs}, before Reviewer round
+{round_number}/{max_rounds}. These commands and diagnostics come only from tests generated
 inside the workspace from the supplied requirements; they are not evaluator tests:
 {json.dumps(test_result, ensure_ascii=False, indent=2)}
 
@@ -866,13 +902,20 @@ with source inspection. Re-run the registered commands, update
 Prioritize the earliest failed prerequisite because dependent workflows may be
 invalid until it passes.
 """
-                    self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", round_number=round_number, review_findings=test_result.get("findings", []))
+                    self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", review_round=round_number, current_verification_attempt=verification_attempt, review_findings=test_result.get("findings", []))
                     repair_result = self._run_agent(repair_role, repair_prompt.strip(), module=module, phase="repair", round_number=round_number, workspace_dir=workspace_dir, parent_id=parent_id)
                     self._message("agent.message", repair_role, module=module, phase="repair", round_number=round_number, payload={"response": str(getattr(repair_result, "final_response", "") or "")[:20000], "test_feedback": test_result}, parent_id=parent_id)
-                    previous_hash = current_hash
-                    previous_fingerprint = current_fingerprint
+                    previous_test_hash = current_hash
+                    previous_test_fingerprint = current_fingerprint
+                    verification_repairs += 1
                     continue
             if tester_enabled:
+                verification_attempt = verification_repairs + 1
+                self.checkpoint.update_pipeline(
+                    module.node_id if module else "ROOT",
+                    current_verification_attempt=verification_attempt,
+                    review_round=round_number,
+                )
                 tester_node = self.pipeline.node("final_test") if final_review else self.pipeline.node("tester")
                 tester_role = loop.test or (tester_node.role if tester_node else "") or self.pipeline.role_for("tester", "tester")
                 test_result = self._run_tester(
@@ -888,7 +931,7 @@ invalid until it passes.
                 if not test_passes(test_result):
                     current_hash = test_hash(test_result)
                     current_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
-                    if current_hash == previous_hash and current_fingerprint == previous_fingerprint:
+                    if current_hash == previous_test_hash and current_fingerprint == previous_test_fingerprint:
                         self.checkpoint.update_pipeline(
                             module.node_id if module else "ROOT",
                             node="blocked",
@@ -898,14 +941,15 @@ invalid until it passes.
                         )
                         self._defer_quality(module, "test", "test loop made no progress")
                         return test_result
-                    if round_number >= max_rounds:
+                    if verification_repairs >= max_verification_repairs:
                         self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="blocked", loop_status="blocked", test_status="failed", last_test_hash=current_hash)
-                        self._defer_quality(module, "test", f"test loop exceeded {max_rounds} rounds")
+                        self._defer_quality(module, "test", f"test loop exceeded {max_verification_repairs} repair attempts")
                         return test_result
                     repair_prompt = base_prompt + f"""
 
-Test failures require repair before review. This is repair round {round_number}; test
-feedback is authoritative:
+Test failures require repair before review. This is verification repair attempt
+{verification_attempt}/{max_verification_repairs}, before Reviewer round
+{round_number}/{max_rounds}; test feedback is authoritative:
 {json.dumps(test_result, ensure_ascii=False, indent=2)}
 
 You are the implementation agent. Modify only implementation files belonging to the
@@ -913,17 +957,18 @@ current module, resolve the failing tests, and leave test files intact unless a 
 itself is demonstrably incorrect. You must make a concrete file change when a failure
 is actionable and report changed_files; do not return only an explanation.
 """
-                    self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", round_number=round_number, review_findings=test_result.get("findings", []))
+                    self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", review_round=round_number, current_verification_attempt=verification_attempt, review_findings=test_result.get("findings", []))
                     repair_result = self._run_agent(repair_role, repair_prompt.strip(), module=module, phase="repair", round_number=round_number, workspace_dir=workspace_dir, parent_id=parent_id)
                     self._message("agent.message", repair_role, module=module, phase="repair", round_number=round_number, payload={"response": str(getattr(repair_result, "final_response", "") or "")[:20000], "test_feedback": test_result}, parent_id=parent_id)
-                    previous_hash = current_hash
-                    previous_fingerprint = current_fingerprint
+                    previous_test_hash = current_hash
+                    previous_test_fingerprint = current_fingerprint
+                    verification_repairs += 1
                     parent_id = self.bus.replay(module_id=module.node_id if module else "")[-1]["id"] if self.bus.replay(module_id=module.node_id if module else "") else parent_id
                     continue
             self.checkpoint.update_pipeline(
                 module.node_id if module else "ROOT",
                 node="review_loop",
-                round_number=round_number,
+                review_round=round_number,
                 loop_status="reviewing",
             )
             review_workspace = workspace_dir or self.output_dir
@@ -1073,7 +1118,7 @@ exists from an earlier resumed attempt.
                 self.checkpoint.update_pipeline(
                     module.node_id,
                     node="repair",
-                    round_number=round_number,
+                    review_round=round_number,
                     loop_status="changes_requested",
                     review_findings=feedback.get("findings", []),
                     last_feedback_message_id=feedback_message["id"],
@@ -1116,6 +1161,7 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 parent_id=verdict["id"],
             )
             previous_hash, previous_fingerprint, parent_id = current_hash, fingerprint, verdict["id"]
+            round_number += 1
         self._defer_quality(module, "review", "review loop terminated without approval")
         return feedback
 
@@ -1267,9 +1313,11 @@ weakening the assertion. Re-run the focused tests and report the command/result.
         root_contracts = root_capabilities.get("seed_contracts", [])
         gateway_contracts = root_capabilities.get("gateway_contracts", [])
         state_interference_contract = root_capabilities.get("state_interference_contract", {})
+        identity_consistency_contract = root_capabilities.get("identity_consistency_contract", {})
         root_contracts_text = json.dumps(root_contracts, ensure_ascii=False, indent=2)
         gateway_contracts_text = json.dumps(gateway_contracts, ensure_ascii=False, indent=2)
         state_interference_text = json.dumps(state_interference_contract, ensure_ascii=False, indent=2)
+        identity_consistency_text = json.dumps(identity_consistency_contract, ensure_ascii=False, indent=2)
         workspace_note = ""
         if workspace_dir is not None:
             workspace_note = textwrap.dedent(
@@ -1307,6 +1355,13 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             multi-client and repeatability checks before declaring related flows done:
             ```json
             {state_interference_text}
+            ```
+            Whole-project identity consistency gate inferred only from public
+            authentication, account, seed, and recovery requirements. When non-empty,
+            unique identifier ownership and token-scoped recovery are prerequisite
+            release gates for protected downstream flows:
+            ```json
+            {identity_consistency_text}
             ```
             Coordinator plan path: {plan_path}
             Global architecture document: {self.architecture_path}
@@ -1443,7 +1498,9 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             )
             resume_feedback: dict[str, Any] | None = None
             resume_message_id = str(checkpoint_state.get("last_feedback_message_id") or "")
-            resume_round = int(checkpoint_state.get("current_round", 0) or 0)
+            resume_round = int(
+                checkpoint_state.get("current_review_round", checkpoint_state.get("current_round", 0)) or 0
+            )
             if resume_loop:
                 messages = self.bus.replay(module_id=module.node_id)
                 if resume_message_id:
@@ -1603,6 +1660,7 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             root_capabilities = build_capability_model(self.requirement_tree or {})
             gateway_contracts = root_capabilities.get("gateway_contracts", [])
             state_interference_contract = root_capabilities.get("state_interference_contract", {})
+            identity_consistency_contract = root_capabilities.get("identity_consistency_contract", {})
             # Give the implementation agent one explicit, whole-project integration
             # pass before the read-only final audit.  Module turns are intentionally
             # scoped, but cross-module navigation/authentication/persistence bugs are
@@ -1649,6 +1707,12 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     {json.dumps(state_interference_contract, ensure_ascii=False, indent=2)}
                     ```
 
+                    Identity consistency gate derived only from public authentication,
+                    account, seed, and recovery requirements:
+                    ```json
+                    {json.dumps(identity_consistency_contract, ensure_ascii=False, indent=2)}
+                    ```
+
                     Audit and improve the running product across module boundaries. Exercise
                     public behavior with focused smoke checks, but do not start a long-lived
                     server. First create or update a compact project-owned gateway smoke suite.
@@ -1682,6 +1746,15 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     affect only its own session unless the public requirements explicitly demand a
                     global or single-session policy. Repair shared-token, destructive session
                     replacement, or lost-update persistence designs instead of serializing the test.
+
+                    When the identity consistency gate is non-empty, exercise every
+                    app-owned public seed account through every supported sign-in identifier
+                    and assert it resolves to exactly its owning durable identity. Seed
+                    identifiers must be unique, lookup precedence deterministic, and ambiguous
+                    matches rejected rather than selecting the first record. Exercise
+                    overlapping recovery/reset challenges and prove consuming one opaque token
+                    preserves another still-valid challenge. Repeat these checks after restart
+                    and any supported persisted-data migration.
 
                     For every public state-changing flow listed by the interference gate,
                     run at least two isolated clients against the same service. Exercise a
@@ -1734,6 +1807,13 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                         active sessions, refresh-visible mutation results, atomic persistence,
                         and a second clean invocation of destructive scenarios. Serial-only
                         evidence or tests that consume shared seed fixtures are major gaps. Also treat
+                        identity consistency as a release gate whenever public requirements
+                        accept multiple login identifiers or describe seeded accounts/recovery.
+                        Require project-owned evidence that every public seed identifier maps
+                        uniquely to its owning durable identity, ambiguous identifiers are
+                        rejected deterministically, and overlapping reset challenges are
+                        independently consumable. A one-account happy-path login check is
+                        insufficient evidence for a multi-account seed model. Also treat
                         collection projection as a release gate: reject a filter/sort/date or
                         navigation transition if the canonical URL can change while stale prior
                         rows remain visible, or if tests do not inspect every visible item, count,
@@ -1793,7 +1873,9 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     module,
                     base_prompt,
                     workspace_dir=workspace,
-                    resume_round=int(checkpoint_state.get("current_round", 0) or 0),
+                    resume_round=int(
+                        checkpoint_state.get("current_review_round", checkpoint_state.get("current_round", 0)) or 0
+                    ),
                     resume_feedback=dict(match["payload"]),
                     resume_message_id=feedback_id,
                 )
@@ -2050,6 +2132,35 @@ weakening the assertion. Re-run the focused tests and report the command/result.
         requirement_tree = self.requirement_tree
         if requirement_tree is None:
             raise RuntimeError("architecture requirement tree is unavailable")
+        # A process can exit after the Architect turn completed but before the
+        # structural gate/checkpoint was recorded (for example, after a validator
+        # false positive). Recover only when the durable MessageBus proves the turn
+        # completed and the current artifacts now satisfy the delivery contract.
+        completed_architecture_turn = any(
+            message.get("kind") == "turn.completed"
+            and message.get("from") == self.pipeline.role_for("architect", "architect")
+            and message.get("phase") == "architecture"
+            for message in self.bus.replay()
+        )
+        architecture_ready = (
+            self.architecture_path.is_file()
+            and bool(self.architecture_path.read_text(encoding="utf-8", errors="ignore").strip())
+        )
+        structure_violations = (
+            validate_web_structure(self.output_dir)
+            if architecture_ready and self.task_type == "web"
+            else []
+        )
+        if completed_architecture_turn and architecture_ready and not structure_violations:
+            checkpoint_message = "ROOT: architecture scaffold"
+            committed = self._commit_operation(checkpoint_message, "architect", phase="architecture")
+            self.checkpoint.mark_architecture_completed()
+            log(
+                f"[hafleet] Recovered completed architecture artifacts; checkpoint "
+                f"{'created' if committed else 'reused'}: {checkpoint_message}",
+                flush=True,
+            )
+            return
         try:
             self._run_agent(self.pipeline.role_for("architect", "architect"), self._architecture_prompt(requirement_tree), phase="architecture")
             if self.pause_request_path.exists():

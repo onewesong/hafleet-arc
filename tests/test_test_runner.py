@@ -5,10 +5,62 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hafleet_arc.test_runner import discover_project_test_commands, has_project_tests, run_project_tests
+from hafleet_arc.test_runner import (
+    _bounded_node_test_command,
+    _project_uses_playwright,
+    discover_project_test_commands,
+    has_project_tests,
+    run_project_tests,
+)
 
 
 class ProjectTestDiscoveryTests(unittest.TestCase):
+    def test_node_test_commands_force_exit_after_reporting_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text(
+                json.dumps({"scripts": {"test": "node --test test/**/*.test.js"}}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _bounded_node_test_command(["npm", "run", "test"], root),
+                ["node", "--test", "--test-force-exit", "test/**/*.test.js"],
+            )
+            self.assertEqual(
+                _bounded_node_test_command(["node", "--test", "focused.test.js"], root),
+                ["node", "--test", "--test-force-exit", "focused.test.js"],
+            )
+
+    def test_compound_package_test_script_is_not_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text(
+                json.dumps({"scripts": {"test": "npm run build && node --test test/**/*.test.js"}}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _bounded_node_test_command(["npm", "run", "test"], root),
+                ["npm", "run", "test"],
+            )
+
+    def test_detects_playwright_import_in_project_test_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            test_dir = root / "backend" / "test"
+            test_dir.mkdir(parents=True)
+            (test_dir / "browser.test.js").write_text(
+                'import { chromium } from "playwright";\n', encoding="utf-8"
+            )
+
+            self.assertTrue(
+                _project_uses_playwright(
+                    root,
+                    [(["npm", "run", "test"], root / "backend", "backend tests", "self")],
+                )
+            )
+
     def test_prefers_workspace_verification_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

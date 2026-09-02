@@ -237,9 +237,77 @@ def _state_interference_contract(requirements: list[dict[str, Any]], limit: int 
             "Exercise state-changing scenarios against one running service with at least two isolated clients, not only one serial in-memory client.",
             "While one client mutates state, prove another active client keeps its independent session and unrelated actor-owned data; a credential change must not silently destroy already-authenticated sessions unless the public requirement explicitly says so.",
             "After create/update/delete/cancel/refund operations, verify the resulting owner-scoped collection and dependent views through the public API/UI and after refresh.",
+            "When a mutation reserves, locks, decrements, or otherwise consumes a finite resource, observe the resource before and after the mutation and prove every cancel/refund/expiry path restores or finalizes it exactly once as required; reap expired reservations before every public availability projection or competing reservation attempt, without requiring the original owner to revisit its order.",
+            "For countdowns, expirations, polling, progress, or other time-driven UI, prove liveness by observing at least two distinct values or the required terminal transition; rendering a static timer-shaped string is insufficient.",
             "Run destructive scenarios from deterministic reset state and repeat the same project-owned suite; a prior invocation must not consume fixtures required by the next invocation.",
             "Use atomic persistence updates so concurrent session, collection, inventory, or order mutations cannot overwrite unrelated state through a stale read-modify-write cycle.",
             "Do not solve interference by serializing all tests, adding evaluator-only reset hooks, or weakening observable assertions.",
+        ],
+    }
+
+
+def _identity_consistency_contract(
+    requirements: list[dict[str, Any]], seed_contracts: list[dict[str, Any]], limit: int = 80
+) -> dict[str, Any]:
+    """Derive an authentication identity gate only from public requirement text.
+
+    Authentication is a high-fan-out prerequisite. A generated application can appear
+    correct for one account while ambiguous seed identifiers, destructive session
+    replacement, or single-use recovery state break every protected downstream flow.
+    This contract stays domain-neutral and never consults evaluator fixtures.
+    """
+
+    auth = re.compile(
+        r"\b(auth(?:entication)?|sign[ -]?in|log[ -]?in|register|account|username|password|credential|mobile|phone|e-?mail|reset|recover)\b",
+        re.IGNORECASE,
+    )
+    identifier = re.compile(r"\b(username|mobile|phone|e-?mail|account|identifier|login)\b", re.IGNORECASE)
+    recovery = re.compile(r"\b(reset|recover|forgot|verification|challenge|token)\b", re.IGNORECASE)
+    requirement_ids: list[str] = []
+    identifier_requirement_ids: list[str] = []
+    recovery_requirement_ids: list[str] = []
+
+    for requirement in requirements:
+        requirement_id = str(requirement.get("id") or "")
+        pieces = [
+            str(requirement.get("title") or ""),
+            str(requirement.get("description") or ""),
+            *[str(item) for item in requirement.get("acceptance", [])],
+        ]
+        for scenario in requirement.get("scenarios", []):
+            pieces.append(str(scenario.get("name") or ""))
+            transition = scenario.get("transition") if isinstance(scenario, dict) else {}
+            if isinstance(transition, dict):
+                pieces.extend(str(item) for key in ("preconditions", "actions", "observable_results") for item in transition.get(key, []))
+        text = " ".join(pieces)
+        if auth.search(text) and requirement_id and requirement_id not in requirement_ids:
+            requirement_ids.append(requirement_id)
+        if identifier.search(text) and requirement_id and requirement_id not in identifier_requirement_ids:
+            identifier_requirement_ids.append(requirement_id)
+        if recovery.search(text) and requirement_id and requirement_id not in recovery_requirement_ids:
+            recovery_requirement_ids.append(requirement_id)
+        if len(requirement_ids) >= limit:
+            break
+
+    seed_signals = [
+        item for item in seed_contracts
+        if auth.search(f"{item.get('category', '')} {item.get('statement', '')}")
+    ][:limit]
+    if not requirement_ids and not seed_signals:
+        return {}
+    return {
+        "requirement_ids": requirement_ids,
+        "identifier_requirement_ids": identifier_requirement_ids,
+        "recovery_requirement_ids": recovery_requirement_ids,
+        "seed_signals": seed_signals,
+        "release_gate": True,
+        "verification_contract": [
+            "Build one canonical identity resolver for every publicly accepted sign-in identifier; username, e-mail, mobile/phone, aliases, and case normalization must resolve deterministically to exactly one owning account.",
+            "Give app-owned seeded accounts unique values for every accepted unique identifier. Never silently choose the first record when an identifier is duplicated; reject ambiguous credentials with the public validation/error contract.",
+            "From clean isolated persistence, iterate every public seeded account through every supported login identifier and assert the returned durable identity, protected navigation, and refresh reconstruction belong to that same account.",
+            "Exercise two concurrent sessions for the same account and two different accounts. A later login, credential update, or logout must not overwrite or revoke unrelated active sessions unless the public requirements explicitly require it.",
+            "When recovery/reset is supported, create overlapping challenges and consume each by its own opaque token. Creating or consuming one challenge must not invalidate another still-valid challenge unless the public contract explicitly says so.",
+            "Repeat the identity gateway suite after process restart and from a migrated older persisted data shape; bootstrap/migration must preserve user-owned unique identifiers and repair only app-owned ambiguous defaults.",
         ],
     }
 
@@ -343,12 +411,14 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 160)
         count = dependent_counts.get(str(requirement.get("id") or ""), 0)
         requirement["dependent_count"] = count
         requirement["critical_prerequisite"] = count >= 2
+    seed_contracts = _root_data_contracts(tree)
     return {
         "source": "arc_requirement_tree",
         "requirements": requirements,
-        "seed_contracts": _root_data_contracts(tree),
+        "seed_contracts": seed_contracts,
         "gateway_contracts": _gateway_contracts(requirements),
         "state_interference_contract": _state_interference_contract(requirements),
+        "identity_consistency_contract": _identity_consistency_contract(requirements, seed_contracts),
         # This is a domain-neutral browser/API contract.  It gives an agent a
         # stable interoperability target without revealing evaluator details or
         # prescribing product-specific selectors.
@@ -365,9 +435,12 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 160)
             "forms": [
                 "Every input, select, radio group, checkbox, and date control has a visible label or equivalent accessible name.",
                 "Choose native control semantics that match the requirement and authored reference: enumerable choices use a labeled select/radio group, while free-form values use inputs; dialogs and expandable forms expose a stable accessible region name.",
+                "Choose native interactive elements by intent: anchors with real href values navigate, while buttons perform submissions, sign-out, deletion, payment, cancellation, toggles, and other state-changing actions; do not emulate actions with anchors plus preventDefault or navigation with spans/divs.",
+                "Every requirement-named clickable affordance is discoverable by its semantic role and accessible name. When the authenticated identity is the entry to an available account/profile center, render the displayed identity as a real named link to that destination rather than a non-interactive span.",
                 "Required fields expose required semantics and deterministic validation messages without losing entered values.",
                 "Validation is enforced at the API boundary as well as the UI; errors identify the field or business conflict and use a non-2xx status for rejected mutations.",
                 "Submit controls expose a stable accessible name and prevent duplicate submissions while pending.",
+                "Inactive wizard steps, closed dialogs, collapsed panels, and elements carrying the hidden attribute are absent from layout, pointer interaction, focus order, and the accessibility tree; author CSS must not accidentally override their hidden state.",
             ],
             "api": [
                 "JSON endpoints use consistent success and error envelopes with appropriate HTTP status codes.",
@@ -382,12 +455,16 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 160)
                 "Every async view has explicit loading, empty, recoverable error, and retry states; stale data is not presented as a successful response.",
                 "Logout clears client credentials and protects authenticated views after reload.",
                 "Runtime dates and seeded records derive from the requirement-configured clock/environment rather than generation-time constants.",
+                "Every accepted authentication identifier resolves to exactly one durable identity; app-owned seed accounts use unique identifiers and ambiguous matches are rejected rather than selecting the first record.",
+                "Concurrent password/account-recovery challenges are token-scoped and do not erase another still-valid challenge unless the public contract explicitly requires single-challenge behavior.",
             ],
             "collections": [
                 "A filter, sort, pagination, date switch, or navigation preset must project the actual visible collection, update its count and empty state, and preserve the same projection in the canonical URL and after refresh.",
                 "When a requirement says the current actor, account holder, owner, or self record always appears and cannot be deleted, derive that protected row from the authenticated durable identity on every read, deduplicate legacy persisted owner rows, omit destructive controls for it, and prove ordinary collection mutations and restart cannot remove it.",
                 "When a collection query changes, stale rows must be hidden or marked busy synchronously before the URL/result transition; clients must never observe the new query together with rows from the previous projection.",
                 "Executable tests must inspect every visible data item after each composed filter, not merely wait for one matching item that was already present before the transition.",
+                "Filter and sort fixtures must be non-vacuous: provide multiple distinct selectable values and prove the action excludes or reorders at least one item; a changed URL alone is not behavioral evidence.",
+                "When requirement prose specifies hover, focus, keyboard activation, click, drag, or native selection, exercise that exact interaction modality in a browser test rather than substituting a different action.",
                 "Composite or multi-segment results use a semantic list item/article/card boundary and visibly label every segment, connection/wait duration, total duration, price, and action; ordering and result limits are deterministic.",
             ],
         },
@@ -395,17 +472,25 @@ def build_capability_model(tree: dict[str, Any], *, max_requirements: int = 160)
             "Trace every leaf requirement and scenario to an implementation behavior and executable test.",
             "For each user-visible flow cover success, invalid input, empty state, failure response, and refresh/persistence where applicable.",
             "For each API cover input validation, authorization, success response, error status, and persistence where applicable.",
+            "Exercise requirement-named controls through their native semantic roles: links for navigation and buttons for state-changing actions; verify any displayed account identity that opens an account center is a named link and survives authentication refresh.",
             "When requirements mention seeded/example records, verify a fresh process bootstraps deterministic app-owned data without evaluator setup.",
             "When author-provided visual references exist, verify the corresponding observable layout/content states without relying on hidden selectors.",
             "Execute prerequisite scenarios before dependents and treat a failed high-fan-out prerequisite as blocking because it can invalidate many downstream flows.",
             "Build a compact smoke gate for every repeated GIVEN precondition in gateway_contracts and run those gates before dependent scenarios.",
             "For authentication/session gateways, exercise two isolated clients concurrently and reject implementations where a later login silently invalidates an earlier active session without an explicit requirement.",
+            "For identity gateways, iterate every public seeded account through every supported sign-in identifier and prove each identifier resolves uniquely to its owning durable identity after refresh and restart.",
+            "For recovery gateways, create overlapping reset challenges and prove consuming one opaque token does not destroy a different still-valid challenge unless explicitly required.",
             "For public state-changing scenarios, run two isolated clients against one service and prove credential, profile, collection, inventory, and order mutations preserve unrelated sessions and actor-owned state.",
+            "For finite-resource workflows, assert inventory or capacity before reservation, after reservation, and after every cancellation/refund/expiry path, including a competing client reading availability and reserving immediately after expiry before the original owner calls an order endpoint, so resources are neither leaked nor released twice.",
+            "For time-driven behavior, observe the value changing or reaching its specified terminal state under a bounded clock interval; a static countdown/progress label does not prove liveness.",
             "Repeat destructive project-owned scenarios from deterministic reset state and reject non-atomic persistence or fixture consumption that makes a second invocation fail.",
             "For collection filters and sorts, prove the URL, visible count, empty state, and every visible item describe one atomic projection; a stale pre-transition row is a failed gate.",
+            "For every filter and sort, use non-vacuous fixtures with distinct values, prove at least one item is excluded or reordered, and assert the complete order in every required direction instead of checking only query parameters.",
+            "Exercise the exact public interaction modality named by each requirement, including hover, focus, keyboard activation, click, drag, or native selection; an easier substitute does not prove the stated behavior.",
             "For protected self/owner collection entries, delete all optional persisted owner copies in a test fixture and prove the authenticated actor is still projected exactly once, has no destructive action, and remains after deleting unrelated rows and restarting.",
             "For composite results, verify semantic item boundaries and labeled aggregate values in addition to segment details and ordering.",
             "For each scenario assert the full GIVEN/WHEN/THEN transition, including canonical URL, visible result, API state, and reload behavior where applicable.",
+            "For multi-step or conditionally rendered UI, assert both sides of every transition: the inactive controls are truly hidden and non-focusable before/after the action, while exactly one active control set is visible. Do not silence duplicate-control failures merely by narrowing a locator.",
             "Do not invent hidden acceptance-test details; derive behavior only from the supplied requirements and observable contracts.",
         ],
     }
