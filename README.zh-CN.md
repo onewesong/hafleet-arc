@@ -36,25 +36,29 @@ flowchart TD
     C --> D["按依赖关系排列 ROOT 的直接子模块"]
     D --> E{"模块是否已经完成？"}
     E -- "是" --> F["跳过模块"]
-    E -- "否" --> G["Implementer：规划并实现需求子树"]
-    G --> H["Implementer：编写并运行测试"]
-    H --> I["Reviewer：审查需求、实现和测试"]
-    I --> J{"是否存在 blocker/major 问题？"}
-    J -- "是" --> K["Implementer 根据反馈修复"]
-    K --> I
-    J -- "否" --> L["发送事件并更新可追溯数据"]
-    L --> M["创建 Git 检查点"]
-    M --> N["更新 checkpoint.json"]
-    N --> O{"是否还有模块？"}
-    F --> O
-    O -- "是" --> E
-    O -- "否" --> P["运行最终集成审查循环"]
-    P --> Q["在 smoke 端口构建并启动交付演练"]
-    Q --> R{"Postflight 是否通过？"}
-    R -- "否" --> S["Implementer 修复明确的失败项"]
-    S --> Q
-    R -- "是" --> T["创建最终 Git 检查点"]
-    T --> U["将运行标记为已完成并退出"]
+    E -- "否" --> G["Implementer：仅规划并填写场景契约"]
+    G --> H["Reviewer：只读审核场景契约"]
+    H --> I{"契约是否存在 blocker/major 问题？"}
+    I -- "是" --> J["同一 Implementer 修订计划和契约"]
+    J --> H
+    I -- "否" --> K["同一 Implementer 实施、编写测试并执行检查"]
+    K --> L["Reviewer：审查需求、实现和测试"]
+    L --> M{"实现是否存在 blocker/major 问题？"}
+    M -- "是" --> N["Implementer 根据增量反馈修复"]
+    N --> L
+    M -- "否" --> O["发送事件并更新可追溯数据"]
+    O --> P["创建 Git 检查点"]
+    P --> Q["更新 checkpoint.json"]
+    Q --> R{"是否还有模块？"}
+    F --> R
+    R -- "是" --> E
+    R -- "否" --> S["运行最终集成审查循环"]
+    S --> T["在 smoke 端口构建并启动交付演练"]
+    T --> U{"Postflight 是否通过？"}
+    U -- "否" --> V["Implementer 修复明确的失败项"]
+    V --> T
+    U -- "是" --> W["创建最终 Git 检查点"]
+    W --> X["将运行标记为已完成并退出"]
 ```
 
 ### 1. 初始化工作区
@@ -98,10 +102,31 @@ python3 main.py /path/to/requirements \
 审查及修复策略。角色 Prompt 也统一维护在该 YAML 的 `roles.<role>` 下。运行级配置
 可以只覆盖一个 Prompt，同时继承其他内置角色 Prompt。
 
-省略该文件时，将使用默认的 Architect → Implementer → Reviewer 循环 → checkpoint
-→ Postflight 流水线。默认模块流程没有独立的 Planner 或 Tester：Implementer 会在
-一次 Turn 中完成规划和实施。声明了 `planner` Agent 的旧版或自定义 YAML 仍会使用
-独立规划阶段。
+省略该文件时，将使用默认的 Architect → Implementer 规划 → 契约审核 → Implementer
+实施 → Reviewer 循环 → checkpoint → Postflight 流水线。默认模块流程没有独立的
+Planner 或 Tester：规划和实施仍由同一个 Implementer 负责，只在中间插入只读契约
+门禁。声明了 `planner` Agent 的旧版或自定义 YAML 仍会由该角色承担规划阶段。
+
+默认流水线的相关部分等价于：
+
+```yaml
+nodes:
+  - id: implementation_plan
+    type: agent
+    role: implementer
+  - id: contract_review
+    type: loop
+    mode: contract
+    review: reviewer
+    repair: implementer
+    until: no_major_findings
+    max_rounds: 2
+  - id: implementer
+    type: agent
+    role: implementer
+```
+
+契约门禁使用独立轮次预算，不会占用后续实现质量审查的轮次。
 
 每个 Turn 和操作都会追加到 `.arc/hafleet/messages.jsonl`。该日志可以持久化并在
 重启后回放；Dashboard 的 `/api/stream` 接口使用 Server-Sent Events（以及
@@ -166,7 +191,7 @@ PYTHONPATH=. python3 -m hafleet_arc.dashboard /path/to/output --port 3200
 ROOT 的每个直接子节点都会成为一个模块。模块按稳定且依赖感知的顺序处理。对子孙
 节点的依赖不会限制顶层模块排序；出现依赖环时会回退到源码顺序，避免运行死锁。
 
-### 4. 规划并实现模块
+### 4. 规划并审核场景契约
 
 `implementer` 会收到完整的需求子树、任务类型、已经完成的模块 ID，以及当前仓库
 上下文。它首先将具体实施计划写入：
@@ -175,9 +200,43 @@ ROOT 的每个直接子节点都会成为一个模块。模块按稳定且依赖
 .arc/hafleet/plans/<module-id>.md
 ```
 
-计划覆盖数据模型、路由或 UI、持久化、校验、需求场景和验证方式。在同一个 Turn 中，
-Implementer 会在共享输出工作区实现整个需求子树。它必须保留之前模块的行为、实现
-真实且可持久化的功能而不是静态模拟页面，并在工作过程中运行聚焦检查。
+在这个仅规划的 Turn 中，HAFleet 还会预生成、并由 Implementer 填写：
+
+```text
+.arc/hafleet/contracts/<module-id>.json
+```
+
+契约为每个原始 scenario 保留一条稳定记录，包括 GIVEN/WHEN/THEN、计划修改文件、
+公开可观察结果、规范 URL、持久状态、测试 ID 和具体断言。若 Implementer 在规划阶段
+提前修改业务源码，HAFleet 会恢复这些源码改动，但保留计划和契约产物。
+
+每条场景记录都可以被明确审核，例如：
+
+```json
+{
+  "scenario_id": "REQ-5.3.9-S002",
+  "requirement_id": "REQ-5.3.9",
+  "given": [],
+  "when": [],
+  "then": [],
+  "planned_files": ["frontend/src/..."],
+  "observable_checks": ["对话框关闭且订单保持不变。"],
+  "canonical_url": "/personal-center/orders?tab=uncompleted",
+  "durable_state": "订单状态保持未支付。",
+  "test_id": "T-REQ-5.3.9-S002",
+  "assertions": ["对话框已隐藏。", "订单仍以未支付状态显示。"]
+}
+```
+
+开始编码前，只读 Reviewer 会把计划和场景契约与原始需求子树、作者提供的参考资源
+逐项对照。遗漏或薄弱的场景映射会返回同一个 Implementer 会话修订。该独立门禁由
+`pipeline.yaml` 中的 `contract_review` 节点声明，默认最多两轮。若有限轮次仍未收敛，
+无人值守模式会保留最新反馈并继续实施；设置
+`HAFLEET_QUALITY_ON_EXHAUSTION=pause` 可改为严格暂停。
+
+审核通过后，同一个 Implementer 会话再实现完整需求子树，并使用稳定的场景测试 ID
+编写和运行测试。这样既不重新引入 Planner→Implementer 的信息传递，也能在昂贵的
+代码实现前发现需求理解偏差。
 
 ### 5. 审查循环与修复
 
@@ -191,8 +250,10 @@ Web 项目可以使用 `frontend/tests/e2e` 中的 Playwright；测试结果和�
 它不会运行测试、启动服务器或安装依赖；它会静态评估上报的测试结果和测试质量，
 随后返回结构化 JSON 结论。它绝不会编辑源文件或 Git 状态。问题严重级别包括
 `blocker`、`major`、`minor` 和 `info`。Blocker/major 问题会追加到消息总线并路由给
-`implementer`，由其修复当前模块。Reviewer 会持续复查，直到模块通过，或有界循环
-暂停（默认三轮）。Minor/info 问题不会阻止创建检查点，但仍会显示在 Dashboard 中。
+`implementer`，由其修复当前模块。Reviewer 会持续复查，直到模块通过或有界循环
+耗尽。确定性项目测试拥有独立的修复预算，因此失败的测试命令不再占用 Reviewer
+审查轮次。相同失败第一次无进展时还会获得一次新的诊断修复 Turn，之后才会被判定为
+无进展。Minor/info 问题不会阻止创建检查点，但仍会显示在 Dashboard 中。
 
 模块通过审查后，Orchestrator 会：
 
@@ -227,8 +288,12 @@ ROOT: final HAFleet integration review
 在隔离的 smoke 端口启动后端并等待 HTTP 响应。Postflight 失败时，具体错误会发送给
 Implementer，最多进行两轮修复。
 
-只有 Postflight 成功后，系统才会创建最终 Git 检查点、将 checkpoint 标记为完成、
-发送运行完成事件，并以状态码 `0` 退出。退出前会停止所有演练进程。
+构建和启动演练成功后，HAFleet 默认还会重新运行 ROOT 范围内注册的项目验证命令。
+失败结果会发送给新的 Implementer 恢复 Turn，并在 Postflight 修复预算内重新执行演练。
+只有交付演练和最终注册验证都成功后，系统才会创建最终 Git 检查点并将 checkpoint
+标记为完成。如果有限的无人值守预算耗尽后项目测试仍然失败，生成结果会保留并可交给
+评测，但不会写入最终完成 checkpoint，后续运行可以继续收敛。退出前会停止所有演练
+进程。
 
 ## 可靠性控制
 
@@ -247,9 +312,12 @@ Runner 上的外部监听进程。
 | `HAFLEET_TURN_TIMEOUT` | `1200` | 单个 Codex Turn 的最大执行秒数 |
 | `HAFLEET_SMOKE_PORT` | `3100` | 生成阶段使用的安全应用端口 |
 | `HAFLEET_POSTFLIGHT_REPAIRS` | `2` | 交付演练失败后允许 Implementer 修复的次数 |
+| `HAFLEET_FINAL_VERIFICATION` | `1` | 每次交付演练成功后重新运行 ROOT 注册项目测试 |
 | `HAFLEET_NPM_TIMEOUT` | `600` | 每个 Postflight npm 命令的超时时间 |
 | `HAFLEET_READY_TIMEOUT` | `45` | 交付演练时等待后端就绪的超时时间 |
 | `HAFLEET_FINAL_REVIEW` | `1` | 是否启用全项目 Reviewer 检查 |
+| `HAFLEET_CONTRACT_REVIEW` | `1` | 是否启用实施前场景契约门禁 |
+| `HAFLEET_CONTRACT_MAX_ROUNDS` | `2` | 独立的计划/契约审核与修订轮次 |
 | `HAFLEET_POSTFLIGHT` | `1` | 是否启用强制交付演练 |
 | `HAFLEET_PARALLEL` | `0` | 是否为独立 ROOT 模块启用 worktree |
 | `HAFLEET_MAX_WORKERS` | `2` | 并行模块 worktree 的最大并发数 |
@@ -272,8 +340,14 @@ export HAFLEET_TESTER_MODEL=gpt-5.6-terra
 均未设置，则由 Codex SDK 选择默认模型。
 
 质量审查循环有明确上限。默认情况下，达到轮次或无进展限制时会记录
-`quality_deferred`，并以无人值守方式继续处理剩余模块和 Postflight。如果希望使用
-严格的人工门禁，可设置 `HAFLEET_QUALITY_ON_EXHAUSTION=pause`。
+`quality_deferred`，并以无人值守方式继续处理剩余模块和最终收敛。项目验证修复拥有
+独立的有限预算，不会占用 Reviewer 轮次。当注册项目测试仍然失败时，最终 Postflight
+门禁不会创建完成 checkpoint。如果希望使用严格的人工门禁，可设置
+`HAFLEET_QUALITY_ON_EXHAUSTION=pause`。
+
+可以使用 `HAFLEET_VERIFICATION_MAX_REPAIRS` 限制确定性测试修复 Turn 数，使用
+`HAFLEET_QUALITY_STALL_LIMIT` 控制允许连续出现多少次相同的无进展结果。
+`HAFLEET_QUALITY_MAX_ROUNDS` 仍是独立的 Reviewer 审查轮次上限。
 
 `HAFLEET_FINAL_REVIEW=0` 会跳过可选的模型审查，但仍会运行确定性的 Postflight。
 `HAFLEET_POSTFLIGHT=0` 只适合低成本本地 Harness 测试；禁用它会失去对交付结果可运行

@@ -42,6 +42,9 @@ class Pipeline:
             candidate = self.node(node_id)
             if candidate is not None and candidate.type == "loop":
                 return candidate
+        preferred = self.node("quality_loop")
+        if preferred is not None and preferred.type == "loop":
+            return preferred
         for node in self.nodes:
             if node.type == "loop":
                 return node
@@ -145,7 +148,7 @@ def _parse(payload: dict[str, Any]) -> Pipeline:
             raise ValueError(f"unsupported loop termination condition: {raw.get('until')!r}")
         if node_type == "loop":
             mode = str(raw.get("mode") or "module").strip().lower()
-            if mode not in {"module", "integration"}:
+            if mode not in {"module", "integration", "contract"}:
                 raise ValueError(f"unsupported loop mode: {mode!r}")
         seen.add(node_id)
         max_rounds = max(int(raw.get("max_rounds", 3) or 3), 1)

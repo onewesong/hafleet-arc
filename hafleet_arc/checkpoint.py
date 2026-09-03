@@ -34,6 +34,13 @@ class CheckpointStore:
             "final_review_completed": False,
             "current_pipeline_node": None,
             "current_round": 0,
+            "current_review_round": 0,
+            "current_verification_attempt": 0,
+            "contract_review_status": "",
+            "contract_review_round": 0,
+            "last_contract_feedback_message_id": "",
+            "last_contract_feedback_hash": "",
+            "contract_findings": [],
             "loop_status": "",
             "last_feedback_message_id": "",
             "last_feedback_hash": "",
@@ -72,6 +79,13 @@ class CheckpointStore:
         payload.setdefault("final_review_completed", False)
         payload.setdefault("current_pipeline_node", None)
         payload.setdefault("current_round", 0)
+        payload.setdefault("current_review_round", int(payload.get("current_round", 0) or 0))
+        payload.setdefault("current_verification_attempt", 0)
+        payload.setdefault("contract_review_status", "")
+        payload.setdefault("contract_review_round", 0)
+        payload.setdefault("last_contract_feedback_message_id", "")
+        payload.setdefault("last_contract_feedback_hash", "")
+        payload.setdefault("contract_findings", [])
         payload.setdefault("loop_status", "")
         payload.setdefault("last_feedback_message_id", "")
         payload.setdefault("last_feedback_hash", "")
@@ -96,7 +110,17 @@ class CheckpointStore:
 
     def mark_module_started(self, module_id: str, phase: str) -> dict[str, Any]:
         payload = self.read()
-        payload.update({"paused": False, "current_node_id": module_id, "current_phase": phase, "current_pipeline_node": phase, "current_round": 0, "loop_status": "", "quality_deferred": False, "quality_exhaustion_reason": ""})
+        payload.update({"paused": False, "current_node_id": module_id, "current_phase": phase, "current_pipeline_node": phase, "current_round": 0, "current_review_round": 0, "current_verification_attempt": 0, "loop_status": "", "quality_deferred": False, "quality_exhaustion_reason": ""})
+        if phase == "design":
+            payload.update(
+                {
+                    "contract_review_status": "",
+                    "contract_review_round": 0,
+                    "last_contract_feedback_message_id": "",
+                    "last_contract_feedback_hash": "",
+                    "contract_findings": [],
+                }
+            )
         self.write(payload)
         return payload
 
@@ -114,6 +138,10 @@ class CheckpointStore:
                 payload["current_pipeline_node"] = normalized.pop("node")
             if "round_number" in normalized:
                 payload["current_round"] = int(normalized.pop("round_number") or 0)
+            if "review_round" in normalized:
+                value = int(normalized.pop("review_round") or 0)
+                payload["current_review_round"] = value
+                payload["current_round"] = value
             payload.update(normalized)
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -219,6 +247,25 @@ class CheckpointStore:
                 "paused": False,
                 "current_node_id": module_id,
                 "current_phase": "checkpoint",
+            }
+        )
+        self.write(payload)
+        return payload
+
+    def resolve_all_deferred_modules(self) -> dict[str, Any]:
+        """Promote deferred modules after a successful whole-project quality gate."""
+
+        payload = self.read()
+        completed = list(payload.get("completed", []))
+        for module_id in payload.get("deferred_modules", []):
+            if module_id not in completed:
+                completed.append(module_id)
+        payload.update(
+            {
+                "completed": completed,
+                "deferred_modules": [],
+                "quality_deferred": False,
+                "quality_exhaustion_reason": "",
             }
         )
         self.write(payload)

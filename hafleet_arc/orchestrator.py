@@ -12,6 +12,7 @@ from typing import Any, Protocol
 
 from .checkpoint import CheckpointStore
 from .capabilities import build_capability_model
+from .contracts import contract_gaps, ensure_contract_file, scenario_contracts
 from .feedback import (
     blocking_findings,
     parse_review,
@@ -131,6 +132,40 @@ def _quality_round_budget(configured: int) -> int:
     return max(override, 1)
 
 
+def _verification_repair_budget(review_rounds: int) -> int:
+    """Return a separate finite budget for deterministic test repair turns."""
+
+    raw = os.environ.get("HAFLEET_VERIFICATION_MAX_REPAIRS", "").strip()
+    if not raw:
+        return max(int(review_rounds or 1), 1)
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        return max(int(review_rounds or 1), 1)
+
+
+def _quality_stall_limit() -> int:
+    """Allow one fresh recovery attempt before declaring repeated no progress."""
+
+    try:
+        return max(int(os.environ.get("HAFLEET_QUALITY_STALL_LIMIT", "2")), 1)
+    except ValueError:
+        return 2
+
+
+def _contract_round_budget(configured: int) -> int:
+    """Resolve the independent pre-implementation contract-review budget."""
+
+    fallback = max(int(configured or 1), 1)
+    raw = os.environ.get("HAFLEET_CONTRACT_MAX_ROUNDS", "").strip()
+    if not raw:
+        return fallback
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        return fallback
+
+
 def copy_template_contents(template_dir: Path, output_dir: Path) -> None:
     """Copy optional starter assets without overwriting resumed work."""
 
@@ -177,6 +212,7 @@ class FleetOrchestrator:
         self.parallel = bool(parallel)
         self.max_workers = max(int(max_workers), 1)
         self.plan_dir = output_dir / ".arc" / "hafleet" / "plans"
+        self.contract_dir = output_dir / ".arc" / "hafleet" / "contracts"
         self.architecture_path = output_dir / ".arc" / "hafleet" / "architecture.md"
         configured_pause = os.environ.get("ARCBENCH_PAUSE_REQUEST_PATH", "").strip()
         self.pause_request_path = Path(configured_pause) if configured_pause else output_dir / ".arc" / "pause-request"
@@ -247,7 +283,7 @@ class FleetOrchestrator:
             # turns from stale model conclusions. The complete requirement subtree,
             # plan, and structured feedback are supplied again, while workspace files
             # and MessageBus history remain durable across the fresh conversation.
-            if phase in {"review", "final-review", "repair", "completion", "self-check"}:
+            if phase in {"contract-review", "review", "final-review", "repair", "recovery", "completion", "self-check"}:
                 reset_thread = getattr(self.driver, "reset_thread", None)
                 if callable(reset_thread):
                     reset_thread(role, workspace_dir=workspace_dir)
@@ -327,6 +363,295 @@ class FleetOrchestrator:
             node.type == "agent" and node.role.strip().lower() == "planner"
             for node in self.pipeline.nodes
         )
+
+    def _contract_review_enabled(self, module: RequirementModule | None) -> bool:
+        """Enable the YAML-declared planning gate only for real scenario modules."""
+
+        setting = os.environ.get("HAFLEET_CONTRACT_REVIEW", "1").strip().lower()
+        if setting in {"0", "false", "no", "off"} or module is None:
+            return False
+        node = self.pipeline.node("contract_review")
+        if node is None or node.type != "loop":
+            return False
+        subtree = module.subtree if isinstance(module.subtree, dict) else {}
+        return bool(scenario_contracts(subtree))
+
+    @staticmethod
+    def _read_contract(path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _run_plan_only_agent(
+        self,
+        module: RequirementModule,
+        base_prompt: str,
+        plan_path: Path,
+        contract_path: Path,
+        *,
+        workspace_dir: Path | None = None,
+        phase: str = "design",
+        round_number: int = 0,
+        parent_id: str = "",
+        feedback: dict[str, Any] | None = None,
+    ) -> Any:
+        """Let Implementer plan without allowing premature product-source edits."""
+
+        workspace = workspace_dir or self.output_dir
+        ensure_contract_file(contract_path, module.node_id, module.subtree)
+        node = self.pipeline.node("contract_review")
+        repair_instructions = str((node.options if node else {}).get("repair_prompt") or "").strip()
+        if feedback:
+            task = f"""
+{repair_instructions}
+
+Structured contract-review feedback:
+```json
+{json.dumps(feedback, ensure_ascii=False, indent=2)}
+```
+"""
+        else:
+            task = f"""
+Planning-only turn. Do not implement or edit product source files yet. Write the
+complete implementation plan to exactly {plan_path}. Fill the pre-created scenario
+contract at exactly {contract_path}; keep one row for every supplied scenario ID.
+For every row, populate planned_files, observable_checks, canonical_url (or the
+literal string "not_applicable"), durable_state (or "not_applicable"), one stable
+test_id, and concrete assertions. Preserve the original GIVEN/WHEN/THEN text. Inspect
+author-provided reference assets when they define observable UI states. Split success,
+validation, cancellation, empty, authorization, navigation, and persistence branches
+into explicit checks rather than hiding them in a broad claim. Planning files under
+.arc/hafleet are the only files you may modify in this turn.
+"""
+        before_files = _file_snapshot(workspace)
+        result = self._run_agent(
+            self.pipeline.role_for("implementation_plan", "implementer"),
+            textwrap.dedent(base_prompt + "\n\n" + task).strip(),
+            module=module,
+            phase=phase,
+            round_number=round_number,
+            workspace_dir=workspace_dir,
+            parent_id=parent_id,
+        )
+        after_files = _file_snapshot(workspace)
+        changed_source = sorted(
+            path for path in set(before_files) | set(after_files)
+            if before_files.get(path) != after_files.get(path)
+        )
+        if changed_source:
+            _restore_file_snapshot(workspace, before_files)
+            self._message(
+                "pipeline.state",
+                "orchestrator",
+                module=module,
+                phase=phase,
+                round_number=round_number,
+                payload={"status": "planning_write_reverted", "files": changed_source},
+                parent_id=parent_id,
+            )
+        self._ensure_plan_artifact(plan_path, module)
+        ensure_contract_file(contract_path, module.node_id, module.subtree)
+        self.checkpoint.update_pipeline(
+            module.node_id,
+            node="implementation_plan" if phase == "design" else "contract_repair",
+            phase="design",
+            contract_review_status="planned" if phase == "design" else "repairing",
+            contract_review_round=round_number,
+        )
+        self._message(
+            "agent.message",
+            self.pipeline.role_for("implementation_plan", "implementer"),
+            module=module,
+            phase=phase,
+            round_number=round_number,
+            payload={
+                "response": str(getattr(result, "final_response", "") or "")[:20000],
+                "plan_path": str(plan_path),
+                "contract_path": str(contract_path),
+                "source_changes_reverted": changed_source,
+            },
+            parent_id=parent_id,
+        )
+        return result
+
+    def _contract_review_loop(
+        self,
+        module: RequirementModule,
+        base_prompt: str,
+        plan_path: Path,
+        contract_path: Path,
+        *,
+        workspace_dir: Path | None = None,
+    ) -> dict[str, Any]:
+        """Review and repair the public scenario contract before implementation."""
+
+        node = self.pipeline.node("contract_review")
+        if node is None or node.type != "loop":
+            return {"verdict": "pass", "summary": "Contract review is not configured.", "findings": [], "checks": []}
+        reviewer_role = node.review or "reviewer"
+        repair_role = node.repair or "implementer"
+        max_rounds = _contract_round_budget(node.max_rounds)
+        parent_id = ""
+        feedback: dict[str, Any] = {}
+        for round_number in range(1, max_rounds + 1):
+            self._check_pause(module, "contract-review")
+            self.checkpoint.update_pipeline(
+                module.node_id,
+                node="contract_review",
+                phase="design",
+                contract_review_status="reviewing",
+                contract_review_round=round_number,
+            )
+            contract = self._read_contract(contract_path)
+            machine_gaps = contract_gaps(contract, module.subtree)
+            prompt = base_prompt + f"""
+
+Pre-implementation contract review round {round_number}/{max_rounds}. You are read-only.
+Product implementation has not started for this module. Read the original public
+requirement subtree and reference assets, then audit:
+- implementation plan: {plan_path}
+- scenario contract: {contract_path}
+
+{str(node.options.get("prompt") or "").strip()}
+
+The deterministic contract validator currently reports:
+```json
+{json.dumps(machine_gaps, ensure_ascii=False, indent=2)}
+```
+
+Return ONLY a JSON review object followed by a short summary. Use verdict=pass only
+when every original scenario has a complete, non-invented and independently verifiable
+contract row and there are no blocker/major findings. Do not execute tests, start a
+server, modify files, or review implementation that does not exist yet.
+"""
+            review_workspace = workspace_dir or self.output_dir
+            before_files = _file_snapshot(review_workspace)
+            result = self._run_agent(
+                reviewer_role,
+                textwrap.dedent(prompt).strip(),
+                module=module,
+                phase="contract-review",
+                round_number=round_number,
+                workspace_dir=workspace_dir,
+                parent_id=parent_id,
+            )
+            after_files = _file_snapshot(review_workspace)
+            if before_files != after_files:
+                _restore_file_snapshot(review_workspace, before_files)
+                self.checkpoint.update_pipeline(
+                    module.node_id,
+                    reviewer_write_violation=True,
+                    contract_review_status="blocked",
+                )
+                self._pause_pipeline(module, "contract-review", "reviewer modified project files during contract review")
+            response = str(getattr(result, "final_response", "") or "")
+            feedback = parse_review(response) if response.strip() else {
+                "verdict": "pass",
+                "summary": "Reviewer completed without structured findings.",
+                "findings": [],
+                "checks": [],
+                "raw": "",
+            }
+            if machine_gaps:
+                feedback["verdict"] = "changes_requested"
+                findings = list(feedback.get("findings") or [])
+                existing = {str(item.get("id") or "") for item in findings if isinstance(item, dict)}
+                for gap in machine_gaps:
+                    finding_id = "CONTRACT-" + hashlib.sha256(
+                        f"{gap.get('scenario_id')}:{gap.get('field')}".encode("utf-8")
+                    ).hexdigest()[:10].upper()
+                    if finding_id in existing:
+                        continue
+                    findings.append(
+                        {
+                            "id": finding_id,
+                            "severity": "major",
+                            "title": f"Incomplete scenario contract: {gap.get('scenario_id')}",
+                            "description": gap.get("message", "Scenario contract is incomplete."),
+                            "files": [str(contract_path)],
+                            "expected": f"Populate {gap.get('field')} from the supplied public scenario.",
+                            "verification": "Re-run the pre-implementation contract review.",
+                        }
+                    )
+                feedback["findings"] = findings
+                feedback["summary"] = f"Contract validator found {len(machine_gaps)} incomplete scenario fields."
+            feedback_message = self._message(
+                "contract.feedback",
+                reviewer_role,
+                module=module,
+                phase="contract-review",
+                round_number=round_number,
+                payload=feedback,
+                parent_id=parent_id,
+            )
+            passed = review_passes(feedback)
+            verdict = self._message(
+                "contract.verdict",
+                reviewer_role,
+                module=module,
+                phase="contract-review",
+                round_number=round_number,
+                payload={"verdict": feedback.get("verdict"), "passed": passed, "blocking_findings": blocking_findings(feedback)},
+                parent_id=feedback_message["id"],
+            )
+            self.checkpoint.update_pipeline(
+                module.node_id,
+                contract_review_status="approved" if passed else "changes_requested",
+                contract_review_round=round_number,
+                last_contract_feedback_message_id=feedback_message["id"],
+                last_contract_feedback_hash=review_hash(feedback),
+                contract_findings=feedback.get("findings", []),
+            )
+            if passed:
+                self._message(
+                    "pipeline.state",
+                    "orchestrator",
+                    module=module,
+                    phase="contract-review",
+                    round_number=round_number,
+                    payload={"status": "contract_approved", "contract_path": str(contract_path)},
+                    parent_id=verdict["id"],
+                )
+                return feedback
+            if round_number < max_rounds:
+                self.checkpoint.update_pipeline(
+                    module.node_id,
+                    node="contract_repair",
+                    phase="design",
+                    contract_review_status="repairing",
+                )
+                self._run_plan_only_agent(
+                    module,
+                    base_prompt,
+                    plan_path,
+                    contract_path,
+                    workspace_dir=workspace_dir,
+                    phase="contract-repair",
+                    round_number=round_number,
+                    parent_id=verdict["id"],
+                    feedback=feedback,
+                )
+                parent_id = verdict["id"]
+        reason = f"contract review exceeded {max_rounds} rounds"
+        self.checkpoint.update_pipeline(
+            module.node_id,
+            node="contract_review",
+            contract_review_status="deferred",
+            contract_findings=feedback.get("findings", []),
+        )
+        self._message(
+            "pipeline.state",
+            "orchestrator",
+            module=module,
+            phase="contract-review",
+            payload={"status": "contract_deferred", "reason": reason},
+        )
+        if os.environ.get("HAFLEET_QUALITY_ON_EXHAUSTION", "defer").strip().lower() in {"pause", "stop", "fail"}:
+            self._pause_pipeline(module, "contract-review", reason)
+        log(f"[hafleet] contract review deferred ({module.node_id}): {reason}; implementation will use the latest feedback", flush=True)
+        return feedback
 
     def _self_check_enabled(self, module: RequirementModule | None) -> bool:
         """Whether to run the short implementation self-check before review.
@@ -518,9 +843,9 @@ Do not merely describe gaps: fix concrete gaps before returning.
         requirement = json.dumps(module.subtree, ensure_ascii=False, indent=2)
         plan_path.write_text(
             "# Implementation plan\n\n"
-            "Planning, implementation, and test authoring were performed by the "
-            "Implementer role in a single turn. The requirement context used for "
-            "that turn follows:\n\n"
+            "The Implementer role did not return the required plan artifact. This "
+            "requirement-derived fallback preserves the authoritative module context "
+            "for contract review and a later planning repair:\n\n"
             "```json\n" + requirement + "\n```\n",
             encoding="utf-8",
         )
@@ -733,8 +1058,15 @@ implementation source files. Return the required structured Tester JSON response
         reviewer_role = loop.review or "reviewer"
         repair_role = loop.repair or "implementer"
         max_rounds = _quality_round_budget(loop.max_rounds)
+        max_verification_repairs = _verification_repair_budget(max_rounds)
+        stall_limit = _quality_stall_limit()
         previous_hash = ""
         previous_fingerprint: tuple[tuple[str, str], ...] | None = None
+        previous_test_hash = ""
+        previous_test_fingerprint: tuple[tuple[str, str], ...] | None = None
+        verification_repairs = 0
+        verification_stalls = 0
+        review_stalls = 0
         feedback: dict[str, Any] = {}
         parent_id = ""
         first_round = 1
@@ -788,7 +1120,8 @@ source text assertions. Re-run the relevant test and include its command and res
             previous_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
             parent_id = resume_message_id
             first_round = repair_round + 1
-        for round_number in range(first_round, max_rounds + 1):
+        round_number = first_round
+        while round_number <= max_rounds:
             self._check_pause(module, "final-review" if final_review else "review")
             latest_test_result: dict[str, Any] | None = None
             tester_enabled = self._tester_enabled(module, workspace_dir)
@@ -799,6 +1132,12 @@ source text assertions. Re-run the relevant test and include its command and res
                 and has_project_tests(workspace_dir or self.output_dir, module.node_id if module else "ROOT")
             )
             if project_tests_enabled:
+                verification_attempt = verification_repairs + 1
+                self.checkpoint.update_pipeline(
+                    module.node_id if module else "ROOT",
+                    current_verification_attempt=verification_attempt,
+                    review_round=round_number,
+                )
                 test_result = self._run_registered_project_tests(
                     module,
                     workspace_dir=workspace_dir,
@@ -809,16 +1148,30 @@ source text assertions. Re-run the relevant test and include its command and res
                 if not test_passes(test_result):
                     current_hash = test_hash(test_result)
                     current_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
-                    if current_hash == previous_hash and current_fingerprint == previous_fingerprint:
-                        self._defer_quality(module, "test", "project verification made no progress")
+                    stalled = (
+                        current_hash == previous_test_hash
+                        and current_fingerprint == previous_test_fingerprint
+                    )
+                    verification_stalls = verification_stalls + 1 if stalled else 0
+                    if verification_stalls >= stall_limit:
+                        self._defer_quality(
+                            module,
+                            "test",
+                            f"project verification made no progress for {verification_stalls} consecutive attempts",
+                        )
                         return test_result
-                    if round_number >= max_rounds:
-                        self._defer_quality(module, "test", f"project verification exceeded {max_rounds} rounds")
+                    if verification_repairs >= max_verification_repairs:
+                        self._defer_quality(
+                            module,
+                            "test",
+                            f"project verification exceeded {max_verification_repairs} repair attempts",
+                        )
                         return test_result
                     repair_prompt = base_prompt + f"""
 
-Deterministic execution of the project-owned verification commands failed in repair
-round {round_number}. These commands and diagnostics come only from tests generated
+Deterministic execution of the project-owned verification commands failed in verification
+repair attempt {verification_attempt}/{max_verification_repairs}, before Reviewer round
+{round_number}/{max_rounds}. These commands and diagnostics come only from tests generated
 inside the workspace from the supplied requirements; they are not evaluator tests:
 {json.dumps(test_result, ensure_ascii=False, indent=2)}
 
@@ -828,14 +1181,17 @@ with source inspection. Re-run the registered commands, update
 .arc/hafleet/verification.json, and report concrete changed_files and check results.
 Prioritize the earliest failed prerequisite because dependent workflows may be
 invalid until it passes.
+{"The preceding repair made no observable progress. Start from a fresh diagnosis: reproduce the earliest failure, inspect the real rendered/API state and its prerequisite flow, and make a substantive implementation or test-fixture correction instead of repeating the prior patch." if stalled else ""}
 """
-                    self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", round_number=round_number, review_findings=test_result.get("findings", []))
+                    self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", review_round=round_number, current_verification_attempt=verification_attempt, review_findings=test_result.get("findings", []))
                     repair_result = self._run_agent(repair_role, repair_prompt.strip(), module=module, phase="repair", round_number=round_number, workspace_dir=workspace_dir, parent_id=parent_id)
                     self._message("agent.message", repair_role, module=module, phase="repair", round_number=round_number, payload={"response": str(getattr(repair_result, "final_response", "") or "")[:20000], "test_feedback": test_result}, parent_id=parent_id)
-                    previous_hash = current_hash
-                    previous_fingerprint = current_fingerprint
+                    previous_test_hash = current_hash
+                    previous_test_fingerprint = current_fingerprint
+                    verification_repairs += 1
                     continue
             if tester_enabled:
+                verification_attempt = verification_repairs + 1
                 tester_node = self.pipeline.node("final_test") if final_review else self.pipeline.node("tester")
                 tester_role = loop.test or (tester_node.role if tester_node else "") or self.pipeline.role_for("tester", "tester")
                 test_result = self._run_tester(
@@ -851,7 +1207,12 @@ invalid until it passes.
                 if not test_passes(test_result):
                     current_hash = test_hash(test_result)
                     current_fingerprint = _content_fingerprint(workspace_dir or self.output_dir)
-                    if current_hash == previous_hash and current_fingerprint == previous_fingerprint:
+                    stalled = (
+                        current_hash == previous_test_hash
+                        and current_fingerprint == previous_test_fingerprint
+                    )
+                    verification_stalls = verification_stalls + 1 if stalled else 0
+                    if verification_stalls >= stall_limit:
                         self.checkpoint.update_pipeline(
                             module.node_id if module else "ROOT",
                             node="blocked",
@@ -859,39 +1220,52 @@ invalid until it passes.
                             test_status="failed",
                             last_test_hash=current_hash,
                         )
-                        self._defer_quality(module, "test", "test loop made no progress")
+                        self._defer_quality(module, "test", f"test loop made no progress for {verification_stalls} consecutive attempts")
                         return test_result
-                    if round_number >= max_rounds:
+                    if verification_repairs >= max_verification_repairs:
                         self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="blocked", loop_status="blocked", test_status="failed", last_test_hash=current_hash)
-                        self._defer_quality(module, "test", f"test loop exceeded {max_rounds} rounds")
+                        self._defer_quality(module, "test", f"test loop exceeded {max_verification_repairs} repair attempts")
                         return test_result
                     repair_prompt = base_prompt + f"""
 
-Test failures require repair before review. This is repair round {round_number}; test
-feedback is authoritative:
+Test failures require repair before review. This is verification repair attempt
+{verification_attempt}/{max_verification_repairs}, before Reviewer round
+{round_number}/{max_rounds}; test feedback is authoritative:
 {json.dumps(test_result, ensure_ascii=False, indent=2)}
 
 You are the implementation agent. Modify only implementation files belonging to the
 current module, resolve the failing tests, and leave test files intact unless a test
 itself is demonstrably incorrect. You must make a concrete file change when a failure
 is actionable and report changed_files; do not return only an explanation.
+{"The preceding repair made no observable progress. Reproduce the earliest failing public behavior from a clean state and make a substantive correction instead of repeating the previous patch." if stalled else ""}
 """
-                    self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", round_number=round_number, review_findings=test_result.get("findings", []))
+                    self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="repair", loop_status="changes_requested", review_round=round_number, current_verification_attempt=verification_attempt, review_findings=test_result.get("findings", []))
                     repair_result = self._run_agent(repair_role, repair_prompt.strip(), module=module, phase="repair", round_number=round_number, workspace_dir=workspace_dir, parent_id=parent_id)
                     self._message("agent.message", repair_role, module=module, phase="repair", round_number=round_number, payload={"response": str(getattr(repair_result, "final_response", "") or "")[:20000], "test_feedback": test_result}, parent_id=parent_id)
-                    previous_hash = current_hash
-                    previous_fingerprint = current_fingerprint
+                    previous_test_hash = current_hash
+                    previous_test_fingerprint = current_fingerprint
+                    verification_repairs += 1
                     parent_id = self.bus.replay(module_id=module.node_id if module else "")[-1]["id"] if self.bus.replay(module_id=module.node_id if module else "") else parent_id
                     continue
             self.checkpoint.update_pipeline(
                 module.node_id if module else "ROOT",
                 node="review_loop",
-                round_number=round_number,
+                review_round=round_number,
                 loop_status="reviewing",
             )
             review_workspace = workspace_dir or self.output_dir
             before_files = _file_snapshot(review_workspace)
             before = _content_fingerprint(review_workspace)
+            scenario_contract_note = ""
+            if module is not None:
+                scenario_contract = review_workspace / ".arc" / "hafleet" / "contracts" / f"{module.node_id}.json"
+                scenario_contract_note = f"""
+The approved pre-implementation scenario contract is at {scenario_contract}.
+Compare it with the final implementation and executable tests. Every stable test_id
+must correspond to a real behavioral test with the promised assertions; flag plan-to-
+implementation drift and contract rows that were deleted, merged, or satisfied only by
+self-authored assumptions.
+"""
             review_prompt = base_prompt + f"""
 
 Review loop round {round_number}/{max_rounds}. You are read-only. Audit the original
@@ -903,6 +1277,8 @@ and source-string-only checks, and verify that the reported results are consiste
 the test files. Return ONLY a JSON review object followed by a short summary.
 Use verdict=pass only when all blocker/major findings are resolved and required checks pass.
 Do not edit project files or Git state.
+
+{scenario_contract_note}
 
 The Orchestrator executed this structured test result in the current round immediately
 before review. It is authoritative for current pass/fail status:
@@ -968,9 +1344,11 @@ exists from an earlier resumed attempt.
                 self._message("pipeline.state", "orchestrator", module=module, phase="review", round_number=round_number, payload={"status": "approved"}, parent_id=verdict["id"])
                 return feedback
             fingerprint = after
-            if current_hash == previous_hash and fingerprint == previous_fingerprint:
+            stalled = current_hash == previous_hash and fingerprint == previous_fingerprint
+            review_stalls = review_stalls + 1 if stalled else 0
+            if review_stalls >= stall_limit:
                 self.checkpoint.update_pipeline(module.node_id if module else "ROOT", loop_status="blocked", last_feedback_hash=current_hash, review_findings=feedback.get("findings", []))
-                self._defer_quality(module, "review", "review loop made no progress")
+                self._defer_quality(module, "review", f"review loop made no progress for {review_stalls} consecutive attempts")
                 return feedback
             if round_number >= max_rounds:
                 self.checkpoint.update_pipeline(module.node_id if module else "ROOT", loop_status="blocked", last_feedback_hash=current_hash, review_findings=feedback.get("findings", []))
@@ -980,7 +1358,7 @@ exists from an earlier resumed attempt.
                 self.checkpoint.update_pipeline(
                     module.node_id,
                     node="repair",
-                    round_number=round_number,
+                    review_round=round_number,
                     loop_status="changes_requested",
                     review_findings=feedback.get("findings", []),
                     last_feedback_message_id=feedback_message["id"],
@@ -1001,6 +1379,7 @@ tests, rewrite those tests to exercise the public application over HTTP/API or t
 real browser DOM interactions, with behavior assertions that can fail for a broken
 implementation. Never satisfy a test-quality finding by adding more source scans or
 weakening the assertion. Re-run the focused tests and report the command/result.
+{"The preceding repair did not change either the finding set or project fingerprint. Reproduce each unresolved finding from the public requirement, inspect the affected implementation and tests from first principles, and make a substantive correction rather than repeating the previous explanation." if stalled else ""}
 """
             repair_result = self._run_agent(
                 repair_role,
@@ -1021,6 +1400,7 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 parent_id=verdict["id"],
             )
             previous_hash, previous_fingerprint, parent_id = current_hash, fingerprint, verdict["id"]
+            round_number += 1
         self._defer_quality(module, "review", "review loop terminated without approval")
         return feedback
 
@@ -1153,6 +1533,7 @@ weakening the assertion. Re-run the focused tests and report the command/result.
         branch: str | None = None,
     ) -> str:
         completed = ", ".join(completed_ids) if completed_ids else "none"
+        scenario_contract_path = plan_path.parent.parent / "contracts" / f"{module.node_id}.json"
         # A compact index of the whole requirement tree prevents scoped module
         # turns from inventing incompatible routes/entities while keeping the
         # prompt bounded (the full subtree remains the authoritative detail).
@@ -1196,6 +1577,7 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             {root_contracts_text}
             ```
             Coordinator plan path: {plan_path}
+            Scenario contract path: {scenario_contract_path}
             Global architecture document: {self.architecture_path}
 
             Before changing files, read {self.architecture_path}. Follow its module
@@ -1363,15 +1745,40 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 )
             else:
                 planner_enabled = self._planner_enabled()
-                if planner_enabled:
+                contract_enabled = self._contract_review_enabled(module)
+                contract_path = self.contract_dir / f"{module.node_id}.json"
+                contract_already_approved = (
+                    checkpoint_state.get("current_node_id") == module.node_id
+                    and checkpoint_state.get("contract_review_status") == "approved"
+                    and plan_path.is_file()
+                    and contract_path.is_file()
+                )
+                contract_resume_ready = (
+                    checkpoint_state.get("current_node_id") == module.node_id
+                    and checkpoint_state.get("contract_review_status")
+                    in {"planned", "reviewing", "changes_requested", "repairing", "deferred"}
+                    and plan_path.is_file()
+                    and contract_path.is_file()
+                )
+                contract_feedback: dict[str, Any] = {}
+                if planner_enabled and not contract_already_approved:
                     self._check_pause(module, "design")
                     self.checkpoint.mark_module_started(module.node_id, "design")
                     self.runtime.events.mark_design_started(module.node_id, "HAFleet planner started")
                     log(f"[hafleet]   planner started -> {plan_path}", flush=True)
                     try:
+                        if contract_enabled:
+                            ensure_contract_file(contract_path, module.node_id, module.subtree)
                         self._run_agent(
                             self.pipeline.role_for("planner", "planner"),
-                            base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
+                            base_prompt
+                            + f"\n\nWrite the implementation plan to exactly: {plan_path}"
+                            + (
+                                f" and fill the scenario contract at exactly: {contract_path}. "
+                                "Do not edit product source files during this planning turn."
+                                if contract_enabled
+                                else ""
+                            ),
                             module=module,
                             phase="design",
                         )
@@ -1392,12 +1799,41 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     except Exception:
                         self.runtime.events.mark_design_failed(module.node_id, "HAFleet planner failed")
                         raise
-                    self.runtime.events.mark_design_done(module.node_id, "HAFleet plan completed")
                     log(f"[hafleet]   planner finished ({plan_path.stat().st_size} bytes)", flush=True)
+                elif contract_enabled and not contract_already_approved and not contract_resume_ready:
+                    self._check_pause(module, "design")
+                    self.checkpoint.mark_module_started(module.node_id, "design")
+                    self.runtime.events.mark_design_started(
+                        module.node_id, "HAFleet implementer contract planning started"
+                    )
+                    log(
+                        f"[hafleet]   implementer planning started -> {plan_path}; contract={contract_path}",
+                        flush=True,
+                    )
+                    self._run_plan_only_agent(module, base_prompt, plan_path, contract_path)
+                elif contract_enabled and contract_resume_ready:
+                    log(
+                        f"[hafleet]   resuming contract review from existing plan: {module.node_id}",
+                        flush=True,
+                    )
+
+                if contract_enabled and not contract_already_approved:
+                    log(f"[hafleet]   contract review started: {module.node_id}", flush=True)
+                    contract_feedback = self._contract_review_loop(
+                        module,
+                        base_prompt,
+                        plan_path,
+                        contract_path,
+                    )
+                    self.runtime.events.mark_design_done(
+                        module.node_id, "HAFleet implementation contract reviewed"
+                    )
+                elif planner_enabled:
+                    self.runtime.events.mark_design_done(module.node_id, "HAFleet plan completed")
 
                 self._check_pause(module, "implement")
                 self.checkpoint.mark_module_started(module.node_id, "implement")
-                if not planner_enabled:
+                if not planner_enabled and not contract_enabled:
                     self.runtime.events.mark_design_started(
                         module.node_id, "HAFleet implementer planning started"
                     )
@@ -1405,22 +1841,41 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     module.node_id, "HAFleet implementer started"
                 )
                 log(
-                    f"[hafleet]   implementer started{' (planning + implementation)' if not planner_enabled else ''}: {module.node_id}",
+                    f"[hafleet]   implementer started"
+                    f"{' (approved contract + implementation)' if contract_enabled else ' (planning + implementation)' if not planner_enabled else ''}: "
+                    f"{module.node_id}",
                     flush=True,
                 )
                 try:
-                    implementer_prompt = base_prompt + (
-                        f"\n\nYou own planning and implementation, as well as test authoring, for this module. First write a concrete implementation plan to exactly: {plan_path}. Then implement the complete requirement subtree, create or update executable tests derived directly from its requirement IDs and scenarios, and run those tests plus focused build checks in the same turn. For web behavior use Playwright when appropriate. Do not delegate planning or testing to another role."
-                        if not planner_enabled
-                        else "\n\nRead the coordinator plan, then implement the complete subtree, create or update requirement-derived executable tests, and run those tests plus focused build checks now."
-                    )
+                    if contract_enabled:
+                        implementer_prompt = base_prompt + f"""
+
+The planning-only phase and pre-implementation contract review are complete. Read
+the plan at {plan_path} and the scenario contract at {contract_path}. Now implement
+the complete subtree literally from those artifacts, create executable tests using
+each scenario's stable test_id and concrete assertions, and run the focused tests and
+build checks. Keep the scenario contract synchronized if an implementation detail must
+change, but do not remove or merge original scenario rows. The same Implementer role
+owns this plan and implementation, so preserve the decisions already made.
+
+Latest contract-review result (approved unless the finite unattended gate was deferred):
+```json
+{json.dumps(contract_feedback or {"verdict": "pass", "summary": "Previously approved contract restored from checkpoint."}, ensure_ascii=False, indent=2)}
+```
+"""
+                    else:
+                        implementer_prompt = base_prompt + (
+                            f"\n\nYou own planning and implementation, as well as test authoring, for this module. First write a concrete implementation plan to exactly: {plan_path}. Then implement the complete requirement subtree, create or update executable tests derived directly from its requirement IDs and scenarios, and run those tests plus focused build checks in the same turn. For web behavior use Playwright when appropriate. Do not delegate planning or testing to another role."
+                            if not planner_enabled
+                            else "\n\nRead the coordinator plan, then implement the complete subtree, create or update requirement-derived executable tests, and run those tests plus focused build checks now."
+                        )
                     self._run_agent(
                         self.pipeline.role_for("implementer", "implementer"),
                         implementer_prompt,
                         module=module,
                         phase="implement",
                     )
-                    if not planner_enabled:
+                    if not planner_enabled and not contract_enabled:
                         self._ensure_plan_artifact(plan_path, module)
                         self.runtime.events.mark_design_done(
                             module.node_id, "HAFleet implementer plan completed"
@@ -1562,7 +2017,14 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 "running delivery postflight",
                 flush=True,
             )
-            self._run_postflight(module_ids)
+            delivery_approved = self._run_postflight(module_ids)
+            if not delivery_approved:
+                log(
+                    "[hafleet] Final checkpoint withheld: project-owned verification remains failing; "
+                    "the output is preserved for unattended evaluation and a later resume",
+                    flush=True,
+                )
+                return
             final_checkpoint = "ROOT: final HAFleet integration review"
             committed = self._commit_operation(final_checkpoint, "postflight", phase="checkpoint")
             self._message(
@@ -1589,6 +2051,7 @@ weakening the assertion. Re-run the focused tests and report the command/result.
         completed_ids: list[str],
     ) -> Path:
         plan_path = workspace / ".arc" / "hafleet" / "plans" / f"{module.node_id}.md"
+        contract_path = workspace / ".arc" / "hafleet" / "contracts" / f"{module.node_id}.json"
         plan_path.parent.mkdir(parents=True, exist_ok=True)
         base_prompt = self._base_prompt(module, completed_ids, plan_path, workspace, branch)
         checkpoint_state = self.checkpoint.read()
@@ -1612,10 +2075,21 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 )
                 return plan_path
         planner_enabled = self._planner_enabled()
+        contract_enabled = self._contract_review_enabled(module)
+        contract_feedback: dict[str, Any] = {}
         if planner_enabled:
+            if contract_enabled:
+                ensure_contract_file(contract_path, module.node_id, module.subtree)
             self._run_agent(
                 self.pipeline.role_for("planner", "planner"),
-                base_prompt + f"\n\nWrite the implementation plan to exactly: {plan_path}",
+                base_prompt
+                + f"\n\nWrite the implementation plan to exactly: {plan_path}"
+                + (
+                    f" and fill the scenario contract at exactly: {contract_path}. "
+                    "Do not edit product source files during this planning turn."
+                    if contract_enabled
+                    else ""
+                ),
                 module=module,
                 phase="design",
                 workspace_dir=workspace,
@@ -1631,18 +2105,49 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 )
             if not plan_path.is_file() or not plan_path.read_text(encoding="utf-8", errors="ignore").strip():
                 raise RuntimeError(f"planner did not create required plan: {plan_path}")
-        self._run_agent(
-            self.pipeline.role_for("implementer", "implementer"),
-            base_prompt + (
+        elif contract_enabled:
+            self._run_plan_only_agent(
+                module,
+                base_prompt,
+                plan_path,
+                contract_path,
+                workspace_dir=workspace,
+            )
+        if contract_enabled:
+            contract_feedback = self._contract_review_loop(
+                module,
+                base_prompt,
+                plan_path,
+                contract_path,
+                workspace_dir=workspace,
+            )
+        if contract_enabled:
+            implementer_prompt = base_prompt + f"""
+
+The planning-only phase and pre-implementation contract review are complete. Read
+the plan at {plan_path} and scenario contract at {contract_path}, then implement the
+complete subtree literally. Create and run executable tests using every scenario's
+stable test_id and assertions. Keep all original scenario rows.
+
+Latest contract-review result:
+```json
+{json.dumps(contract_feedback, ensure_ascii=False, indent=2)}
+```
+"""
+        else:
+            implementer_prompt = base_prompt + (
                 f"\n\nYou own planning and implementation, as well as test authoring, for this module. First write a concrete implementation plan to exactly: {plan_path}. Then implement the complete requirement subtree, create or update executable tests derived directly from its requirement IDs and scenarios, and run those tests plus focused build checks in the same turn. For web behavior use Playwright when appropriate. Do not delegate planning or testing to another role."
                 if not planner_enabled
                 else "\n\nRead the coordinator plan, then implement the complete subtree, create or update requirement-derived executable tests, and run those tests plus focused build checks now."
-            ),
+            )
+        self._run_agent(
+            self.pipeline.role_for("implementer", "implementer"),
+            textwrap.dedent(implementer_prompt).strip(),
             module=module,
             phase="implement",
             workspace_dir=workspace,
         )
-        if not planner_enabled:
+        if not planner_enabled and not contract_enabled:
             self._ensure_plan_artifact(plan_path, module)
         if self._self_check_enabled(module):
             self._run_implementer_self_check(
@@ -1711,13 +2216,17 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                         "path": str(workspace),
                         "branch": branch,
                         "base_commit": module_base,
-                        "phase": "design" if self._planner_enabled() else "implement",
+                        "phase": "design"
+                        if self._planner_enabled() or self._contract_review_enabled(module)
+                        else "implement",
                     },
                 )
                 self.runtime.events.mark_design_started(
                     module.node_id,
                     "HAFleet parallel planner started"
                     if self._planner_enabled()
+                    else "HAFleet parallel implementer contract planning started"
+                    if self._contract_review_enabled(module)
                     else "HAFleet parallel implementer planning started",
                 )
                 self.runtime.events.mark_implementation_started(
@@ -1806,6 +2315,11 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     destination_plan = self.plan_dir / f"{module.node_id}.md"
                     destination_plan.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source_plan, destination_plan)
+                    source_contract = workspace / ".arc" / "hafleet" / "contracts" / f"{module.node_id}.json"
+                    if source_contract.is_file():
+                        destination_contract = self.contract_dir / f"{module.node_id}.json"
+                        destination_contract.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source_contract, destination_contract)
                     manager.cherry_pick(commits)
                     self.runtime.events.mark_design_done(module.node_id, "HAFleet plan completed")
                     self.runtime.events.mark_implementation_done(
@@ -1899,7 +2413,7 @@ weakening the assertion. Re-run the focused tests and report the command/result.
             log("[hafleet] architecture failed; feature modules will not start", flush=True)
             raise
 
-    def _run_postflight(self, module_ids: str) -> None:
+    def _run_postflight(self, module_ids: str) -> bool:
         enabled = os.environ.get("HAFLEET_POSTFLIGHT", "1").strip().lower() not in {
             "0",
             "false",
@@ -1908,11 +2422,16 @@ weakening the assertion. Re-run the focused tests and report the command/result.
         if not enabled or self.task_type != "web":
             reason = "disabled by HAFLEET_POSTFLIGHT" if not enabled else f"task type is {self.task_type}"
             log(f"[hafleet] Web postflight skipped ({reason})", flush=True)
-            return
+            return True
         try:
             repair_attempts = max(int(os.environ.get("HAFLEET_POSTFLIGHT_REPAIRS", "2")), 0)
         except ValueError:
             repair_attempts = 2
+        final_verification = os.environ.get("HAFLEET_FINAL_VERIFICATION", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
 
         for attempt in range(repair_attempts + 1):
             self._check_pause(None, "postflight")
@@ -1927,12 +2446,39 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 f"on smoke port {self.smoke_port}",
                 flush=True,
             )
+            verification_failed = False
             try:
                 rehearse_web_app(self.output_dir, self.smoke_port)
+                verification_result: dict[str, Any] | None = None
+                if final_verification and has_project_tests(self.output_dir, "ROOT"):
+                    log("[hafleet] Running final registered project verification gate", flush=True)
+                    verification_result = self._run_registered_project_tests(
+                        None,
+                        workspace_dir=self.output_dir,
+                        round_number=100 + attempt + 1,
+                        parent_id=operation["id"],
+                    )
+                    if not test_passes(verification_result):
+                        verification_failed = True
+                        summary = json.dumps(verification_result, ensure_ascii=False, indent=2)
+                        raise PostflightError(
+                            "Final registered project verification failed:\n"
+                            + summary[-20000:]
+                        )
                 log(
                     f"[hafleet] Web postflight passed on smoke port {self.smoke_port}",
                     flush=True,
                 )
+                self.checkpoint.update_pipeline(
+                    "ROOT",
+                    node="checkpoint",
+                    loop_status="approved",
+                    test_status="passed" if verification_result is not None else "",
+                    quality_deferred=False,
+                    quality_exhaustion_reason="",
+                )
+                if verification_result is not None:
+                    self.checkpoint.resolve_all_deferred_modules()
                 self._message(
                     "operation.completed",
                     "orchestrator",
@@ -1940,7 +2486,7 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     payload={"operation": "postflight", "attempt": attempt + 1},
                     parent_id=operation["id"],
                 )
-                return
+                return True
             except PostflightError as exc:
                 self._message(
                     "operation.failed",
@@ -1950,7 +2496,14 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                     parent_id=operation["id"],
                 )
                 if attempt >= repair_attempts:
-                    raise
+                    if not verification_failed:
+                        raise
+                    self._defer_quality(
+                        None,
+                        "postflight",
+                        f"final registered project verification exceeded {repair_attempts} repair attempts",
+                    )
+                    return False
                 log(
                     f"[hafleet] Web postflight failed; repair {attempt + 1}/{repair_attempts}: {exc}",
                     flush=True,
@@ -1967,6 +2520,15 @@ weakening the assertion. Re-run the focused tests and report the command/result.
 
                         Exact postflight error:
                         {exc}
+
+                        If the delivery structure and health contract already pass, focus on the
+                        earliest failing registered project test. Reproduce it from isolated state,
+                        repair the underlying public behavior and its cross-module prerequisites,
+                        keep strong requirement-derived assertions, and rerun the failing command
+                        before the full registered verification set. Do not delete, skip, or weaken
+                        a failing behavioral test merely to pass this gate.
                         """
                     ).strip(),
+                    phase="recovery",
                 )
+        return False

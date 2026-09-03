@@ -147,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         _console(f"dashboard enabled: http://127.0.0.1:{args.dashboard_port}")
 
     skills_dir = agent_root / "skills"
+    checkpoint = CheckpointStore.from_env(output_dir)
     try:
         port_guard = (
             WorkspacePortGuard(output_dir, args.web_port, args.smoke_port)
@@ -163,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             FleetOrchestrator(
                 driver=fleet,
                 runtime=runtime,
-                checkpoint=CheckpointStore.from_env(output_dir),
+                checkpoint=checkpoint,
                 requirements_dir=requirements_dir,
                 output_dir=output_dir,
                 task_type=args.task_type,
@@ -172,8 +173,17 @@ def main(argv: list[str] | None = None) -> int:
                 parallel=args.parallel,
                 max_workers=args.max_workers,
             ).run(modules)
-        runtime.events.mark_run_completed("HAFleet ARC completed")
-        _console(f"completed successfully in {time.monotonic() - started_at:.1f}s")
+        final_state = checkpoint.read()
+        if final_state.get("final_review_completed"):
+            runtime.events.mark_run_completed("HAFleet ARC completed")
+            _console(f"completed successfully in {time.monotonic() - started_at:.1f}s")
+        else:
+            reason = str(final_state.get("quality_exhaustion_reason") or "quality convergence remains incomplete")
+            runtime.events.mark_run_completed(f"HAFleet ARC output preserved with deferred quality: {reason}")
+            _console(
+                f"finished unattended with deferred quality in {time.monotonic() - started_at:.1f}s: "
+                f"{reason}; final checkpoint was withheld"
+            )
     except PauseRequested as exc:
         runtime.events.mark_run_paused(str(exc))
         _console(f"paused: {exc}")

@@ -51,6 +51,8 @@ class FeedbackPipelineTests(unittest.TestCase):
             self.assertTrue(DEFAULT_PIPELINE_PATH.is_file())
             default = load_pipeline(root)
             self.assertEqual(default.loop().max_rounds, 3)
+            self.assertEqual(default.node("contract_review").mode, "contract")
+            self.assertEqual(default.node("contract_review").max_rounds, 2)
             config = root / ".arc" / "hafleet" / "pipeline.yaml"
             config.parent.mkdir(parents=True)
             config.write_text(
@@ -73,6 +75,8 @@ class FeedbackPipelineTests(unittest.TestCase):
         self.assertIsNone(pipeline.node("planner"))
         self.assertIsNone(pipeline.node("tester"))
         self.assertIsNone(pipeline.node("final_test"))
+        self.assertIsNotNone(pipeline.node("implementation_plan"))
+        self.assertIsNotNone(pipeline.node("contract_review"))
         self.assertIn("planning and implementation", pipeline.prompt_for("implementer"))
         self.assertIn("test authoring", pipeline.prompt_for("implementer"))
         self.assertIn("test cases", pipeline.prompt_for("reviewer"))

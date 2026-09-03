@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 import subprocess
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from hafleet_arc.checkpoint import CheckpointStore
+from hafleet_arc.contracts import ensure_contract_file
 from hafleet_arc.models import RequirementModule
 from hafleet_arc.orchestrator import FleetOrchestrator, PauseRequested
 from hafleet_arc.postflight import PostflightError
@@ -146,6 +148,120 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(driver.calls, ["implementer", "reviewer"])
             self.assertTrue(any(item["kind"] == "test.failed" for item in orchestrator.bus.replay()))
 
+    def test_project_verification_repairs_do_not_consume_reviewer_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class Driver:
+                def __init__(self) -> None:
+                    self.calls: list[tuple[str, str]] = []
+                    self.repairs = 0
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append((role, prompt))
+                    if role == "implementer":
+                        self.repairs += 1
+                        (workspace_dir or root).joinpath("repair.txt").write_text(
+                            f"repair {self.repairs}\n", encoding="utf-8"
+                        )
+                    return SimpleNamespace(final_response='{"verdict":"pass","summary":"ok","findings":[],"checks":[]}')
+
+            failed_one = {"verdict": "changes_requested", "summary": "first", "findings": [{"id": "T-1", "severity": "major", "title": "failed"}], "checks": []}
+            failed_two = {"verdict": "changes_requested", "summary": "second", "findings": [{"id": "T-2", "severity": "major", "title": "failed"}], "checks": []}
+            passed = {"verdict": "pass", "summary": "passed", "findings": [], "checks": []}
+            driver = Driver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"HAFLEET_QUALITY_MAX_ROUNDS": "2", "HAFLEET_VERIFICATION_MAX_REPAIRS": "3"},
+                clear=False,
+            ), mock.patch("hafleet_arc.orchestrator.has_project_tests", return_value=True), mock.patch(
+                "hafleet_arc.orchestrator.run_project_tests",
+                side_effect=[failed_one, failed_two, passed],
+            ):
+                result = orchestrator._review_loop(self._module(1, "REQ-1"), "Review REQ-1")
+
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual([role for role, _ in driver.calls], ["implementer", "implementer", "reviewer"])
+            reviewer_prompt = next(prompt for role, prompt in driver.calls if role == "reviewer")
+            self.assertIn("Review loop round 1/2", reviewer_prompt)
+            state = orchestrator.checkpoint.read()
+            self.assertEqual(state["current_review_round"], 1)
+            self.assertEqual(state["current_verification_attempt"], 3)
+
+    def test_postflight_repairs_failed_final_registered_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            driver = FakeDriver()
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            checkpoint.mark_module_deferred("REQ-1", 1)
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            failed = {"verdict": "changes_requested", "summary": "failed", "findings": [{"id": "T-ROOT", "severity": "major", "title": "failed"}], "checks": []}
+            passed = {"verdict": "pass", "summary": "passed", "findings": [], "checks": []}
+            with mock.patch.dict(
+                "os.environ",
+                {"HAFLEET_POSTFLIGHT": "1", "HAFLEET_POSTFLIGHT_REPAIRS": "1"},
+                clear=False,
+            ), mock.patch("hafleet_arc.orchestrator.rehearse_web_app"), mock.patch(
+                "hafleet_arc.orchestrator.has_project_tests", return_value=True
+            ), mock.patch.object(
+                orchestrator,
+                "_run_registered_project_tests",
+                side_effect=[failed, passed],
+            ):
+                approved = orchestrator._run_postflight("REQ-1")
+
+            self.assertTrue(approved)
+            self.assertEqual([role for role, _ in driver.calls], ["implementer"])
+            self.assertIn("earliest failing registered project test", driver.calls[0][1])
+            state = checkpoint.read()
+            self.assertEqual(state["deferred_modules"], [])
+            self.assertEqual(state["completed"], ["REQ-1"])
+
+    def test_postflight_withholds_approval_when_final_verification_stays_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            orchestrator = FleetOrchestrator(
+                driver=FakeDriver(),
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            failed = {"verdict": "changes_requested", "summary": "failed", "findings": [{"id": "T-ROOT", "severity": "major", "title": "failed"}], "checks": []}
+            with mock.patch.dict(
+                "os.environ",
+                {"HAFLEET_POSTFLIGHT": "1", "HAFLEET_POSTFLIGHT_REPAIRS": "1"},
+                clear=False,
+            ), mock.patch("hafleet_arc.orchestrator.rehearse_web_app"), mock.patch(
+                "hafleet_arc.orchestrator.has_project_tests", return_value=True
+            ), mock.patch.object(
+                orchestrator,
+                "_run_registered_project_tests",
+                side_effect=[failed, failed],
+            ):
+                approved = orchestrator._run_postflight("REQ-1")
+
+            self.assertFalse(approved)
+            state = orchestrator.checkpoint.read()
+            self.assertTrue(state["quality_deferred"])
+            self.assertFalse(state["final_review_completed"])
+
     def test_reviewer_receives_current_orchestrator_test_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -264,6 +380,142 @@ class OrchestratorTests(unittest.TestCase):
             implementer_prompts = [prompt for role, prompt in driver.calls if role == "implementer"]
             self.assertEqual(len(implementer_prompts), 2)
             self.assertIn("Implementation self-check", implementer_prompts[1])
+
+    def test_contract_review_approves_plan_before_same_implementer_writes_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module = RequirementModule(
+                1,
+                1,
+                "REQ-1",
+                "Demo",
+                {
+                    "id": "REQ-1",
+                    "children": [
+                        {
+                            "id": "REQ-1.1",
+                            "scenarios": [
+                                {
+                                    "name": "Show page",
+                                    "steps": [
+                                        {"keyword": "GIVEN", "content": "The app is available."},
+                                        {"keyword": "WHEN", "content": "Open the page."},
+                                        {"keyword": "THEN", "content": "The page is visible."},
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+            class ContractDriver:
+                def __init__(self) -> None:
+                    self.calls: list[tuple[str, str]] = []
+                    self.contract_saw_source = False
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append((role, prompt))
+                    if role == "architect":
+                        path = Path(prompt.split("Architecture document path: ", 1)[1].splitlines()[0])
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("# Architecture\n", encoding="utf-8")
+                    elif role == "implementer" and "Planning-only turn" in prompt:
+                        plan = root / ".arc" / "hafleet" / "plans" / "REQ-1.md"
+                        contract = root / ".arc" / "hafleet" / "contracts" / "REQ-1.json"
+                        plan.parent.mkdir(parents=True, exist_ok=True)
+                        plan.write_text("# Plan\n", encoding="utf-8")
+                        payload = json.loads(contract.read_text(encoding="utf-8"))
+                        for row in payload["scenarios"]:
+                            row["planned_files"] = ["src/app.js"]
+                            row["observable_checks"] = ["The public page is visible."]
+                            row["canonical_url"] = "/"
+                            row["durable_state"] = "not_applicable"
+                            row["test_id"] = "T-REQ-1.1-S001"
+                            row["assertions"] = ["Assert the page heading is visible."]
+                        contract.write_text(json.dumps(payload), encoding="utf-8")
+                    elif role == "reviewer" and "Pre-implementation contract review" in prompt:
+                        self.contract_saw_source = (root / "src" / "app.js").exists()
+                    elif role == "implementer" and "planning-only phase" in prompt.lower():
+                        app = root / "src" / "app.js"
+                        app.parent.mkdir(parents=True, exist_ok=True)
+                        app.write_text("export const ready = true;\n", encoding="utf-8")
+                    return SimpleNamespace(final_response='{"verdict":"pass","summary":"ok","findings":[],"checks":[]}')
+
+            driver = ContractDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HAFLEET_SELF_CHECK": "0",
+                    "HAFLEET_COMPLETION_PASS": "0",
+                    "HAFLEET_PROJECT_TESTS": "0",
+                    "HAFLEET_FINAL_REVIEW": "0",
+                    "HAFLEET_POSTFLIGHT": "0",
+                },
+                clear=False,
+            ):
+                orchestrator.run([module])
+
+            roles = [role for role, _ in driver.calls]
+            self.assertEqual(roles, ["architect", "implementer", "reviewer", "implementer", "reviewer"])
+            self.assertFalse(driver.contract_saw_source)
+            self.assertTrue((root / "src" / "app.js").is_file())
+            state = orchestrator.checkpoint.read()
+            self.assertEqual(state["contract_review_status"], "approved")
+            self.assertTrue(any(item["kind"] == "contract.verdict" for item in orchestrator.bus.replay()))
+
+    def test_contract_review_routes_incomplete_contract_back_to_implementer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module = RequirementModule(
+                1,
+                1,
+                "REQ-1",
+                "Demo",
+                {"id": "REQ-1", "scenarios": [{"name": "Show", "steps": [{"keyword": "THEN", "content": "Visible"}]}]},
+            )
+            plan = root / ".arc" / "hafleet" / "plans" / "REQ-1.md"
+            contract = root / ".arc" / "hafleet" / "contracts" / "REQ-1.json"
+            plan.parent.mkdir(parents=True, exist_ok=True)
+            plan.write_text("# Plan\n", encoding="utf-8")
+
+            class RepairDriver:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append(role)
+                    if role == "implementer":
+                        payload = json.loads(contract.read_text(encoding="utf-8"))
+                        for row in payload["scenarios"]:
+                            row["planned_files"] = ["app.py"]
+                            row["observable_checks"] = ["Visible"]
+                            row["test_id"] = "T-1"
+                            row["assertions"] = ["Assert Visible"]
+                        contract.write_text(json.dumps(payload), encoding="utf-8")
+                    return SimpleNamespace(final_response='{"verdict":"pass","summary":"ok","findings":[],"checks":[]}')
+
+            driver = RepairDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            ensure_contract_file(contract, module.node_id, module.subtree)
+            result = orchestrator._contract_review_loop(module, "Review", plan, contract)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(driver.calls, ["reviewer", "implementer", "reviewer"])
 
     def test_quality_exhaustion_is_deferred_for_unattended_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -548,6 +800,30 @@ class OrchestratorTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(PostflightError, "broken build"),
             ):
+                orchestrator.run([self._module(1, "REQ-1")])
+
+            self.assertEqual(checkpoint.read()["completed"], ["REQ-1"])
+            self.assertFalse(checkpoint.read()["final_review_completed"])
+            self.assertNotIn("ROOT: final HAFleet integration review", runtime.git.messages)
+
+    def test_failed_final_verification_withholds_completion_without_crashing_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            runtime = FakeRuntime()
+            orchestrator = FleetOrchestrator(
+                driver=FakeDriver(),
+                runtime=runtime,
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"HAFLEET_FINAL_REVIEW": "0"},
+                clear=False,
+            ), mock.patch.object(orchestrator, "_run_postflight", return_value=False):
                 orchestrator.run([self._module(1, "REQ-1")])
 
             self.assertEqual(checkpoint.read()["completed"], ["REQ-1"])

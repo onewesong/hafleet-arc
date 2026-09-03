@@ -38,25 +38,29 @@ flowchart TD
     C --> D["Order direct ROOT children by dependencies"]
     D --> E{"Module already completed?"}
     E -- "Yes" --> F["Skip module"]
-    E -- "No" --> G["Implementer: plan + implement requirement subtree"]
-    G --> H["Implementer: write and run tests"]
-    H --> I["Reviewer: audit requirements, implementation, and tests"]
-    I --> J{"Blocker/major findings?"}
-    J -- "Yes" --> K["Implementer repairs from feedback"]
-    K --> I
-    J -- "No" --> L["Emit events and update traceability"]
-    L --> M["Create git checkpoint"]
-    M --> N["Update checkpoint.json"]
-    N --> O{"More modules?"}
-    F --> O
-    O -- "Yes" --> E
-    O -- "No" --> P["Run final integration review loop"]
-    P --> Q["Build and start rehearsal on smoke port"]
-    Q --> R{"Postflight passed?"}
-    R -- "No" --> S["Implementer repairs exact failure"]
-    S --> Q
-    R -- "Yes" --> T["Create final git checkpoint"]
-    T --> U["Mark run completed and exit"]
+    E -- "No" --> G["Implementer: planning-only turn and scenario contract"]
+    G --> H["Reviewer: read-only contract review"]
+    H --> I{"Contract blocker/major findings?"}
+    I -- "Yes" --> J["Same Implementer revises plan and contract"]
+    J --> H
+    I -- "No" --> K["Same Implementer implements, writes tests, and runs checks"]
+    K --> L["Reviewer: audit requirements, implementation, and tests"]
+    L --> M{"Implementation blocker/major findings?"}
+    M -- "Yes" --> N["Implementer repairs from incremental feedback"]
+    N --> L
+    M -- "No" --> O["Emit events and update traceability"]
+    O --> P["Create git checkpoint"]
+    P --> Q["Update checkpoint.json"]
+    Q --> R{"More modules?"}
+    F --> R
+    R -- "Yes" --> E
+    R -- "No" --> S["Run final integration review loop"]
+    S --> T["Build and start rehearsal on smoke port"]
+    T --> U{"Postflight passed?"}
+    U -- "No" --> V["Implementer repairs exact failure"]
+    V --> T
+    U -- "Yes" --> W["Create final git checkpoint"]
+    W --> X["Mark run completed and exit"]
 ```
 
 ### 1. Initialize the workspace
@@ -106,10 +110,34 @@ nodes; the loop's `review`, `repair`, `until`, and `max_rounds` fields control t
 review/repair policy. Role prompts are maintained in the same YAML under
 `roles.<role>`. A run-local
 configuration may override only one prompt while inheriting the other built-in
-role prompts. Omit the file to use the default Architect → Implementer →
-Reviewer loop → checkpoint → Postflight pipeline. The default module flow has no standalone Planner or Tester: Implementer writes
-the plan and applies it in one turn. A legacy/custom YAML that declares a `planner`
-agent continues to use the separate planning phase.
+role prompts. Omit the file to use the default Architect → Implementer planning →
+contract review → Implementer implementation → Reviewer loop → checkpoint →
+Postflight pipeline. The default module flow has no standalone Planner or Tester:
+the same Implementer owns both planning and implementation, separated by the read-only
+contract gate. A legacy/custom YAML that declares a `planner` agent continues to use
+that role for the planning phase.
+
+The relevant part of the default pipeline is equivalent to:
+
+```yaml
+nodes:
+  - id: implementation_plan
+    type: agent
+    role: implementer
+  - id: contract_review
+    type: loop
+    mode: contract
+    review: reviewer
+    repair: implementer
+    until: no_major_findings
+    max_rounds: 2
+  - id: implementer
+    type: agent
+    role: implementer
+```
+
+The contract gate has its own round budget and does not consume the later
+implementation-quality review rounds.
 
 Every turn and operation is appended to `.arc/hafleet/messages.jsonl`. The log is
 durable and can be replayed after a restart; the Dashboard's `/api/stream` endpoint
@@ -180,7 +208,7 @@ dependency-aware order. Dependencies on descendants do not constrain this
 top-level ordering, and dependency cycles fall back to source order instead of
 deadlocking the run.
 
-### 4. Plan and implement the module
+### 4. Plan and review the scenario contract
 
 The `implementer` receives the complete requirement subtree, task type, previously
 completed module IDs, and current repository context. It first writes a concrete
@@ -190,11 +218,47 @@ implementation plan to:
 .arc/hafleet/plans/<module-id>.md
 ```
 
-The plan covers the data model, routes or UI, persistence, validation,
-requirement scenarios, and verification. In the same turn, the implementer
-implements the entire subtree in the shared output workspace. It must preserve behavior from earlier modules,
-build real persisted behavior rather than static mock screens, and run focused
-checks while working.
+During this planning-only turn, HAFleet also pre-creates and the Implementer fills:
+
+```text
+.arc/hafleet/contracts/<module-id>.json
+```
+
+The contract contains one stable row per original scenario: GIVEN/WHEN/THEN,
+planned files, public observations, canonical URL, durable state, test ID, and
+concrete assertions. Product source edits made prematurely during this turn are
+reverted while the plan and contract artifacts are retained.
+
+Each scenario entry is explicit and reviewable, for example:
+
+```json
+{
+  "scenario_id": "REQ-5.3.9-S002",
+  "requirement_id": "REQ-5.3.9",
+  "given": [],
+  "when": [],
+  "then": [],
+  "planned_files": ["frontend/src/..."],
+  "observable_checks": ["Dialog closes and order remains unchanged."],
+  "canonical_url": "/personal-center/orders?tab=uncompleted",
+  "durable_state": "Order status remains unpaid.",
+  "test_id": "T-REQ-5.3.9-S002",
+  "assertions": ["Dialog is hidden.", "Order remains visible as unpaid."]
+}
+```
+
+Before implementation, the read-only Reviewer audits the plan and contract against
+the original requirement subtree and author-provided reference assets. Missing or
+weak scenario mappings are returned to the same Implementer session for correction.
+The independent gate is declared as `contract_review` in `pipeline.yaml` and uses two
+rounds by default. If it cannot converge, unattended runs preserve the latest feedback
+and continue; strict pause behavior remains available through
+`HAFLEET_QUALITY_ON_EXHAUSTION=pause`.
+
+After approval, the same Implementer session implements the entire subtree, authors
+tests using the stable scenario test IDs, preserves earlier modules, and runs focused
+checks. This keeps planning and implementation ownership together while detecting
+requirement interpretation drift before expensive source work begins.
 
 ### 5. Review loop and repair
 
@@ -212,9 +276,11 @@ statically, then returns a structured JSON verdict. It never edits source files 
 Git state. Findings use `blocker`, `major`,
 `minor`, or `info` severity. Blocker/major findings are appended to the message
 bus and routed to the `implementer`, which repairs the current module. The reviewer
-runs again until the module passes or the bounded loop pauses (three rounds by
-default). Minor/info findings remain visible in the Dashboard but do not block a
-checkpoint.
+runs again until the module passes or the bounded loop is exhausted. Deterministic
+project-test repairs have an independent budget, so a failing test command no longer
+consumes Reviewer passes. A repeated identical failure receives a fresh diagnostic
+repair turn before it is classified as no progress. Minor/info findings remain visible
+in the Dashboard but do not block a checkpoint.
 
 When the module passes review, the orchestrator:
 
@@ -255,9 +321,14 @@ then starts the backend on the isolated smoke port and waits for an HTTP
 response. A failed postflight is sent back to the implementer with the exact error
 for up to two repair passes.
 
-Only a successful postflight creates the final git checkpoint, marks the
-checkpoint complete, emits the run-completed event, and exits with status `0`.
-All rehearsal processes are stopped before exit.
+After the build/start rehearsal succeeds, HAFleet reruns the ROOT-scoped registered
+project verification commands by default. A failure is routed back to a fresh
+Implementer recovery turn and the rehearsal is repeated within the Postflight repair
+budget. Only a successful rehearsal and final registered verification create the final
+git checkpoint and mark the checkpoint complete. If the project tests still fail after
+the finite unattended budget, the generated output is preserved and the process may
+return for evaluation, but the final completion checkpoint is withheld so a later run
+can resume quality convergence. All rehearsal processes are stopped before exit.
 
 ## Reliability controls
 
@@ -278,9 +349,12 @@ foreign listener on a shared runner.
 | `HAFLEET_TURN_TIMEOUT` | `1200` | Maximum seconds for one Codex turn |
 | `HAFLEET_SMOKE_PORT` | `3100` | Safe generation-time application port |
 | `HAFLEET_POSTFLIGHT_REPAIRS` | `2` | Implementer repair attempts after failed rehearsal |
+| `HAFLEET_FINAL_VERIFICATION` | `1` | Re-run ROOT registered project tests after each successful delivery rehearsal |
 | `HAFLEET_NPM_TIMEOUT` | `600` | Timeout for each postflight npm command |
 | `HAFLEET_READY_TIMEOUT` | `45` | Backend readiness timeout during rehearsal |
 | `HAFLEET_FINAL_REVIEW` | `1` | Enable the whole-project reviewer pass |
+| `HAFLEET_CONTRACT_REVIEW` | `1` | Enable the pre-implementation scenario-contract gate |
+| `HAFLEET_CONTRACT_MAX_ROUNDS` | `2` | Independent plan/contract review and repair budget |
 | `HAFLEET_POSTFLIGHT` | `1` | Enable the mandatory delivery rehearsal |
 | `HAFLEET_PARALLEL` | `0` | Enable independent ROOT module worktrees |
 | `HAFLEET_MAX_WORKERS` | `2` | Maximum concurrent parallel module worktrees |
@@ -305,8 +379,15 @@ Codex SDK selects its default model.
 
 Quality review loops are bounded. By default, reaching the round or no-progress
 limit records `quality_deferred` and continues unattended to the remaining modules
-and postflight. Set `HAFLEET_QUALITY_ON_EXHAUSTION=pause` when a strict manual gate
-is preferred.
+and final convergence. Project verification repairs use their own finite budget and
+do not consume Reviewer rounds. The final Postflight gate does not create a completion
+checkpoint while registered project tests are still failing. Set
+`HAFLEET_QUALITY_ON_EXHAUSTION=pause` when a strict manual gate is preferred.
+
+Use `HAFLEET_VERIFICATION_MAX_REPAIRS` to cap deterministic test repair turns and
+`HAFLEET_QUALITY_STALL_LIMIT` to control how many consecutive identical no-progress
+attempts are tolerated. `HAFLEET_QUALITY_MAX_ROUNDS` remains the independent Reviewer
+pass limit.
 
 `HAFLEET_FINAL_REVIEW=0` skips the optional model review but still runs the
 deterministic postflight. `HAFLEET_POSTFLIGHT=0` is intended only for cheap

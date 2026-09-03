@@ -57,9 +57,11 @@ roles:
   implementer: |
     You are the planning and implementation agent, also responsible for test authoring, in a finite HAFleet
     run. Read the supplied requirement subtree, architecture, and current repository.
-    First write a concise, concrete implementation plan to the exact plan path supplied
-    by the coordinator, then implement the entire subtree and create executable tests in
-    the same turn. The coordinator supplies a capability model: map every leaf
+    Follow the phase supplied by the coordinator. In a planning-only phase, write a
+    concise implementation plan and fill the scenario contract at the exact paths
+    supplied, but do not edit product source. In the later implementation phase, reuse
+    that same plan/context to implement the entire subtree and create executable tests.
+    The coordinator supplies a capability model: map every leaf
     requirement/scenario to implementation files, an observable behavior, and a test ID.
     Cover data model, routes/UI, persistence, validation, authorization, error/empty
     states, navigation, and refresh behavior in the plan where applicable. Derive tests
@@ -188,11 +190,45 @@ roles:
     servers must be cleaned up. Treat a suite whose second identical invocation observes
     polluted seed state, or whose abandoned child process blocks the next invocation, as
     a concrete major test-contract defect.
+    During a pre-implementation `contract_review` phase, audit only the original
+    requirements, reference assets, implementation plan, and scenario contract. Do not
+    demand existing source code or executed tests at that stage. Verify instead that
+    every scenario has concrete planned files, public observations, URL/durable-state
+    outcomes, a stable test ID, and assertions capable of detecting an incorrect future
+    implementation. In normal and final review phases, audit the completed source and
+    tests as described above.
 
 nodes:
   - id: architect
     type: agent
     role: architect
+
+  - id: implementation_plan
+    type: agent
+    role: implementer
+
+  - id: contract_review
+    type: loop
+    mode: contract
+    review: reviewer
+    repair: implementer
+    until: no_major_findings
+    max_rounds: 2
+    prompt: |
+      Audit the implementation plan and scenario contract before source implementation
+      begins. Compare them directly with the complete original requirement subtree and
+      author-provided reference assets. Verify that every scenario has its own stable
+      contract row covering preconditions, user action, exact public observations,
+      canonical URL or navigation outcome, durable state, planned files, test ID, and
+      concrete assertions. Reject missing scenarios, bundled assertions that can hide a
+      failed branch, invented behavior, weak success-only checks, missing seed data, and
+      reference-defined states that are absent from the plan. Review only the supplied
+      public requirements; never inspect or infer evaluator tests. Do not modify files.
+    repair_prompt: |
+      Revise only the module plan and scenario contract from the structured Reviewer
+      feedback. Do not implement or edit product source yet. Preserve every original
+      requirement scenario as a separate row and make each observable/test contract
+      concrete enough to implement literally.
 
   - id: implementer
     type: agent

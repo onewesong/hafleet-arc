@@ -15,6 +15,18 @@ class CheckpointStoreTests(unittest.TestCase):
             started = store.read()
             self.assertEqual(started["current_node_id"], "REQ-1")
             self.assertEqual(started["current_phase"], "design")
+            self.assertEqual(started["contract_review_status"], "")
+
+            store.update_pipeline(
+                "REQ-1",
+                node="contract_review",
+                contract_review_status="approved",
+                contract_review_round=2,
+                last_contract_feedback_message_id="msg-2",
+            )
+            reviewed = store.read()
+            self.assertEqual(reviewed["contract_review_status"], "approved")
+            self.assertEqual(reviewed["contract_review_round"], 2)
 
             store.mark_module_completed("REQ-1", 1)
             completed = store.read()
@@ -52,6 +64,16 @@ class CheckpointStoreTests(unittest.TestCase):
             approved = store.mark_module_completed("REQ-1", 1)
             self.assertEqual(approved["completed"], ["REQ-1"])
             self.assertEqual(approved["deferred_modules"], [])
+
+    def test_whole_project_gate_resolves_all_deferred_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CheckpointStore(Path(temporary) / "checkpoint.json")
+            store.mark_module_deferred("REQ-1", 1)
+            store.mark_module_deferred("REQ-2", 2)
+            resolved = store.resolve_all_deferred_modules()
+            self.assertEqual(resolved["completed"], ["REQ-1", "REQ-2"])
+            self.assertEqual(resolved["deferred_modules"], [])
+            self.assertFalse(resolved["quality_deferred"])
 
 
 if __name__ == "__main__":
