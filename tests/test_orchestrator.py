@@ -498,6 +498,8 @@ class OrchestratorTests(unittest.TestCase):
                         for row in payload["scenarios"]:
                             row["planned_files"] = ["app.py"]
                             row["observable_checks"] = ["Visible"]
+                            row["canonical_url"] = "/"
+                            row["durable_state"] = "not_applicable"
                             row["test_id"] = "T-1"
                             row["assertions"] = ["Assert Visible"]
                         contract.write_text(json.dumps(payload), encoding="utf-8")
@@ -516,6 +518,61 @@ class OrchestratorTests(unittest.TestCase):
             result = orchestrator._contract_review_loop(module, "Review", plan, contract)
             self.assertEqual(result["verdict"], "pass")
             self.assertEqual(driver.calls, ["reviewer", "implementer", "reviewer"])
+
+    def test_contract_review_reconciles_last_feedback_and_carries_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module = RequirementModule(
+                1,
+                1,
+                "REQ-1",
+                "Demo",
+                {"id": "REQ-1", "scenarios": [{"name": "Show", "steps": [{"keyword": "THEN", "content": "Visible"}]}]},
+            )
+            plan = root / ".arc" / "hafleet" / "plans" / "REQ-1.md"
+            contract = root / ".arc" / "hafleet" / "contracts" / "REQ-1.json"
+            plan.parent.mkdir(parents=True, exist_ok=True)
+            plan.write_text("# Plan\n", encoding="utf-8")
+            payload = ensure_contract_file(contract, module.node_id, module.subtree)
+            row = payload["scenarios"][0]
+            row.update(
+                {
+                    "planned_files": ["app.py"],
+                    "observable_checks": ["Visible"],
+                    "canonical_url": "/",
+                    "durable_state": "not_applicable",
+                    "test_id": "T-1",
+                    "assertions": ["Assert Visible"],
+                }
+            )
+            contract.write_text(json.dumps(payload), encoding="utf-8")
+
+            class StuckContractDriver:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append(role)
+                    if role == "reviewer":
+                        return SimpleNamespace(final_response='{"verdict":"changes_requested","findings":[{"id":"C-1","severity":"major","title":"Missing branch"}],"checks":[]}')
+                    return SimpleNamespace(final_response='{"summary":"reconciled"}')
+
+            driver = StuckContractDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            result = orchestrator._contract_review_loop(module, "Review", plan, contract)
+            self.assertEqual(driver.calls, ["reviewer", "implementer", "reviewer", "implementer"])
+            self.assertEqual(result["contract_status"], "deferred")
+            self.assertEqual([item["id"] for item in result["carried_findings"]], ["C-1"])
+            state = orchestrator.checkpoint.read()
+            self.assertEqual(state["contract_review_status"], "deferred")
+            self.assertEqual([item["id"] for item in state["carried_contract_findings"]], ["C-1"])
 
     def test_quality_exhaustion_is_deferred_for_unattended_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

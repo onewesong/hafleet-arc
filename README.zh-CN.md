@@ -231,8 +231,14 @@ ROOT 的每个直接子节点都会成为一个模块。模块按稳定且依赖
 开始编码前，只读 Reviewer 会把计划和场景契约与原始需求子树、作者提供的参考资源
 逐项对照。遗漏或薄弱的场景映射会返回同一个 Implementer 会话修订。该独立门禁由
 `pipeline.yaml` 中的 `contract_review` 节点声明，默认最多两轮。若有限轮次仍未收敛，
-无人值守模式会保留最新反馈并继续实施；设置
+无人值守模式会先让同一个 Implementer 再执行一次仅规划的最终修订，然后继续实施。
+未解决的 blocker/major finding 会按模块持久化，并成为后续实现和实现审核的强制义务；
+只有 Reviewer 对最终源码和可执行测试审核通过后才会清除。设置
 `HAFLEET_QUALITY_ON_EXHAUSTION=pause` 可改为严格暂停。
+
+确定性契约校验还会拒绝被改写的 GIVEN/WHEN/THEN、重复测试 ID、未解决占位符、含糊的
+规范 URL，以及缺失的 URL 或持久状态结果。Reviewer 的结构化 checks 可以使用
+`status` 或 `result` 字段。
 
 审核通过后，同一个 Implementer 会话再实现完整需求子树，并使用稳定的场景测试 ID
 编写和运行测试。这样既不重新引入 Planner→Implementer 的信息传递，也能在昂贵的

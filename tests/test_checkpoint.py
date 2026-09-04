@@ -16,6 +16,7 @@ class CheckpointStoreTests(unittest.TestCase):
             self.assertEqual(started["current_node_id"], "REQ-1")
             self.assertEqual(started["current_phase"], "design")
             self.assertEqual(started["contract_review_status"], "")
+            self.assertEqual(started["carried_contract_findings"], [])
 
             store.update_pipeline(
                 "REQ-1",
@@ -45,6 +46,17 @@ class CheckpointStoreTests(unittest.TestCase):
             state = CheckpointStore(path).read()
             self.assertEqual(state["completed"], [])
             self.assertFalse(state["architecture_completed"])
+
+    def test_contract_obligations_are_persisted_per_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CheckpointStore(Path(temporary) / "checkpoint.json")
+            store.set_contract_obligations("REQ-1", [{"id": "C-1", "severity": "major"}])
+            store.set_contract_obligations("REQ-2", [{"id": "C-2", "severity": "major"}])
+            self.assertEqual([item["id"] for item in store.contract_obligations("REQ-1")], ["C-1"])
+            self.assertEqual([item["id"] for item in store.contract_obligations("REQ-2")], ["C-2"])
+            store.set_contract_obligations("REQ-1", [])
+            self.assertEqual(store.contract_obligations("REQ-1"), [])
+            self.assertEqual([item["id"] for item in store.contract_obligations("REQ-2")], ["C-2"])
 
     def test_architecture_completion_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

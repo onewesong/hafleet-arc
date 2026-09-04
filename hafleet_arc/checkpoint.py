@@ -41,6 +41,8 @@ class CheckpointStore:
             "last_contract_feedback_message_id": "",
             "last_contract_feedback_hash": "",
             "contract_findings": [],
+            "carried_contract_findings": [],
+            "contract_obligations": {},
             "loop_status": "",
             "last_feedback_message_id": "",
             "last_feedback_hash": "",
@@ -86,6 +88,8 @@ class CheckpointStore:
         payload.setdefault("last_contract_feedback_message_id", "")
         payload.setdefault("last_contract_feedback_hash", "")
         payload.setdefault("contract_findings", [])
+        payload.setdefault("carried_contract_findings", [])
+        payload.setdefault("contract_obligations", {})
         payload.setdefault("loop_status", "")
         payload.setdefault("last_feedback_message_id", "")
         payload.setdefault("last_feedback_hash", "")
@@ -119,6 +123,7 @@ class CheckpointStore:
                     "last_contract_feedback_message_id": "",
                     "last_contract_feedback_hash": "",
                     "contract_findings": [],
+                    "carried_contract_findings": [],
                 }
             )
         self.write(payload)
@@ -148,6 +153,27 @@ class CheckpointStore:
             temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             temporary.replace(self.path)
             return payload
+
+    def set_contract_obligations(self, module_id: str, findings: list[dict[str, Any]]) -> dict[str, Any]:
+        """Persist unresolved contract findings by module for resume/final review."""
+
+        with self._write_lock:
+            payload = self.read()
+            obligations = dict(payload.get("contract_obligations") or {})
+            if findings:
+                obligations[module_id] = [dict(item) for item in findings if isinstance(item, dict)]
+            else:
+                obligations.pop(module_id, None)
+            payload["contract_obligations"] = obligations
+            payload["carried_contract_findings"] = list(obligations.get(module_id, []))
+            self.write(payload)
+            return payload
+
+    def contract_obligations(self, module_id: str) -> list[dict[str, Any]]:
+        payload = self.read()
+        obligations = payload.get("contract_obligations") or {}
+        values = obligations.get(module_id, []) if isinstance(obligations, dict) else []
+        return [dict(item) for item in values if isinstance(item, dict)]
 
     def mark_architecture_completed(self) -> dict[str, Any]:
         payload = self.read()

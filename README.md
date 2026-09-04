@@ -252,8 +252,16 @@ the original requirement subtree and author-provided reference assets. Missing o
 weak scenario mappings are returned to the same Implementer session for correction.
 The independent gate is declared as `contract_review` in `pipeline.yaml` and uses two
 rounds by default. If it cannot converge, unattended runs preserve the latest feedback
-and continue; strict pause behavior remains available through
+and give the same Implementer one final planning-only reconciliation turn before
+continuing. Unresolved blocker/major findings are persisted by module and become
+mandatory implementation and implementation-review obligations; they are cleared only
+after the later Reviewer approves the source and executable tests. Strict pause behavior remains available through
 `HAFLEET_QUALITY_ON_EXHAUSTION=pause`.
+
+The deterministic contract validator also rejects changed GIVEN/WHEN/THEN steps,
+duplicate test IDs, unresolved placeholders, ambiguous canonical URLs, and missing
+URL or durable-state outcomes. Reviewer checks may use either `status` or `result` in
+their structured response.
 
 After approval, the same Implementer session implements the entire subtree, authors
 tests using the stable scenario test IDs, preserves earlier modules, and runs focused

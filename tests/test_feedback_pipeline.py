@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hafleet_arc.feedback import blocking_findings, parse_review, review_hash, review_passes, test_hash, test_passes
+from hafleet_arc.feedback import blocking_findings, contract_review_passes, parse_review, review_hash, review_passes, test_hash, test_passes
 from hafleet_arc.pipeline import DEFAULT_PIPELINE_PATH, load_pipeline
 
 
@@ -18,6 +18,23 @@ class FeedbackPipelineTests(unittest.TestCase):
     def test_pass_requires_no_blocking_findings_and_no_failed_checks(self) -> None:
         self.assertTrue(review_passes(parse_review('{"verdict":"pass","findings":[],"checks":[{"status":"passed"}]}')))
         self.assertFalse(review_passes(parse_review('{"verdict":"pass","findings":[],"checks":[{"status":"failed"}]}')))
+
+    def test_review_check_result_alias_is_normalized(self) -> None:
+        review = parse_review('{"verdict":"pass","findings":[],"checks":[{"name":"traceability","result":"pass"}]}')
+        self.assertEqual(review["checks"][0]["status"], "pass")
+        self.assertTrue(contract_review_passes(review, []))
+
+    def test_contract_review_requires_explicit_pass_and_no_machine_gaps(self) -> None:
+        non_blocking_request = parse_review(
+            '{"verdict":"changes_requested","findings":[{"severity":"minor","title":"polish"}],"checks":[]}'
+        )
+        self.assertFalse(contract_review_passes(non_blocking_request, []))
+        passed = parse_review('{"verdict":"pass","findings":[],"checks":[]}')
+        self.assertFalse(contract_review_passes(passed, [{"field":"test_id"}]))
+        descriptive = parse_review(
+            '{"verdict":"pass","findings":[],"checks":[{"result":"All public scenarios map one-to-one."}]}'
+        )
+        self.assertTrue(contract_review_passes(descriptive, []))
 
     def test_non_blocking_findings_do_not_block_review(self) -> None:
         review = parse_review(

@@ -15,6 +15,7 @@ from .capabilities import build_capability_model
 from .contracts import contract_gaps, ensure_contract_file, scenario_contracts
 from .feedback import (
     blocking_findings,
+    contract_review_passes,
     parse_review,
     parse_test_result,
     review_hash,
@@ -586,7 +587,7 @@ server, modify files, or review implementation that does not exist yet.
                 payload=feedback,
                 parent_id=parent_id,
             )
-            passed = review_passes(feedback)
+            passed = contract_review_passes(feedback, machine_gaps)
             verdict = self._message(
                 "contract.verdict",
                 reviewer_role,
@@ -603,6 +604,11 @@ server, modify files, or review implementation that does not exist yet.
                 last_contract_feedback_message_id=feedback_message["id"],
                 last_contract_feedback_hash=review_hash(feedback),
                 contract_findings=feedback.get("findings", []),
+                carried_contract_findings=[] if passed else blocking_findings(feedback),
+            )
+            self.checkpoint.set_contract_obligations(
+                module.node_id,
+                [] if passed else blocking_findings(feedback),
             )
             if passed:
                 self._message(
@@ -634,13 +640,63 @@ server, modify files, or review implementation that does not exist yet.
                     feedback=feedback,
                 )
                 parent_id = verdict["id"]
+        # The last review still contains actionable information. Give the same
+        # Implementer session one final reconciliation turn before unattended
+        # implementation starts; otherwise the final Reviewer response would be
+        # logged but never acted upon.
+        if blocking_findings(feedback):
+            self.checkpoint.update_pipeline(
+                module.node_id,
+                node="contract_reconciliation",
+                phase="design",
+                contract_review_status="reconciling",
+            )
+            self._run_plan_only_agent(
+                module,
+                base_prompt,
+                plan_path,
+                contract_path,
+                workspace_dir=workspace_dir,
+                phase="contract-reconciliation",
+                round_number=max_rounds,
+                parent_id=parent_id,
+                feedback=feedback,
+            )
+        final_contract = self._read_contract(contract_path)
+        final_machine_gaps = contract_gaps(final_contract, module.subtree)
+        carried = blocking_findings(feedback)
+        if final_machine_gaps:
+            for gap in final_machine_gaps:
+                carried.append(
+                    {
+                        "id": "CONTRACT-" + hashlib.sha256(
+                            f"{gap.get('scenario_id')}:{gap.get('field')}".encode("utf-8")
+                        ).hexdigest()[:10].upper(),
+                        "severity": "major",
+                        "title": f"Incomplete scenario contract: {gap.get('scenario_id')}",
+                        "description": gap.get("message", "Scenario contract is incomplete."),
+                        "files": [str(contract_path)],
+                    }
+                )
+        # Preserve a de-duplicated set of obligations for implementation and
+        # the later source/test review.
+        carried_by_id = {
+            str(item.get("id") or review_hash({"findings": [item]})): item
+            for item in carried
+            if isinstance(item, dict)
+        }
+        carried = list(carried_by_id.values())
+        feedback["contract_status"] = "deferred"
+        feedback["carried_findings"] = carried
         reason = f"contract review exceeded {max_rounds} rounds"
         self.checkpoint.update_pipeline(
             module.node_id,
             node="contract_review",
             contract_review_status="deferred",
             contract_findings=feedback.get("findings", []),
+            carried_contract_findings=carried,
         )
+        self.checkpoint.set_contract_obligations(module.node_id, carried)
         self._message(
             "pipeline.state",
             "orchestrator",
@@ -1340,7 +1396,17 @@ exists from an earlier resumed attempt.
                 parent_id=parent_id,
             )
             if review_passes(feedback):
-                self.checkpoint.update_pipeline(module.node_id if module else "ROOT", node="checkpoint", loop_status="approved", review_findings=feedback.get("findings", []), last_feedback_message_id=feedback_message["id"], last_feedback_hash=current_hash)
+                self.checkpoint.update_pipeline(
+                    module.node_id if module else "ROOT",
+                    node="checkpoint",
+                    loop_status="approved",
+                    review_findings=feedback.get("findings", []),
+                    carried_contract_findings=[] if module else self.checkpoint.read().get("carried_contract_findings", []),
+                    last_feedback_message_id=feedback_message["id"],
+                    last_feedback_hash=current_hash,
+                )
+                if module:
+                    self.checkpoint.set_contract_obligations(module.node_id, [])
                 self._message("pipeline.state", "orchestrator", module=module, phase="review", round_number=round_number, payload={"status": "approved"}, parent_id=verdict["id"])
                 return feedback
             fingerprint = after
@@ -1732,7 +1798,18 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 self._check_pause(module, "review")
                 self.checkpoint.mark_module_started(module.node_id, "review")
                 log(f"[hafleet]   retrying deferred quality: {module.node_id}", flush=True)
-                self._review_loop(module, base_prompt)
+                carried = self.checkpoint.contract_obligations(module.node_id)
+                retry_prompt = base_prompt
+                if carried:
+                    retry_prompt += f"""
+
+These unresolved pre-implementation contract obligations remain authoritative on
+resume. Verify each finding ID against source and executable tests before approval:
+```json
+{json.dumps(carried, ensure_ascii=False, indent=2)}
+```
+"""
+                self._review_loop(module, retry_prompt)
             elif resume_loop and resume_feedback:
                 self._check_pause(module, "repair")
                 log(f"[hafleet]   resuming repair round {resume_round}: {module.node_id}", flush=True)
@@ -1842,7 +1919,7 @@ weakening the assertion. Re-run the focused tests and report the command/result.
                 )
                 log(
                     f"[hafleet]   implementer started"
-                    f"{' (approved contract + implementation)' if contract_enabled else ' (planning + implementation)' if not planner_enabled else ''}: "
+                    f"{' (reviewed contract + implementation)' if contract_enabled else ' (planning + implementation)' if not planner_enabled else ''}: "
                     f"{module.node_id}",
                     flush=True,
                 )
@@ -1857,6 +1934,9 @@ each scenario's stable test_id and concrete assertions, and run the focused test
 build checks. Keep the scenario contract synchronized if an implementation detail must
 change, but do not remove or merge original scenario rows. The same Implementer role
 owns this plan and implementation, so preserve the decisions already made.
+If the contract gate was deferred, every item in carried_findings is a mandatory
+implementation obligation. Resolve it in source and executable tests, and report
+evidence keyed by the original finding ID; do not merely acknowledge the feedback.
 
 Latest contract-review result (approved unless the finite unattended gate was deferred):
 ```json
@@ -1889,7 +1969,19 @@ Latest contract-review result (approved unless the finite unattended gate was de
                     self._check_pause(module, "review")
                     self.checkpoint.mark_module_started(module.node_id, "review")
                     log(f"[hafleet]   reviewer started: {module.node_id}", flush=True)
-                    self._review_loop(module, base_prompt)
+                    carried = self.checkpoint.contract_obligations(module.node_id)
+                    review_base_prompt = base_prompt
+                    if carried:
+                        review_base_prompt += f"""
+
+The pre-implementation contract gate carried these unresolved obligations into
+implementation. Verify each finding ID against the final source and executable tests.
+Do not approve the module while any blocker/major obligation remains unresolved:
+```json
+{json.dumps(carried, ensure_ascii=False, indent=2)}
+```
+"""
+                    self._review_loop(module, review_base_prompt)
                 except PauseRequested:
                     raise
                 except Exception:
@@ -2128,6 +2220,8 @@ The planning-only phase and pre-implementation contract review are complete. Rea
 the plan at {plan_path} and scenario contract at {contract_path}, then implement the
 complete subtree literally. Create and run executable tests using every scenario's
 stable test_id and assertions. Keep all original scenario rows.
+If carried_findings are present below, resolve every item in implementation and tests
+and report evidence keyed by its original finding ID.
 
 Latest contract-review result:
 ```json
@@ -2163,7 +2257,19 @@ Latest contract-review result:
                 workspace_dir=workspace,
                 plan_path=plan_path,
             )
-        self._review_loop(module, base_prompt, workspace_dir=workspace)
+        carried = self.checkpoint.contract_obligations(module.node_id)
+        review_base_prompt = base_prompt
+        if carried:
+            review_base_prompt += f"""
+
+The pre-implementation contract gate carried these unresolved obligations into
+implementation. Verify each finding ID against the final source and executable tests.
+Do not approve while any blocker/major obligation remains unresolved:
+```json
+{json.dumps(carried, ensure_ascii=False, indent=2)}
+```
+"""
+        self._review_loop(module, review_base_prompt, workspace_dir=workspace)
         return plan_path
 
     def _run_parallel(

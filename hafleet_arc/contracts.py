@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -84,7 +85,8 @@ def ensure_contract_file(path: Path, module_id: str, requirement_subtree: dict[s
 def contract_gaps(payload: dict[str, Any], requirement_subtree: dict[str, Any]) -> list[dict[str, str]]:
     """Return concrete planning gaps that must be resolved before implementation."""
 
-    expected = {row["scenario_id"] for row in scenario_contracts(requirement_subtree)}
+    expected_rows = {row["scenario_id"]: row for row in scenario_contracts(requirement_subtree)}
+    expected = set(expected_rows)
     raw_rows = payload.get("scenarios")
     rows = raw_rows if isinstance(raw_rows, list) else []
     actual_ids = [
@@ -100,6 +102,7 @@ def contract_gaps(payload: dict[str, Any], requirement_subtree: dict[str, Any]) 
         gaps.append({"scenario_id": scenario_id, "field": "scenario", "message": "Scenario is not present in the supplied requirement subtree."})
     for scenario_id in sorted({item for item in actual_ids if actual_ids.count(item) > 1}):
         gaps.append({"scenario_id": scenario_id, "field": "scenario", "message": "Scenario appears more than once in the contract."})
+    test_ids: list[tuple[str, str]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -114,4 +117,43 @@ def contract_gaps(payload: dict[str, Any], requirement_subtree: dict[str, Any]) 
             missing = not value if field == "test_id" else not isinstance(value, list) or not value
             if missing:
                 gaps.append({"scenario_id": scenario_id, "field": field, "message": message})
+        expected_row = expected_rows.get(scenario_id)
+        if expected_row:
+            for field in ("given", "when", "then"):
+                if row.get(field) != expected_row.get(field):
+                    gaps.append(
+                        {
+                            "scenario_id": scenario_id,
+                            "field": field,
+                            "message": f"Original {field.upper()} steps were changed or omitted.",
+                        }
+                    )
+        test_id = str(row.get("test_id") or "").strip()
+        if test_id:
+            test_ids.append((scenario_id, test_id))
+        canonical_url = str(row.get("canonical_url") or "").strip()
+        if not canonical_url:
+            gaps.append({"scenario_id": scenario_id, "field": "canonical_url", "message": "No canonical URL or not_applicable marker is defined."})
+        elif canonical_url.lower() != "not_applicable":
+            if not canonical_url.startswith("/"):
+                gaps.append({"scenario_id": scenario_id, "field": "canonical_url", "message": "Canonical URL must be an application path or not_applicable."})
+            if any(marker in canonical_url.lower() for marker in ("...", "yyyy-mm-dd", "tbd", "todo")) or "|" in canonical_url:
+                gaps.append({"scenario_id": scenario_id, "field": "canonical_url", "message": "Canonical URL contains an unresolved placeholder or multiple alternatives."})
+        durable_state = str(row.get("durable_state") or "").strip()
+        if not durable_state:
+            gaps.append({"scenario_id": scenario_id, "field": "durable_state", "message": "No durable-state outcome or not_applicable marker is defined."})
+        for field in ("planned_files", "observable_checks", "assertions"):
+            values = row.get(field)
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                text = str(value or "").strip()
+                if not text or re.search(r"(?:\.\.\.|\bTBD\b|\bTODO\b)", text, re.IGNORECASE):
+                    gaps.append({"scenario_id": scenario_id, "field": field, "message": f"{field} contains an empty or unresolved placeholder value."})
+                    break
+    duplicate_test_ids = sorted({test_id for _, test_id in test_ids if sum(1 for _, value in test_ids if value == test_id) > 1})
+    for test_id in duplicate_test_ids:
+        for scenario_id, value in test_ids:
+            if value == test_id:
+                gaps.append({"scenario_id": scenario_id, "field": "test_id", "message": f"Test ID is not unique: {test_id}."})
     return gaps

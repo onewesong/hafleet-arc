@@ -49,7 +49,17 @@ def parse_review(text: str | None) -> dict[str, Any]:
     verdict = str(parsed.get("verdict") or "changes_requested").strip().lower()
     if verdict not in {"pass", "changes_requested"}:
         verdict = "changes_requested"
-    checks = [item for item in (parsed.get("checks") or []) if isinstance(item, dict)]
+    checks: list[dict[str, Any]] = []
+    for raw in parsed.get("checks") or []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        # Reviewer prompts historically used both ``status`` and ``result``.
+        # Normalize at the protocol boundary so a successful static contract
+        # check is not accidentally treated as a failed implementation check.
+        if not str(item.get("status") or "").strip() and "result" in item:
+            item["status"] = item.get("result")
+        checks.append(item)
     return {
         "verdict": verdict,
         "summary": str(parsed.get("summary") or ("Review passed" if verdict == "pass" else "Changes requested")),
@@ -81,6 +91,28 @@ def review_passes(review: dict[str, Any]) -> bool:
     # in the audit log and Dashboard.
     verdict = str(review.get("verdict") or "").strip().lower()
     return verdict in {"pass", "changes_requested"} and not blocking_findings(review) and not failed_checks
+
+
+def contract_review_passes(review: dict[str, Any], machine_gaps: list[dict[str, Any]] | None = None) -> bool:
+    """Return whether a pre-implementation contract is ready for implementation.
+
+    Contract review is a static gate: unlike the later implementation review it
+    must receive an explicit ``pass`` verdict, but it does not require executable
+    test output. Any deterministic validator gap remains blocking regardless of
+    model wording.
+    """
+
+    explicitly_failed_checks = []
+    for item in review.get("checks") or []:
+        status = str(item.get("status") or item.get("result") or "").strip().lower()
+        if status in {"failed", "fail", "error", "timeout", "blocked"} or status.startswith(("failed_", "error_", "timeout_")):
+            explicitly_failed_checks.append(item)
+    return (
+        not (machine_gaps or [])
+        and str(review.get("verdict") or "").strip().lower() == "pass"
+        and not blocking_findings(review)
+        and not explicitly_failed_checks
+    )
 
 
 def review_hash(review: dict[str, Any]) -> str:
