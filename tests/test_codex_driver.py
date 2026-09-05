@@ -52,6 +52,24 @@ class CodexFleetRetryTests(unittest.TestCase):
             self.assertEqual(copied.read_text(encoding="utf-8"), '{"tokens":{"access_token":"test"}}\n')
             self.assertEqual(copied.stat().st_mode & 0o777, 0o600)
 
+    def test_isolated_codex_home_inherits_provider_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inherited = root / "operator-codex"
+            isolated = root / "output" / ".arc" / "hafleet" / "codex-home"
+            inherited.mkdir(parents=True)
+            isolated.mkdir(parents=True)
+            (inherited / "config.toml").write_text(
+                'model_provider = "relay"\n[model_providers.relay]\nbase_url = "https://relay.invalid/v1"\n',
+                encoding="utf-8",
+            )
+            with mock.patch.dict("os.environ", {"CODEX_HOME": str(inherited)}, clear=False):
+                CodexFleet._seed_codex_config(isolated)
+
+            copied = isolated / "config.toml"
+            self.assertIn('model_provider = "relay"', copied.read_text(encoding="utf-8"))
+            self.assertEqual(copied.stat().st_mode & 0o777, 0o600)
+
     def test_role_model_overrides_global_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fleet = CodexFleet(Path(temporary))

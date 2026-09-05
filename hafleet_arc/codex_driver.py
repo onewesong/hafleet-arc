@@ -171,6 +171,30 @@ class CodexFleet:
                 log(f"[hafleet] warning: could not seed isolated Codex authentication: {exc}", flush=True)
                 return
 
+    @staticmethod
+    def _seed_codex_config(codex_home: Path) -> None:
+        """Preserve the operator's configured model provider in an isolated home."""
+
+        target = codex_home / "config.toml"
+        if target.exists():
+            return
+        inherited_home = os.environ.get("CODEX_HOME", "").strip()
+        candidates = [Path(inherited_home)] if inherited_home else []
+        default_home = Path.home() / ".codex"
+        if default_home not in candidates:
+            candidates.append(default_home)
+        for home in candidates:
+            source = home.expanduser() / "config.toml"
+            try:
+                if not source.is_file() or source.resolve() == target.resolve():
+                    continue
+                shutil.copy2(source, target)
+                target.chmod(0o600)
+                return
+            except OSError as exc:
+                log(f"[hafleet] warning: could not seed isolated Codex configuration: {exc}", flush=True)
+                return
+
     def __enter__(self) -> Self:
         try:
             from openai_codex import Codex, CodexConfig
@@ -184,6 +208,7 @@ class CodexFleet:
         codex_home = self.output_dir / ".arc" / "hafleet" / "codex-home"
         codex_home.mkdir(parents=True, exist_ok=True)
         self._seed_codex_auth(codex_home)
+        self._seed_codex_config(codex_home)
         env["CODEX_HOME"] = str(codex_home)
         env["ARCBENCH_WEB_PORT"] = str(self.grading_port)
         env["HAFLEET_SMOKE_PORT"] = str(self.smoke_port)
