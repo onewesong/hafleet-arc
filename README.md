@@ -255,7 +255,8 @@ rounds by default. If it cannot converge, unattended runs preserve the latest fe
 and give the same Implementer one final planning-only reconciliation turn before
 continuing. Unresolved blocker/major findings are persisted by module and become
 mandatory implementation and implementation-review obligations; they are cleared only
-after the later Reviewer approves the source and executable tests. Strict pause behavior remains available through
+when the later Reviewer explicitly returns their IDs in `resolved_finding_ids` after
+verifying the source and executable black-box tests. Strict pause behavior remains available through
 `HAFLEET_QUALITY_ON_EXHAUSTION=pause`.
 
 The deterministic contract validator also rejects changed GIVEN/WHEN/THEN steps,
@@ -391,6 +392,11 @@ and final convergence. Project verification repairs use their own finite budget 
 do not consume Reviewer rounds. The final Postflight gate does not create a completion
 checkpoint while registered project tests are still failing. Set
 `HAFLEET_QUALITY_ON_EXHAUSTION=pause` when a strict manual gate is preferred.
+
+Final integration also aggregates unresolved contract obligations from every module.
+The integration Implementer receives them as mandatory repair work, and the final
+Reviewer must explicitly resolve each finding ID. A successful Postflight no longer
+clears deferred modules or creates the final checkpoint while any obligation remains.
 
 Use `HAFLEET_VERIFICATION_MAX_REPAIRS` to cap deterministic test repair turns and
 `HAFLEET_QUALITY_STALL_LIMIT` to control how many consecutive identical no-progress

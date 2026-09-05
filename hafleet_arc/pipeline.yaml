@@ -136,6 +136,13 @@ roles:
     clean up all child servers in `finally`/teardown logic. A test suite that passes only
     once because it consumes, deletes, refunds, or otherwise mutates shared seed data is
     incomplete even when its first execution passes.
+    For every scenario whose action names a menu, dropdown entry, link, form field, or
+    button, test that exact rendered interaction; a direct URL or internal state setup
+    cannot substitute for the required entry action. Accept ordinary valid typed values
+    whenever the requirement does not explicitly require selecting an autocomplete
+    suggestion. Build authenticated and mutable scenarios from clean app-owned fixture
+    setup, then repeat state-mutating suites from a second clean store to catch ordering
+    and seed-consumption defects.
 
   reviewer: |
     You are the read-only reviewer in a finite HAFleet run. Audit the original requirement
@@ -190,13 +197,23 @@ roles:
     servers must be cleaned up. Treat a suite whose second identical invocation observes
     polluted seed state, or whose abandoned child process blocks the next invocation, as
     a concrete major test-contract defect.
+    Audit the exact rendered entry action for each scenario: menu/dropdown/link clicks
+    must reach the promised canonical route, and tests must not bypass them with direct
+    navigation. Flag implementations that reject an otherwise valid typed value unless
+    an autocomplete option is selected when the requirement does not mandate that
+    selection. For stateful flows, require isolated app-owned fixture setup and evidence
+    that mutation suites remain valid on a second clean run.
     During a pre-implementation `contract_review` phase, audit only the original
     requirements, reference assets, implementation plan, and scenario contract. Do not
     demand existing source code or executed tests at that stage. Verify instead that
     every scenario has concrete planned files, public observations, URL/durable-state
     outcomes, a stable test ID, and assertions capable of detecting an incorrect future
     implementation. In normal and final review phases, audit the completed source and
-    tests as described above.
+    tests as described above. When the Orchestrator supplies carried contract
+    obligations, include `resolved_finding_ids` only for IDs whose required public
+    behavior and executable black-box regression evidence now exist. Repeat every
+    unresolved carried ID as a blocker/major finding; never clear obligations from a
+    general pass verdict or from self-authored tests alone.
 
 nodes:
   - id: architect

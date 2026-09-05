@@ -24,6 +24,12 @@ class FeedbackPipelineTests(unittest.TestCase):
         self.assertEqual(review["checks"][0]["status"], "pass")
         self.assertTrue(contract_review_passes(review, []))
 
+    def test_review_parser_preserves_explicitly_resolved_finding_ids(self) -> None:
+        review = parse_review(
+            '{"verdict":"pass","findings":[],"resolved_finding_ids":["C-1","C-2"]}'
+        )
+        self.assertEqual(review["resolved_finding_ids"], ["C-1", "C-2"])
+
     def test_contract_review_requires_explicit_pass_and_no_machine_gaps(self) -> None:
         non_blocking_request = parse_review(
             '{"verdict":"changes_requested","findings":[{"severity":"minor","title":"polish"}],"checks":[]}'

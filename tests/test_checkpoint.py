@@ -58,6 +58,17 @@ class CheckpointStoreTests(unittest.TestCase):
             self.assertEqual(store.contract_obligations("REQ-1"), [])
             self.assertEqual([item["id"] for item in store.contract_obligations("REQ-2")], ["C-2"])
 
+    def test_contract_obligations_require_explicit_id_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CheckpointStore(Path(temporary) / "checkpoint.json")
+            store.set_contract_obligations(
+                "REQ-1",
+                [{"id": "C-1"}, {"id": "C-2"}],
+            )
+            remaining = store.resolve_contract_obligations(["C-1"], module_id="REQ-1")
+            self.assertEqual([item["id"] for item in remaining["REQ-1"]], ["C-2"])
+            self.assertEqual([item["id"] for item in store.contract_obligations("REQ-1")], ["C-2"])
+
     def test_architecture_completion_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = CheckpointStore(Path(temporary) / "checkpoint.json")

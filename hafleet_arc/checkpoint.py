@@ -175,6 +175,49 @@ class CheckpointStore:
         values = obligations.get(module_id, []) if isinstance(obligations, dict) else []
         return [dict(item) for item in values if isinstance(item, dict)]
 
+    def all_contract_obligations(self) -> dict[str, list[dict[str, Any]]]:
+        payload = self.read()
+        raw = payload.get("contract_obligations") or {}
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(module_id): [dict(item) for item in findings if isinstance(item, dict)]
+            for module_id, findings in raw.items()
+            if isinstance(findings, list) and findings
+        }
+
+    def resolve_contract_obligations(
+        self,
+        resolved_ids: list[str] | set[str],
+        *,
+        module_id: str | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Remove only obligations explicitly verified by a Reviewer."""
+
+        resolved = {str(item).strip() for item in resolved_ids if str(item).strip()}
+        with self._write_lock:
+            payload = self.read()
+            obligations = dict(payload.get("contract_obligations") or {})
+            targets = [module_id] if module_id else list(obligations)
+            for target in targets:
+                findings = obligations.get(target, [])
+                remaining = [
+                    item for item in findings
+                    if isinstance(item, dict) and str(item.get("id") or "").strip() not in resolved
+                ]
+                if remaining:
+                    obligations[target] = remaining
+                else:
+                    obligations.pop(target, None)
+            payload["contract_obligations"] = obligations
+            payload["carried_contract_findings"] = list(obligations.get(module_id or "", []))
+            self.write(payload)
+            return {
+                str(key): [dict(item) for item in value if isinstance(item, dict)]
+                for key, value in obligations.items()
+                if isinstance(value, list) and value
+            }
+
     def mark_architecture_completed(self) -> dict[str, Any]:
         payload = self.read()
         payload.update(

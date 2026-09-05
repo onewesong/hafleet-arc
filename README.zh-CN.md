@@ -233,7 +233,8 @@ ROOT 的每个直接子节点都会成为一个模块。模块按稳定且依赖
 `pipeline.yaml` 中的 `contract_review` 节点声明，默认最多两轮。若有限轮次仍未收敛，
 无人值守模式会先让同一个 Implementer 再执行一次仅规划的最终修订，然后继续实施。
 未解决的 blocker/major finding 会按模块持久化，并成为后续实现和实现审核的强制义务；
-只有 Reviewer 对最终源码和可执行测试审核通过后才会清除。设置
+只有 Reviewer 对最终源码和可执行黑盒测试审核后，在 `resolved_finding_ids` 中明确
+返回对应 ID 才会清除。设置
 `HAFLEET_QUALITY_ON_EXHAUSTION=pause` 可改为严格暂停。
 
 确定性契约校验还会拒绝被改写的 GIVEN/WHEN/THEN、重复测试 ID、未解决占位符、含糊的
@@ -350,6 +351,10 @@ export HAFLEET_TESTER_MODEL=gpt-5.6-terra
 独立的有限预算，不会占用 Reviewer 轮次。当注册项目测试仍然失败时，最终 Postflight
 门禁不会创建完成 checkpoint。如果希望使用严格的人工门禁，可设置
 `HAFLEET_QUALITY_ON_EXHAUSTION=pause`。
+
+最终集成还会汇总所有模块尚未解决的契约义务。集成 Implementer 必须将其作为修复任务，
+最终 Reviewer 必须逐项明确核销。即使 Postflight 成功，只要仍有契约义务，系统也不会
+清空 deferred 模块或创建最终完成 checkpoint。
 
 可以使用 `HAFLEET_VERIFICATION_MAX_REPAIRS` 限制确定性测试修复 Turn 数，使用
 `HAFLEET_QUALITY_STALL_LIMIT` 控制允许连续出现多少次相同的无进展结果。

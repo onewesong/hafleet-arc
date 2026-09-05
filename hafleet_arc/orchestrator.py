@@ -804,6 +804,15 @@ checks, register the exact argv commands in .arc/hafleet/verification.json, and 
 JSON with changed_files, covered requirement IDs, checks, and any
 remaining risks; an empty changed_files result is acceptable only when you can cite
 evidence for every leaf being implemented.
+
+Before declaring completion, exercise a public-boundary prerequisite matrix derived
+from the subtree: click every named menu/dropdown entry and assert its destination;
+submit ordinary valid typed values without requiring an undocumented autocomplete
+selection; open every canonical route in a fresh browser context; and create/reset the
+stateful fixtures needed by each workflow rather than borrowing records from an earlier
+test. Run mutation suites twice from clean storage and fix order dependence. A passing
+downstream test is not meaningful when its login, search, navigation, or seed-data
+prerequisite was bypassed by directly injecting internal state.
 """
         result = self._run_agent(
             self.pipeline.role_for("implementer", "implementer"),
@@ -866,6 +875,15 @@ the generation date. Register every executed argv command in
 .arc/hafleet/verification.json. Keep changes inside this module and
 return JSON with changed_files, covered_requirements, checks, and remaining_risks.
 Do not merely describe gaps: fix concrete gaps before returning.
+
+For each scenario whose WHEN step names a link, menu item, dropdown entry, form input,
+or button, exercise that exact rendered entry action rather than navigating directly
+or setting internal state. Verify that ordinary valid text input is accepted when the
+requirement does not mandate choosing a suggestion. For authenticated or stateful
+flows, provision the precondition from a fresh isolated store through an app-owned
+public setup path, then repeat the scenario after reload and in a second clean context.
+Run the module's state-mutating tests twice to expose shared-fixture consumption and
+test-order dependencies before handing off to Reviewer.
 """
         result = self._run_agent(
             self.pipeline.role_for("implementer", "implementer"),
@@ -1313,6 +1331,14 @@ is actionable and report changed_files; do not return only an explanation.
             before_files = _file_snapshot(review_workspace)
             before = _content_fingerprint(review_workspace)
             scenario_contract_note = ""
+            contract_obligations = (
+                {module.node_id: self.checkpoint.contract_obligations(module.node_id)}
+                if module is not None
+                else self.checkpoint.all_contract_obligations()
+            )
+            contract_obligations = {
+                key: value for key, value in contract_obligations.items() if value
+            }
             if module is not None:
                 scenario_contract = review_workspace / ".arc" / "hafleet" / "contracts" / f"{module.node_id}.json"
                 scenario_contract_note = f"""
@@ -1321,6 +1347,18 @@ Compare it with the final implementation and executable tests. Every stable test
 must correspond to a real behavioral test with the promised assertions; flag plan-to-
 implementation drift and contract rows that were deleted, merged, or satisfied only by
 self-authored assumptions.
+"""
+            obligation_note = ""
+            if contract_obligations:
+                obligation_note = f"""
+These pre-implementation blocker/major obligations remain open. Audit each ID against
+the current source and executable black-box tests. Include `resolved_finding_ids` in
+your JSON only for IDs whose required behavior and regression evidence now exist.
+Repeat every unresolved obligation as a blocker/major finding; a general verdict or
+passing self-authored test suite does not resolve it:
+```json
+{json.dumps(contract_obligations, ensure_ascii=False, indent=2)}
+```
 """
             review_prompt = base_prompt + f"""
 
@@ -1335,6 +1373,7 @@ Use verdict=pass only when all blocker/major findings are resolved and required 
 Do not edit project files or Git state.
 
 {scenario_contract_note}
+{obligation_note}
 
 The Orchestrator executed this structured test result in the current round immediately
 before review. It is authoritative for current pass/fail status:
@@ -1372,8 +1411,48 @@ exists from an earlier resumed attempt.
             # Legacy test doubles and older adapters have no final_response; an
             # empty response is treated as a passing review for compatibility.
             feedback = parse_review(response) if response.strip() else {
-                "verdict": "pass", "summary": "Reviewer completed without structured findings.", "findings": [], "checks": [], "raw": ""
+                "verdict": "pass", "summary": "Reviewer completed without structured findings.", "findings": [], "checks": [], "resolved_finding_ids": [], "raw": ""
             }
+            if contract_obligations:
+                blocking_ids = {
+                    str(item.get("id") or "").strip()
+                    for item in blocking_findings(feedback)
+                    if str(item.get("id") or "").strip()
+                }
+                resolved_ids = {
+                    str(item).strip() for item in feedback.get("resolved_finding_ids", [])
+                    if str(item).strip()
+                } - blocking_ids
+                if resolved_ids:
+                    self.checkpoint.resolve_contract_obligations(
+                        resolved_ids,
+                        module_id=module.node_id if module else None,
+                    )
+                remaining_map = (
+                    {module.node_id: self.checkpoint.contract_obligations(module.node_id)}
+                    if module is not None
+                    else self.checkpoint.all_contract_obligations()
+                )
+                remaining = [item for values in remaining_map.values() for item in values]
+                existing_ids = {
+                    str(item.get("id") or "").strip()
+                    for item in feedback.get("findings", [])
+                    if isinstance(item, dict)
+                }
+                for obligation in remaining:
+                    obligation_id = str(obligation.get("id") or "").strip()
+                    if obligation_id in existing_ids:
+                        continue
+                    carried = dict(obligation)
+                    carried["severity"] = "major"
+                    carried["status"] = "open"
+                    carried["title"] = f"Unverified contract obligation: {carried.get('title') or obligation_id}"
+                    feedback.setdefault("findings", []).append(carried)
+                if remaining:
+                    feedback["verdict"] = "changes_requested"
+                    feedback["summary"] = (
+                        f"{len(remaining)} contract obligation(s) still lack explicit resolution evidence."
+                    )
             current_hash = review_hash(feedback)
             feedback_message = self._message(
                 "review.feedback",
@@ -1405,8 +1484,6 @@ exists from an earlier resumed attempt.
                     last_feedback_message_id=feedback_message["id"],
                     last_feedback_hash=current_hash,
                 )
-                if module:
-                    self.checkpoint.set_contract_obligations(module.node_id, [])
                 self._message("pipeline.state", "orchestrator", module=module, phase="review", round_number=round_number, payload={"status": "approved"}, parent_id=verdict["id"])
                 return feedback
             fingerprint = after
@@ -2053,6 +2130,7 @@ Do not approve the module while any blocker/major obligation remains unresolved:
             integration_enabled = os.environ.get("HAFLEET_FINAL_INTEGRATION", "1").strip().lower() not in {
                 "0", "false", "no",
             } and final_review_enabled and leaf_count >= 4
+            outstanding_contracts = self.checkpoint.all_contract_obligations()
             if integration_enabled and modules:
                 log("[hafleet] Final integration implementation pass started", flush=True)
                 integration_prompt = textwrap.dedent(
@@ -2072,7 +2150,25 @@ Do not approve the module while any blocker/major obligation remains unresolved:
                     - deterministic app-owned seed/bootstrap records described by requirements;
                     - durable persistence across refresh and process restart;
                     - end-to-end handoffs such as search -> booking -> order -> payment and
-                      profile/passenger updates, when those concepts exist in the requirements.
+                    profile/passenger updates, when those concepts exist in the requirements.
+
+                    The following unresolved pre-implementation obligations are mandatory.
+                    Resolve them in source and executable black-box tests, preserving their IDs
+                    in your structured report. A passing existing test suite is not evidence by
+                    itself; reproduce the required public behavior and add a regression assertion:
+                    ```json
+                    {json.dumps(outstanding_contracts, ensure_ascii=False, indent=2)}
+                    ```
+
+                    Independently exercise high-fan-out prerequisites before downstream flows:
+                    - activate every menu/dropdown entry through the rendered UI and assert its
+                      history URL, direct-load behavior, refresh behavior, and protected redirect;
+                    - accept ordinary valid text input whenever the requirement says users type a
+                      value; do not make suggestion selection an undocumented prerequisite;
+                    - provision each stateful test's user/record/order data from a clean isolated
+                      store and prove the same suite passes twice and in a different order;
+                    - verify downstream workflows from their public prerequisite setup rather than
+                      relying on state left by another test.
 
                     Preserve all already-implemented behavior and module boundaries. Make real
                     source changes (not static text), update or add requirement-derived tests,
@@ -2086,9 +2182,10 @@ Do not approve the module while any blocker/major obligation remains unresolved:
                     integration_prompt,
                     phase="integration",
                 )
+            final_review_passed = True
             if final_review_enabled:
                 log("[hafleet] Final integration review started", flush=True)
-                self._review_loop(
+                final_feedback = self._review_loop(
                     None,
                     textwrap.dedent(
                         f"""
@@ -2099,11 +2196,15 @@ Do not approve the module while any blocker/major obligation remains unresolved:
                         executable tests together while preserving module boundaries. Report missing
                         coverage, weak or misleading tests, regressions, and integration gaps. Do not
                         execute test commands, start servers, install dependencies, or modify project
-                        files.
+                        files. Explicitly resolve carried contract finding IDs only when current source
+                        and black-box regression tests prove the promised behavior. Treat unresolved
+                        module obligations, broken UI entry points, undocumented input prerequisites,
+                        shared mutable test fixtures, and order-dependent tests as major findings.
                         """
                     ).strip(),
                     final_review=True,
                 )
+                final_review_passed = review_passes(final_feedback)
             log(
                 f"[hafleet] Final review {'enabled' if final_review_enabled else 'disabled'}; "
                 "running delivery postflight",
@@ -2117,6 +2218,36 @@ Do not approve the module while any blocker/major obligation remains unresolved:
                     flush=True,
                 )
                 return
+            remaining_contracts = self.checkpoint.all_contract_obligations()
+            if not final_review_passed or remaining_contracts:
+                self.checkpoint.update_pipeline(
+                    "ROOT",
+                    node="final_quality_gate",
+                    loop_status="deferred",
+                    quality_deferred=True,
+                    quality_exhaustion_reason=(
+                        "unresolved contract obligations"
+                        if remaining_contracts
+                        else "final reviewer did not approve"
+                    ),
+                )
+                self._message(
+                    "pipeline.state",
+                    "orchestrator",
+                    phase="final-review",
+                    payload={
+                        "status": "final_quality_deferred",
+                        "reason": "unresolved contract obligations" if remaining_contracts else "final review not approved",
+                        "contract_obligations": remaining_contracts,
+                    },
+                )
+                log(
+                    "[hafleet] Final checkpoint withheld: final Reviewer approval and explicit "
+                    "contract-obligation resolution are required; output remains available for evaluation/resume",
+                    flush=True,
+                )
+                return
+            self.checkpoint.resolve_all_deferred_modules()
             final_checkpoint = "ROOT: final HAFleet integration review"
             committed = self._commit_operation(final_checkpoint, "postflight", phase="checkpoint")
             self._message(
@@ -2583,8 +2714,6 @@ Do not approve while any blocker/major obligation remains unresolved:
                     quality_deferred=False,
                     quality_exhaustion_reason="",
                 )
-                if verification_result is not None:
-                    self.checkpoint.resolve_all_deferred_modules()
                 self._message(
                     "operation.completed",
                     "orchestrator",

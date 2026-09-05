@@ -65,6 +65,11 @@ def parse_review(text: str | None) -> dict[str, Any]:
         "summary": str(parsed.get("summary") or ("Review passed" if verdict == "pass" else "Changes requested")),
         "findings": findings,
         "checks": checks,
+        "resolved_finding_ids": [
+            str(item).strip()
+            for item in (parsed.get("resolved_finding_ids") or parsed.get("resolved_findings") or [])
+            if str(item).strip()
+        ],
         "raw": str(text or ""),
     }
 
