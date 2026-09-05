@@ -147,6 +147,30 @@ class CodexFleetRetryTests(unittest.TestCase):
             self.assertEqual(result.final_response, "done")
             self.assertEqual(codex.starts, 2)
 
+    def test_retries_codex_process_closed_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fleet = CodexFleet(Path(temporary))
+            codex = FakeCodex(
+                [
+                    RuntimeError("Codex process closed stdout. stderr_tail="),
+                    SimpleNamespace(error=None, final_response="done"),
+                ]
+            )
+            fleet._codex = codex
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HAFLEET_MAX_ATTEMPTS": "2",
+                    "HAFLEET_RETRY_DELAYS": "0",
+                    "HAFLEET_TURN_TIMEOUT": "2",
+                },
+                clear=False,
+            ):
+                result = fleet.run("implementer", "repair contract")
+
+            self.assertEqual(result.final_response, "done")
+            self.assertEqual(codex.starts, 2)
+
     def test_default_retry_budget_survives_repeated_capacity_errors(self) -> None:
         """The unattended default allows several provider capacity windows."""
 
