@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -138,6 +139,36 @@ class CodexFleet:
             or normalized.endswith("_qa")
         )
 
+    @staticmethod
+    def _seed_codex_auth(codex_home: Path) -> None:
+        """Seed an isolated Codex home from the operator's existing login.
+
+        ARC-Bench runs keep sessions and SQLite state inside the output directory,
+        but an empty isolated home also loses the operator's ChatGPT login.  Prefer
+        an explicit API key when one is supplied; otherwise copy only auth.json and
+        leave the user's global Codex configuration untouched.
+        """
+
+        target = codex_home / "auth.json"
+        if target.exists() or os.environ.get("OPENAI_API_KEY", "").strip():
+            return
+        inherited_home = os.environ.get("CODEX_HOME", "").strip()
+        candidates = [Path(inherited_home)] if inherited_home else []
+        default_home = Path.home() / ".codex"
+        if default_home not in candidates:
+            candidates.append(default_home)
+        for home in candidates:
+            source = home.expanduser() / "auth.json"
+            try:
+                if not source.is_file() or source.resolve() == target.resolve():
+                    continue
+                shutil.copy2(source, target)
+                target.chmod(0o600)
+                return
+            except OSError as exc:
+                log(f"[hafleet] warning: could not seed isolated Codex authentication: {exc}", flush=True)
+                return
+
     def __enter__(self) -> Self:
         try:
             from openai_codex import Codex, CodexConfig
@@ -150,6 +181,7 @@ class CodexFleet:
         # writable output workspace instead of inheriting ~/.codex.
         codex_home = self.output_dir / ".arc" / "hafleet" / "codex-home"
         codex_home.mkdir(parents=True, exist_ok=True)
+        self._seed_codex_auth(codex_home)
         env["CODEX_HOME"] = str(codex_home)
         env["ARCBENCH_WEB_PORT"] = str(self.grading_port)
         env["HAFLEET_SMOKE_PORT"] = str(self.smoke_port)
