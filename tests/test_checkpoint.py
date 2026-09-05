@@ -98,6 +98,26 @@ class CheckpointStoreTests(unittest.TestCase):
             self.assertEqual(resolved["deferred_modules"], [])
             self.assertFalse(resolved["quality_deferred"])
 
+    def test_implementation_slice_progress_is_isolated_per_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CheckpointStore(Path(temporary) / "checkpoint.json")
+            store.record_implementation_slice("REQ-1", "REQ-1.1", 1, 2, completed=True)
+            store.record_implementation_slice("REQ-2", "REQ-2.1", 1, 3, completed=True)
+            store.record_implementation_slice("REQ-1", "REQ-1.2", 2, 2, completed=True)
+
+            state = store.read()
+            self.assertEqual(
+                state["completed_implementation_slices_by_module"],
+                {
+                    "REQ-1": ["REQ-1.1", "REQ-1.2"],
+                    "REQ-2": ["REQ-2.1"],
+                },
+            )
+            store.mark_module_started("REQ-1", "design")
+            reset = store.read()["completed_implementation_slices_by_module"]
+            self.assertNotIn("REQ-1", reset)
+            self.assertEqual(reset["REQ-2"], ["REQ-2.1"])
+
 
 if __name__ == "__main__":
     unittest.main()

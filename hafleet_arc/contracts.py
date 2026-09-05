@@ -6,6 +6,19 @@ from pathlib import Path
 from typing import Any
 
 
+_GENERIC_CONTRACT_TEXT = re.compile(
+    r"^(?:(?:assert|verify|check)(?:\s+that)?\s+)?(?:the\s+)?"
+    r"(?:(?:public|expected|visible|correct)\s+)?"
+    r"(?:result|behavior|outcome|state|content)"
+    r"(?:\s+(?:is\s+(?:visible|correct)|works|matches\s+(?:the\s+)?requirements?|persists))?[.!]?$",
+    re.IGNORECASE,
+)
+
+
+def _generic_contract_value(value: object) -> bool:
+    return bool(_GENERIC_CONTRACT_TEXT.fullmatch(" ".join(str(value or "").strip().split())))
+
+
 def _text_steps(scenario: dict[str, Any], keyword: str) -> list[str]:
     values: list[str] = []
     for step in scenario.get("steps") or []:
@@ -151,6 +164,40 @@ def contract_gaps(payload: dict[str, Any], requirement_subtree: dict[str, Any]) 
                 if not text or re.search(r"(?:\.\.\.|\bTBD\b|\bTODO\b)", text, re.IGNORECASE):
                     gaps.append({"scenario_id": scenario_id, "field": field, "message": f"{field} contains an empty or unresolved placeholder value."})
                     break
+                if field in {"observable_checks", "assertions"} and _generic_contract_value(text):
+                    gaps.append(
+                        {
+                            "scenario_id": scenario_id,
+                            "field": field,
+                            "message": f"{field} contains a generic assertion without a concrete public value or transition.",
+                        }
+                    )
+                    break
+    # Bulk-generated contracts can evade per-value placeholder checks by repeating
+    # one plausible sentence for many unrelated scenarios. Three or more identical
+    # assertion sets are an actionable planning gap; scenario-specific checks should
+    # name the actual control, value, route, API outcome, or durable transition.
+    for field in ("observable_checks", "assertions"):
+        signatures: dict[tuple[str, ...], list[str]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            values = row.get(field)
+            if not isinstance(values, list) or not values:
+                continue
+            signature = tuple(" ".join(str(value or "").lower().split()) for value in values)
+            signatures.setdefault(signature, []).append(str(row.get("scenario_id") or "unknown"))
+        for scenario_ids in signatures.values():
+            if len(scenario_ids) < 3:
+                continue
+            for scenario_id in scenario_ids:
+                gaps.append(
+                    {
+                        "scenario_id": scenario_id,
+                        "field": field,
+                        "message": f"{field} repeats the same template across {len(scenario_ids)} scenarios instead of defining scenario-specific evidence.",
+                    }
+                )
     duplicate_test_ids = sorted({test_id for _, test_id in test_ids if sum(1 for _, value in test_ids if value == test_id) > 1})
     for test_id in duplicate_test_ids:
         for scenario_id, value in test_ids:

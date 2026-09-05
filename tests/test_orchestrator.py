@@ -12,7 +12,11 @@ from hafleet_arc.checkpoint import CheckpointStore
 from hafleet_arc.contracts import ensure_contract_file
 from hafleet_arc.feedback import review_passes
 from hafleet_arc.models import RequirementModule
-from hafleet_arc.orchestrator import FleetOrchestrator, PauseRequested
+from hafleet_arc.orchestrator import (
+    FleetOrchestrator,
+    PauseRequested,
+    _implementation_response_incomplete,
+)
 from hafleet_arc.postflight import PostflightError
 
 
@@ -84,6 +88,392 @@ class FakeRuntime:
 class OrchestratorTests(unittest.TestCase):
     def _module(self, index: int, node_id: str) -> RequirementModule:
         return RequirementModule(index, 2, node_id, node_id, {"id": node_id})
+
+    def test_implementation_incomplete_response_gets_fresh_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class ContinuationDriver:
+                def __init__(self) -> None:
+                    self.calls: list[tuple[str, str]] = []
+                    self.resets: list[str] = []
+
+                def reset_thread(self, role: str, workspace_dir: Path | None = None) -> None:
+                    self.resets.append(role)
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append((role, prompt))
+                    if len(self.calls) == 1:
+                        return SimpleNamespace(
+                            final_response="I can’t complete the requested implementation in this turn; product source still needs to be implemented."
+                        )
+                    (workspace_dir or root).joinpath("implemented.txt").write_text("done\n", encoding="utf-8")
+                    return SimpleNamespace(
+                        final_response='{"status":"complete","changed_files":["implemented.txt"],"checks":[]}'
+                    )
+
+            driver = ContinuationDriver()
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            with mock.patch.dict("os.environ", {"HAFLEET_IMPLEMENTATION_CONTINUATIONS": "2"}, clear=False):
+                result = orchestrator._run_implementation_with_continuations(
+                    self._module(1, "REQ-1"), "Complete authoritative requirement REQ-1."
+                )
+
+            self.assertEqual(len(driver.calls), 2)
+            self.assertIn("Complete authoritative requirement REQ-1", driver.calls[1][1])
+            self.assertIn("do not merely summarize", driver.calls[1][1])
+            self.assertEqual(driver.resets, ["implementer", "implementer"])
+            self.assertTrue((root / "implemented.txt").is_file())
+            self.assertFalse(_implementation_response_incomplete(result.final_response))
+            state = checkpoint.read()
+            self.assertEqual(state["implementation_continuation_attempt"], 1)
+            self.assertEqual(state["loop_status"], "implemented")
+            statuses = [
+                item.get("payload", {}).get("status")
+                for item in orchestrator.bus.replay()
+                if item.get("kind") == "pipeline.state"
+            ]
+            self.assertIn("implementation_incomplete", statuses)
+            self.assertIn("implementation_continuation_completed", statuses)
+
+    def test_implementation_continuation_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class IncompleteDriver:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls += 1
+                    return SimpleNamespace(final_response="The implementation remains incomplete and future work is needed.")
+
+            driver = IncompleteDriver()
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            with mock.patch.dict("os.environ", {"HAFLEET_IMPLEMENTATION_CONTINUATIONS": "1"}, clear=False):
+                orchestrator._run_implementation_with_continuations(
+                    self._module(1, "REQ-1"), "Implement REQ-1."
+                )
+
+            self.assertEqual(driver.calls, 2)
+            state = checkpoint.read()
+            self.assertEqual(state["loop_status"], "implementation_incomplete_exhausted")
+            self.assertEqual(state["implementation_continuation_attempt"], 1)
+
+    def test_final_integration_can_use_the_same_bounded_continuation_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class IntegrationDriver:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+
+                def reset_thread(self, role: str, workspace_dir: Path | None = None) -> None:
+                    return None
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append(prompt)
+                    if len(self.calls) == 1:
+                        return SimpleNamespace(
+                            final_response='{"status":"partial","remaining_work":["resolve deferred modules"]}'
+                        )
+                    return SimpleNamespace(
+                        final_response='{"status":"complete","remaining_work":[],"checks":["integration"]}'
+                    )
+
+            driver = IntegrationDriver()
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            integration_module = RequirementModule(
+                2,
+                2,
+                "ROOT",
+                "Final Integration",
+                {"id": "ROOT"},
+            )
+            with mock.patch.dict("os.environ", {"HAFLEET_IMPLEMENTATION_CONTINUATIONS": "1"}, clear=False):
+                orchestrator._run_implementation_with_continuations(
+                    integration_module,
+                    "Resolve all deferred integration findings.",
+                    phase="integration",
+                )
+
+            self.assertEqual(len(driver.calls), 2)
+            self.assertIn("Implementation continuation 1/1", driver.calls[1])
+            state = checkpoint.read()
+            self.assertEqual(state["current_node_id"], "ROOT")
+            self.assertEqual(state["current_pipeline_node"], "integration")
+            self.assertEqual(state["phase"], "integration")
+            self.assertEqual(state["loop_status"], "implemented")
+
+    def test_large_module_is_implemented_in_author_defined_requirement_slices(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class SliceDriver:
+                def __init__(self) -> None:
+                    self.prompts: list[str] = []
+                    self.resets = 0
+
+                def reset_thread(self, role: str, workspace_dir: Path | None = None) -> None:
+                    self.resets += 1
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.prompts.append(prompt)
+                    return SimpleNamespace(final_response='{"status":"complete","remaining_work":[]}')
+
+            module = RequirementModule(
+                1,
+                1,
+                "REQ-1",
+                "Large module",
+                {
+                    "id": "REQ-1",
+                    "children": [
+                        {"id": "REQ-1.1", "name": "First domain", "scenarios": [{"name": "A"}]},
+                        {"id": "REQ-1.2", "name": "Second domain", "scenarios": [{"name": "B"}]},
+                    ],
+                },
+            )
+            driver = SliceDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            with mock.patch.dict("os.environ", {"HAFLEET_IMPLEMENTATION_SLICE_LEAVES": "2"}, clear=False):
+                orchestrator._run_module_implementation(module, "Implement the complete module.")
+
+            self.assertEqual(len(driver.prompts), 2)
+            self.assertEqual(driver.resets, 2)
+            first_prompt = " ".join(driver.prompts[0].split())
+            second_prompt = " ".join(driver.prompts[1].split())
+            self.assertIn("slice 1/2: REQ-1.1", first_prompt)
+            self.assertIn('"id": "REQ-1.1"', driver.prompts[0])
+            self.assertIn("slice 2/2: REQ-1.2", second_prompt)
+            self.assertIn('"id": "REQ-1.2"', driver.prompts[1])
+            state = orchestrator.checkpoint.read()
+            self.assertEqual(state["completed_implementation_slices"], ["REQ-1.1", "REQ-1.2"])
+            self.assertEqual(state["implementation_slice_total"], 2)
+            self.assertEqual(state["loop_status"], "implemented")
+
+    def test_completed_implementation_slices_are_skipped_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module = RequirementModule(
+                1,
+                1,
+                "REQ-1",
+                "Large module",
+                {
+                    "id": "REQ-1",
+                    "children": [
+                        {"id": "REQ-1.1", "scenarios": [{"name": "A"}]},
+                        {"id": "REQ-1.2", "scenarios": [{"name": "B"}]},
+                    ],
+                },
+            )
+
+            class ResumeDriver:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls += 1
+                    return SimpleNamespace(final_response='{"status":"complete"}')
+
+            driver = ResumeDriver()
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            checkpoint.update_pipeline(
+                "REQ-1",
+                completed_implementation_slices=["REQ-1.1"],
+            )
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="web",
+            )
+            with mock.patch.dict("os.environ", {"HAFLEET_IMPLEMENTATION_SLICE_LEAVES": "2"}, clear=False):
+                orchestrator._run_module_implementation(module, "Resume the module.")
+
+            self.assertEqual(driver.calls, 1)
+            self.assertEqual(
+                checkpoint.read()["completed_implementation_slices"],
+                ["REQ-1.1", "REQ-1.2"],
+            )
+
+    def test_slice_prompt_replaces_full_module_payload_instead_of_duplicating_it(self) -> None:
+        module = RequirementModule(
+            1,
+            1,
+            "REQ-1",
+            "Large module",
+            {
+                "id": "REQ-1",
+                "children": [
+                    {"id": "REQ-1.1", "description": "first unique behavior"},
+                    {"id": "REQ-1.2", "description": "second unique behavior"},
+                ],
+            },
+        )
+        first = module.subtree["children"][0]
+        full_json = json.dumps(module.subtree, ensure_ascii=False, indent=2)
+        from hafleet_arc.capabilities import build_capability_model
+
+        full_capability = json.dumps(
+            build_capability_model(module.subtree), ensure_ascii=False, indent=2
+        )
+        prompt = f"Complete requirement subtree:\n{full_json}\nCapability:\n{full_capability}"
+        focused, replaced = FleetOrchestrator._focus_prompt_on_slice(prompt, module, first)
+
+        self.assertTrue(replaced)
+        self.assertIn("first unique behavior", focused)
+        self.assertNotIn("second unique behavior", focused)
+        self.assertLess(len(focused), len(prompt))
+
+    def test_completed_zero_change_summary_is_not_misclassified(self) -> None:
+        self.assertFalse(
+            _implementation_response_incomplete(
+                "No remaining work is needed; the module is fully implemented and verified."
+            )
+        )
+        self.assertFalse(
+            _implementation_response_incomplete(
+                '{"status":"complete","completed":true,"remaining_work":[]}'
+            )
+        )
+
+    def test_structured_incomplete_result_requests_continuation(self) -> None:
+        self.assertTrue(
+            _implementation_response_incomplete(
+                '```json\n{"status":"partial","remaining_work":["implement routes"]}\n```'
+            )
+        )
+        self.assertTrue(
+            _implementation_response_incomplete('{"completed":false,"remaining_work":"UI wiring"}')
+        )
+
+    def test_deferred_quality_feedback_uses_latest_message_per_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = CheckpointStore(root / ".arc" / "checkpoint.json")
+            checkpoint.mark_module_deferred("REQ-1", 1)
+            orchestrator = FleetOrchestrator(
+                driver=FakeDriver(),
+                runtime=FakeRuntime(),
+                checkpoint=checkpoint,
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            module = self._module(1, "REQ-1")
+            orchestrator._message(
+                "review.feedback",
+                "reviewer",
+                module=module,
+                phase="review",
+                payload={"findings": [{"id": "OLD", "severity": "major"}]},
+            )
+            orchestrator._message(
+                "review.feedback",
+                "reviewer",
+                module=module,
+                phase="review",
+                payload={"findings": [{"id": "LATEST", "severity": "major"}]},
+            )
+
+            feedback = orchestrator._deferred_quality_feedback()
+            self.assertEqual([item["id"] for item in feedback["REQ-1"]], ["LATEST"])
+
+    def test_pipeline_waits_for_continuation_before_self_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class OrderedDriver:
+                def __init__(self) -> None:
+                    self.calls: list[tuple[str, str]] = []
+
+                def reset_thread(self, role: str, workspace_dir: Path | None = None) -> None:
+                    return None
+
+                def run(self, role: str, prompt: str, workspace_dir: Path | None = None):
+                    self.calls.append((role, prompt))
+                    if role == "architect":
+                        marker = "Architecture document path: "
+                        path = Path(prompt.split(marker, 1)[1].splitlines()[0].strip())
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("# Architecture\n", encoding="utf-8")
+                    elif role == "implementer" and "Implementation continuation" in prompt:
+                        root.joinpath("feature.txt").write_text("implemented\n", encoding="utf-8")
+                        return SimpleNamespace(final_response='{"status":"complete","changed_files":["feature.txt"]}')
+                    elif role == "implementer" and "Implementation self-check" in prompt:
+                        if not root.joinpath("feature.txt").is_file():
+                            raise AssertionError("self-check ran before implementation continuation")
+                    elif role == "implementer":
+                        return SimpleNamespace(final_response="I cannot complete this implementation yet; remaining work is required.")
+                    return SimpleNamespace(final_response='{"verdict":"pass","findings":[],"checks":[]}')
+
+            driver = OrderedDriver()
+            orchestrator = FleetOrchestrator(
+                driver=driver,
+                runtime=FakeRuntime(),
+                checkpoint=CheckpointStore(root / ".arc" / "checkpoint.json"),
+                requirements_dir=root / "requirements",
+                output_dir=root,
+                task_type="cli",
+            )
+            module = RequirementModule(
+                1,
+                1,
+                "REQ-1",
+                "Demo",
+                {"id": "REQ-1", "children": [{"id": "REQ-1.1", "scenarios": []}]},
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HAFLEET_IMPLEMENTATION_CONTINUATIONS": "1",
+                    "HAFLEET_COMPLETION_PASS": "0",
+                    "HAFLEET_POSTFLIGHT": "0",
+                },
+                clear=False,
+            ):
+                orchestrator.run([module])
+
+            implementer_prompts = [prompt for role, prompt in driver.calls if role == "implementer"]
+            self.assertEqual(len(implementer_prompts), 3)
+            self.assertIn("Implementation continuation", implementer_prompts[1])
+            self.assertIn("Implementation self-check", implementer_prompts[2])
+            self.assertEqual(orchestrator.checkpoint.read()["completed"], ["REQ-1"])
 
     def test_reviewer_feedback_loops_back_to_implementer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -49,13 +49,13 @@ class ScenarioContractTests(unittest.TestCase):
             path = Path(temporary) / "REQ-1.json"
             payload = ensure_contract_file(path, "REQ-1", self._subtree())
             self.assertEqual(len(contract_gaps(payload, self._subtree())), 12)
-            for row in payload["scenarios"]:
+            for index, row in enumerate(payload["scenarios"], 1):
                 row["planned_files"] = ["src/app.js"]
-                row["observable_checks"] = ["The public result is visible."]
+                row["observable_checks"] = [f"Record {index} is rendered in the results table."]
                 row["canonical_url"] = "/records"
                 row["durable_state"] = "The record remains visible after refresh."
                 row["test_id"] = "T-" + row["scenario_id"]
-                row["assertions"] = ["Assert the visible result."]
+                row["assertions"] = [f"Assert row {index} contains the saved record name."]
             path.write_text(json.dumps(payload), encoding="utf-8")
             self.assertEqual(contract_gaps(ensure_contract_file(path, "REQ-1", self._subtree()), self._subtree()), [])
 
@@ -75,6 +75,36 @@ class ScenarioContractTests(unittest.TestCase):
         self.assertIn("canonical_url", fields)
         self.assertIn("planned_files", fields)
         self.assertEqual(fields.count("test_id"), 2)
+
+    def test_contract_validator_rejects_generic_and_bulk_reused_assertions(self) -> None:
+        subtree = self._subtree()
+        scenarios = subtree["children"][0]["scenarios"]
+        scenarios.extend(
+            [
+                {
+                    "name": "Third flow",
+                    "steps": [{"keyword": "THEN", "content": "A third concrete value is shown."}],
+                },
+                {
+                    "name": "Fourth flow",
+                    "steps": [{"keyword": "THEN", "content": "A fourth concrete value is shown."}],
+                },
+            ]
+        )
+        payload = {"scenarios": scenario_contracts(subtree)}
+        for row in payload["scenarios"]:
+            row["planned_files"] = ["src/app.js"]
+            row["observable_checks"] = ["The public result is visible."]
+            row["canonical_url"] = "/records"
+            row["durable_state"] = "not_applicable"
+            row["test_id"] = "T-" + row["scenario_id"]
+            row["assertions"] = ["Assert the visible result."]
+
+        gaps = contract_gaps(payload, subtree)
+        generic = [gap for gap in gaps if "generic assertion" in gap["message"]]
+        repeated = [gap for gap in gaps if "repeats the same template" in gap["message"]]
+        self.assertEqual(len(generic), 8)
+        self.assertEqual(len(repeated), 8)
 
 
 if __name__ == "__main__":

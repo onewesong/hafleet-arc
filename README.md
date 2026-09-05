@@ -397,11 +397,41 @@ Final integration also aggregates unresolved contract obligations from every mod
 The integration Implementer receives them as mandatory repair work, and the final
 Reviewer must explicitly resolve each finding ID. A successful Postflight no longer
 clears deferred modules or creates the final checkpoint while any obligation remains.
+For modules whose bounded quality loop was deferred, the latest structured Reviewer
+or project-test findings are recovered from MessageBus and supplied to both final
+integration and final review, so exhaustion does not discard actionable feedback.
 
 Use `HAFLEET_VERIFICATION_MAX_REPAIRS` to cap deterministic test repair turns and
 `HAFLEET_QUALITY_STALL_LIMIT` to control how many consecutive identical no-progress
 attempts are tolerated. `HAFLEET_QUALITY_MAX_ROUNDS` remains the independent Reviewer
-pass limit.
+pass limit. If a module or final-integration Implementer response explicitly says the
+requested implementation is incomplete, HAFleet starts a fresh continuation
+conversation with the complete requirement, reviewed contract, and carried findings
+before entering the next quality gate. Set
+`HAFLEET_IMPLEMENTATION_CONTINUATIONS` to bound these turns (default: `2`); exhausting
+the budget falls through to the existing self-check rather than looping forever.
+Each module's planning, contract repair, main implementation, test/review, and final
+integration phases start in fresh conversations and rebuild context from durable
+requirements, plans, architecture, contracts, feedback, workspace files, and MessageBus
+history. This prevents earlier phases or modules from consuming a later phase's context
+window or propagating compressed conclusions.
+
+Large modules are also staged by their author-defined first-level requirement domains
+instead of forcing unrelated workflows into one Agent turn. The same Implementer owns
+all slices, preserves prior slice behavior, and is followed by the normal module-wide
+self-check and Reviewer gate. Completed slices are checkpointed for resume. Configure
+the leaf threshold with `HAFLEET_IMPLEMENTATION_SLICE_LEAVES` (default: `12`), or set it
+to `0` to disable slicing.
+
+After every web Agent turn, HAFleet also removes only smoke-port listeners owned by
+that output workspace. This prevents a timed-out test server from serving stale builds
+or fixture state to the next turn without affecting unrelated user processes.
+
+The deterministic pre-implementation contract gate rejects empty placeholders,
+unresolved URL alternatives, duplicate test IDs, generic assertions such as "assert
+the visible result", and assertion templates copied across three or more scenarios.
+Each scenario must name concrete public values, routes, API outcomes, or durable state
+transitions before implementation starts.
 
 `HAFLEET_FINAL_REVIEW=0` skips the optional model review but still runs the
 deterministic postflight. `HAFLEET_POSTFLIGHT=0` is intended only for cheap

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import threading
 import time
@@ -12,6 +13,7 @@ from typing import Any, Self
 
 from .log import log
 from .pipeline import Pipeline, load_pipeline
+from .postflight import cleanup_workspace_port
 
 TRANSIENT_ERROR_MARKERS = (
     # Provider/model capacity errors are retryable even when the SDK does not
@@ -68,6 +70,18 @@ TRANSIENT_ERROR_MARKERS = (
 DEFAULT_MAX_ATTEMPTS = 6
 DEFAULT_RETRY_DELAYS = "30,60,120,180,300"
 DEFAULT_RETRY_DELAY_VALUES = (30.0, 60.0, 120.0, 180.0, 300.0)
+
+_SAFE_CODEX_TOP_LEVEL_KEYS = {
+    "model",
+    "model_provider",
+    "model_reasoning_effort",
+    "personality",
+    "profile",
+    "service_tier",
+}
+_SAFE_CODEX_SECTIONS = ("model_providers.", "profiles.")
+_TOML_SECTION_RE = re.compile(r"^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$")
+_TOML_KEY_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*=")
 
 
 class TurnTimeoutError(RuntimeError):
@@ -173,10 +187,25 @@ class CodexFleet:
 
     @staticmethod
     def _seed_codex_config(codex_home: Path) -> None:
-        """Preserve the operator's configured model provider in an isolated home."""
+        """Preserve provider settings without importing unrelated integrations.
+
+        Copying the operator's complete config also enables their hooks, plugins and
+        MCP servers inside every isolated Agent turn. Apart from leaking unrelated
+        credentials into the run directory, Codex app-server may then leave one MCP
+        child alive per thread and exhaust memory during long unattended pipelines.
+        HAFleet needs only the selected model/profile and provider tables.
+        """
 
         target = codex_home / "config.toml"
         if target.exists():
+            try:
+                current = target.read_text(encoding="utf-8")
+                filtered = CodexFleet._provider_config_only(current)
+                if filtered != current:
+                    target.write_text(filtered, encoding="utf-8")
+                target.chmod(0o600)
+            except OSError as exc:
+                log(f"[hafleet] warning: could not sanitize isolated Codex configuration: {exc}", flush=True)
             return
         inherited_home = os.environ.get("CODEX_HOME", "").strip()
         candidates = [Path(inherited_home)] if inherited_home else []
@@ -188,12 +217,45 @@ class CodexFleet:
             try:
                 if not source.is_file() or source.resolve() == target.resolve():
                     continue
-                shutil.copy2(source, target)
+                filtered = CodexFleet._provider_config_only(source.read_text(encoding="utf-8"))
+                if not filtered.strip():
+                    continue
+                target.write_text(filtered, encoding="utf-8")
                 target.chmod(0o600)
                 return
             except OSError as exc:
                 log(f"[hafleet] warning: could not seed isolated Codex configuration: {exc}", flush=True)
                 return
+
+    @staticmethod
+    def _provider_config_only(source: str) -> str:
+        """Return the provider/profile subset of a Codex TOML configuration.
+
+        This deliberately uses a conservative textual projection rather than a TOML
+        round-trip dependency. Provider tables can contain arbitrary vendor-specific
+        scalar or array values, which are retained verbatim. All other tables are
+        excluded by default.
+        """
+
+        kept: list[str] = []
+        keep_section = False
+        for line in str(source or "").splitlines():
+            section = _TOML_SECTION_RE.match(line)
+            if section:
+                name = section.group(1).strip().strip('"').strip("'")
+                keep_section = name.startswith(_SAFE_CODEX_SECTIONS)
+                if keep_section:
+                    if kept and kept[-1] != "":
+                        kept.append("")
+                    kept.append(line)
+                continue
+            if keep_section:
+                kept.append(line)
+                continue
+            key = _TOML_KEY_RE.match(line)
+            if key and key.group(1) in _SAFE_CODEX_TOP_LEVEL_KEYS:
+                kept.append(line)
+        return "\n".join(kept).rstrip() + "\n" if kept else ""
 
     def __enter__(self) -> Self:
         try:
@@ -383,10 +445,15 @@ ARC-Bench web delivery contract:
 Continue the interrupted {role} task from the current workspace. The previous turn
 timed out after making persistent file changes, so do not restart planning or replace
 working code. Inspect the current git diff, the existing .arc/hafleet plan and
-architecture, and the registered verification manifest. Finish only the incomplete
-requirement-derived behavior and tests, run the focused registered checks, repair any
-failures, and return the required structured completion summary. Preserve all valid
-work already present and do not access external or hidden evaluator tests.
+architecture, the registered verification manifest, and any project-owned test reports
+or artifacts left by the interrupted turn. Finish only the incomplete requirement-
+derived behavior and tests. Reproduce known failures with the smallest focused command
+or test filter first; do not immediately repeat a full browser or integration suite
+that can consume the entire turn. The deterministic verification/postflight gate will
+run the complete registered suite after the repair. Run focused checks for the changed
+paths, repair failures, and return the required structured completion summary before
+the turn deadline. Preserve all valid work already present and do not access external
+or hidden evaluator tests.
 """.strip()
 
     def run(self, role: str, prompt: str, workspace_dir: Path | None = None) -> Any:
@@ -396,6 +463,7 @@ work already present and do not access external or hidden evaluator tests.
         workspace = (workspace_dir or self.output_dir).resolve()
         attempt_prompt = prompt
         for attempt in range(1, attempts + 1):
+            cleaned = False
             before = _workspace_fingerprint(workspace)
             log(
                 f"[hafleet] {role} turn started in {workspace} "
@@ -432,6 +500,20 @@ work already present and do not access external or hidden evaluator tests.
                     f"{attempt + 1}/{attempts} after {delay:g}s: {exc}",
                     flush=True,
                 )
+                if self.task_type == "web":
+                    self._cleanup_turn_smoke_processes(role, workspace)
+                    cleaned = True
                 if delay:
                     time.sleep(delay)
+            finally:
+                if self.task_type == "web" and not cleaned:
+                    self._cleanup_turn_smoke_processes(role, workspace)
         raise AssertionError("unreachable")
+
+    def _cleanup_turn_smoke_processes(self, role: str, workspace: Path) -> None:
+        killed = cleanup_workspace_port(self.smoke_port, workspace)
+        if killed:
+            log(
+                f"[hafleet] cleaned workspace smoke-port processes after {role} turn: {killed}",
+                flush=True,
+            )

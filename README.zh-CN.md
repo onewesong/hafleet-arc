@@ -354,11 +354,32 @@ export HAFLEET_TESTER_MODEL=gpt-5.6-terra
 
 最终集成还会汇总所有模块尚未解决的契约义务。集成 Implementer 必须将其作为修复任务，
 最终 Reviewer 必须逐项明确核销。即使 Postflight 成功，只要仍有契约义务，系统也不会
-清空 deferred 模块或创建最终完成 checkpoint。
+清空 deferred 模块或创建最终完成 checkpoint。对于有限质量循环耗尽而 deferred 的模块，
+系统会从 MessageBus 恢复该模块最后一轮 Reviewer 或项目测试的结构化 finding，并同时传给
+最终集成与最终审查，避免耗尽循环时丢失可执行的修复信息。
 
 可以使用 `HAFLEET_VERIFICATION_MAX_REPAIRS` 限制确定性测试修复 Turn 数，使用
 `HAFLEET_QUALITY_STALL_LIMIT` 控制允许连续出现多少次相同的无进展结果。
-`HAFLEET_QUALITY_MAX_ROUNDS` 仍是独立的 Reviewer 审查轮次上限。
+`HAFLEET_QUALITY_MAX_ROUNDS` 仍是独立的 Reviewer 审查轮次上限。如果模块实现或最终
+集成阶段的 Implementer 明确回复请求尚未完成，HAFleet 会在进入下一质量门禁前创建新会话，
+并携带完整需求、已审契约与遗留 finding 继续实施。`HAFLEET_IMPLEMENTATION_CONTINUATIONS` 用于限制此类续作次数
+（默认 `2`）；耗尽后会进入既有 self-check 兜底，不会无限循环。每个模块的规划、契约
+修订、正式实现、测试/审查以及最终集成阶段都会使用新会话，并从持久化需求、计划、架构、
+契约、反馈、工作区文件和 MessageBus 历史重建上下文，避免更早阶段或模块消耗后续阶段的
+上下文窗口，也避免传播压缩后的旧结论。
+
+对于大型模块，系统还会按照需求作者定义的一级子域分阶段实施，避免把互不相关的工作流
+强塞进同一个 Agent Turn。所有 slice 仍由同一个 Implementer 角色负责，必须保留前序
+slice 的行为，之后继续执行模块级 self-check 和 Reviewer 门禁；已完成 slice 会写入
+checkpoint，重启时可以跳过。可通过 `HAFLEET_IMPLEMENTATION_SLICE_LEAVES` 设置触发的
+叶子需求数量阈值（默认 `12`），设置为 `0` 可关闭。
+
+每个 Web Agent Turn 结束后，HAFleet 还会仅清理属于当前输出工作区、监听 smoke port
+的进程，避免超时测试服务把旧构建或旧 fixture 状态带入下一轮，同时不会影响用户的其他进程。
+
+确定性的前置契约门禁会拒绝空占位符、未确定的 URL 备选项、重复测试 ID、类似“断言结果
+可见”的泛化断言，以及在三个或更多场景中复制的相同断言模板。正式实现开始前，每个场景
+都必须写明具体的公开值、路由、API 结果或持久化状态转换。
 
 `HAFLEET_FINAL_REVIEW=0` 会跳过可选的模型审查，但仍会运行确定性的 Postflight。
 `HAFLEET_POSTFLIGHT=0` 只适合低成本本地 Harness 测试；禁用它会失去对交付结果可运行

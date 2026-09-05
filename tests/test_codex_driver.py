@@ -70,6 +70,87 @@ class CodexFleetRetryTests(unittest.TestCase):
             self.assertIn('model_provider = "relay"', copied.read_text(encoding="utf-8"))
             self.assertEqual(copied.stat().st_mode & 0o777, 0o600)
 
+    def test_isolated_codex_home_excludes_hooks_plugins_and_mcp_servers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inherited = root / "operator-codex"
+            isolated = root / "output" / ".arc" / "hafleet" / "codex-home"
+            inherited.mkdir(parents=True)
+            isolated.mkdir(parents=True)
+            (inherited / "config.toml").write_text(
+                'model_provider = "relay"\n'
+                'model = "test-model"\n'
+                '[model_providers.relay]\n'
+                'base_url = "https://relay.invalid/v1"\n'
+                'experimental_bearer_token = "provider-secret"\n'
+                '[[hooks.Stop]]\n'
+                'command = "notify-every-turn"\n'
+                '[plugins."unrelated@example"]\n'
+                'enabled = true\n'
+                '[mcp_servers.agent-chat]\n'
+                'command = "node"\n'
+                '[mcp_servers.agent-chat.env]\n'
+                'API_TOKEN = "unrelated-secret"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict("os.environ", {"CODEX_HOME": str(inherited)}, clear=False):
+                CodexFleet._seed_codex_config(isolated)
+
+            copied = (isolated / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model_provider = "relay"', copied)
+            self.assertIn('model = "test-model"', copied)
+            self.assertIn('[model_providers.relay]', copied)
+            self.assertIn('experimental_bearer_token = "provider-secret"', copied)
+            self.assertNotIn("hooks", copied)
+            self.assertNotIn("plugins", copied)
+            self.assertNotIn("mcp_servers", copied)
+            self.assertNotIn("unrelated-secret", copied)
+
+    def test_existing_isolated_config_is_sanitized_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            isolated = Path(temporary) / ".arc" / "hafleet" / "codex-home"
+            isolated.mkdir(parents=True)
+            target = isolated / "config.toml"
+            target.write_text(
+                'model_provider = "relay"\n'
+                '[model_providers.relay]\n'
+                'base_url = "https://relay.invalid/v1"\n'
+                '[mcp_servers.unrelated]\n'
+                'command = "leaking-process"\n',
+                encoding="utf-8",
+            )
+
+            CodexFleet._seed_codex_config(isolated)
+
+            sanitized = target.read_text(encoding="utf-8")
+            self.assertIn('[model_providers.relay]', sanitized)
+            self.assertNotIn("mcp_servers", sanitized)
+            self.assertNotIn("leaking-process", sanitized)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_timeout_progress_prompt_avoids_repeating_long_full_suites(self) -> None:
+        prompt = CodexFleet._progress_retry_prompt("implementer")
+        normalized = " ".join(prompt.split())
+        self.assertIn("project-owned test reports", prompt)
+        self.assertIn("smallest focused command", prompt)
+        self.assertIn("do not immediately repeat a full browser or integration suite", prompt)
+        self.assertIn("verification/postflight gate", prompt)
+        self.assertIn("do not access external or hidden evaluator tests", normalized)
+
+    def test_web_turn_cleans_workspace_smoke_port_after_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fleet = CodexFleet(root, task_type="web", smoke_port=31991)
+            result = SimpleNamespace(final_response="done", error=None)
+            with (
+                mock.patch.object(fleet, "_run_once", return_value=result),
+                mock.patch("hafleet_arc.codex_driver.cleanup_workspace_port", return_value=[123]) as cleanup,
+            ):
+                self.assertIs(fleet.run("implementer", "implement"), result)
+
+            cleanup.assert_called_once_with(31991, root.resolve())
+
     def test_role_model_overrides_global_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fleet = CodexFleet(Path(temporary))

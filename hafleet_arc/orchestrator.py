@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import textwrap
 import time
@@ -167,6 +168,75 @@ def _contract_round_budget(configured: int) -> int:
         return fallback
 
 
+def _implementation_continuation_budget() -> int:
+    """Return the finite number of semantic incomplete-result continuations."""
+
+    try:
+        return max(int(os.environ.get("HAFLEET_IMPLEMENTATION_CONTINUATIONS", "2")), 0)
+    except ValueError:
+        return 2
+
+
+def _implementation_slice_threshold() -> int:
+    """Return the module leaf threshold for requirement-tree implementation slices."""
+
+    try:
+        return max(int(os.environ.get("HAFLEET_IMPLEMENTATION_SLICE_LEAVES", "12")), 0)
+    except ValueError:
+        return 12
+
+
+_IMPLEMENTATION_INCOMPLETE_PATTERNS = (
+    re.compile(r"\b(?:i\s+)?(?:can(?:not|['’]t)|could\s+not|was\s+not\s+able\s+to)\s+(?:fully\s+)?complete\b", re.I),
+    re.compile(r"\b(?:implementation|requested\s+work|task)\s+(?:is|remains)\s+(?:incomplete|unfinished)\b", re.I),
+    re.compile(r"\bstill\s+(?:needs?|need)\s+to\s+be\s+implemented\b", re.I),
+    re.compile(r"\bfuture\s+work\s+is\s+(?:still\s+)?needed\b", re.I),
+    re.compile(r"\bremaining\s+work\s+(?:is|includes|requires|needs)\b", re.I),
+)
+
+
+def _implementation_response_incomplete(response: str) -> bool:
+    """Detect an explicit refusal/deferral, without treating zero edits as failure."""
+
+    text = str(response or "").strip()
+    if not text:
+        return False
+    json_candidates = [text]
+    json_candidates.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", text, re.I)
+    )
+    for candidate in json_candidates:
+        try:
+            payload = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        status = str(payload.get("status") or payload.get("verdict") or "").strip().lower().replace("-", "_")
+        if status in {"incomplete", "partial", "unfinished", "blocked", "implementation_incomplete"}:
+            return True
+        if payload.get("completed") is False:
+            return True
+        remaining = payload.get("remaining_work")
+        if isinstance(remaining, (list, dict)) and bool(remaining):
+            return True
+        if isinstance(remaining, str) and remaining.strip().lower() not in {"", "none", "nothing", "n/a", "no"}:
+            return True
+    lowered = " ".join(text.lower().split())
+    if any(
+        phrase in lowered
+        for phrase in (
+            "no remaining work",
+            "no future work is needed",
+            "nothing remains to be implemented",
+            "fully implemented and verified",
+        )
+    ):
+        return False
+    return any(pattern.search(text) for pattern in _IMPLEMENTATION_INCOMPLETE_PATTERNS)
+
+
 def copy_template_contents(template_dir: Path, output_dir: Path) -> None:
     """Copy optional starter assets without overwriting resumed work."""
 
@@ -280,11 +350,28 @@ class FleetOrchestrator:
             parent_id=request["id"],
         )
         try:
-            # Keep the initial implementation context warm, but isolate corrective
-            # turns from stale model conclusions. The complete requirement subtree,
-            # plan, and structured feedback are supplied again, while workspace files
-            # and MessageBus history remain durable across the fresh conversation.
-            if phase in {"contract-review", "review", "final-review", "repair", "recovery", "completion", "self-check"}:
+            # Start execution and corrective phases from authoritative durable
+            # artifacts instead of carrying compressed conclusions across modules or
+            # from a long planning/contract conversation. The complete requirement,
+            # plan, contract, and feedback are present in each prompt; workspace files
+            # and MessageBus history remain durable across fresh conversations.
+            if phase in {
+                "design",
+                "contract-review",
+                "contract-repair",
+                "contract-reconciliation",
+                "implement",
+                "implement-slice",
+                "implementation-continuation",
+                "self-check",
+                "completion",
+                "test",
+                "review",
+                "final-review",
+                "repair",
+                "recovery",
+                "integration",
+            }:
                 reset_thread = getattr(self.driver, "reset_thread", None)
                 if callable(reset_thread):
                     reset_thread(role, workspace_dir=workspace_dir)
@@ -305,6 +392,330 @@ class FleetOrchestrator:
             parent_id=request["id"],
         )
         return result
+
+    def _run_implementation_with_continuations(
+        self,
+        module: RequirementModule,
+        prompt: str,
+        *,
+        phase: str = "implement",
+        workspace_dir: Path | None = None,
+    ) -> Any:
+        """Continue explicit incomplete implementation handoffs before quality gates."""
+
+        role = self.pipeline.role_for("implementer", "implementer")
+        result = self._run_agent(
+            role,
+            prompt,
+            module=module,
+            phase=phase,
+            workspace_dir=workspace_dir,
+        )
+        response = str(getattr(result, "final_response", "") or "")
+        budget = _implementation_continuation_budget()
+        attempt = 0
+        while _implementation_response_incomplete(response) and attempt < budget:
+            attempt += 1
+            workspace = workspace_dir or self.output_dir
+            fingerprint_before = _content_fingerprint(workspace)
+            self.checkpoint.update_pipeline(
+                module.node_id,
+                node="implementation_continuation",
+                phase=phase,
+                loop_status="implementation_incomplete",
+                implementation_continuation_attempt=attempt,
+                implementation_incomplete_response=response[:20000],
+            )
+            self._message(
+                "pipeline.state",
+                "orchestrator",
+                module=module,
+                phase=phase,
+                round_number=attempt,
+                payload={
+                    "status": "implementation_incomplete",
+                    "attempt": attempt,
+                    "max_continuations": budget,
+                    "response": response[:20000],
+                },
+            )
+            log(
+                f"[hafleet]   implementation incomplete; continuing {module.node_id} "
+                f"({attempt}/{budget})",
+                flush=True,
+            )
+            continuation_prompt = prompt + f"""
+
+Implementation continuation {attempt}/{budget}. Your preceding turn explicitly
+reported that the requested implementation was not complete:
+
+```text
+{response[:8000]}
+```
+
+Continue the same module in the current workspace now. Re-read the complete supplied
+requirement subtree, architecture, reviewed plan, scenario contract, and current files.
+Implement the remaining product behavior and executable requirement-derived tests;
+do not merely summarize, defer, apologize, or list future work. Run focused checks and
+return concrete changed_files and verification evidence. If the workspace already
+contains partial edits from the preceding turn, preserve and finish them.
+"""
+            result = self._run_agent(
+                role,
+                textwrap.dedent(continuation_prompt).strip(),
+                module=module,
+                phase="implementation-continuation",
+                round_number=attempt,
+                workspace_dir=workspace_dir,
+            )
+            response = str(getattr(result, "final_response", "") or "")
+            fingerprint_after = _content_fingerprint(workspace)
+            self._message(
+                "pipeline.state",
+                "orchestrator",
+                module=module,
+                phase=phase,
+                round_number=attempt,
+                payload={
+                    "status": "implementation_continuation_completed",
+                    "attempt": attempt,
+                    "workspace_changed": fingerprint_after != fingerprint_before,
+                    "still_incomplete": _implementation_response_incomplete(response),
+                },
+            )
+
+        still_incomplete = _implementation_response_incomplete(response)
+        self.checkpoint.update_pipeline(
+            module.node_id,
+            node=phase,
+            phase=phase,
+            loop_status="implementation_incomplete_exhausted" if still_incomplete else "implemented",
+            implementation_continuation_attempt=attempt,
+            implementation_incomplete_response=response[:20000] if still_incomplete else "",
+        )
+        if still_incomplete:
+            self._message(
+                "pipeline.state",
+                "orchestrator",
+                module=module,
+                phase=phase,
+                round_number=attempt,
+                payload={
+                    "status": "implementation_incomplete_exhausted",
+                    "attempt": attempt,
+                    "max_continuations": budget,
+                },
+            )
+            log(
+                f"[hafleet]   implementation continuation budget exhausted for "
+                f"{module.node_id}; entering self-check fallback",
+                flush=True,
+            )
+        return result
+
+    def _implementation_slices(self, module: RequirementModule) -> list[dict[str, Any]]:
+        """Split a large module by its author-defined first-level requirement domains."""
+
+        threshold = _implementation_slice_threshold()
+        if threshold <= 0 or self._module_leaf_count(module) < threshold:
+            return []
+        subtree = module.subtree if isinstance(module.subtree, dict) else {}
+        children = subtree.get("children") or subtree.get("requirements") or []
+        if not isinstance(children, list):
+            return []
+        slices = [dict(child) for child in children if isinstance(child, dict)]
+        return slices if len(slices) >= 2 else []
+
+    @staticmethod
+    def _focus_prompt_on_slice(
+        prompt: str,
+        module: RequirementModule,
+        slice_subtree: dict[str, Any],
+    ) -> tuple[str, bool]:
+        """Replace verbose module JSON blocks with the authoritative focused subtree."""
+
+        focused = prompt
+        replaced = False
+        full_requirement = json.dumps(module.subtree, ensure_ascii=False, indent=2)
+        focused_requirement = json.dumps(slice_subtree, ensure_ascii=False, indent=2)
+        if full_requirement in focused:
+            focused = focused.replace(full_requirement, focused_requirement, 1)
+            replaced = True
+        full_capability = json.dumps(
+            build_capability_model(module.subtree), ensure_ascii=False, indent=2
+        )
+        focused_capability = json.dumps(
+            build_capability_model(slice_subtree), ensure_ascii=False, indent=2
+        )
+        if full_capability in focused:
+            focused = focused.replace(full_capability, focused_capability, 1)
+            replaced = True
+        return focused, replaced
+
+    def _run_module_implementation(
+        self,
+        module: RequirementModule,
+        prompt: str,
+        *,
+        workspace_dir: Path | None = None,
+    ) -> Any:
+        """Implement a large module in bounded requirement-tree slices when useful."""
+
+        slices = self._implementation_slices(module)
+        if not slices:
+            return self._run_implementation_with_continuations(
+                module,
+                prompt,
+                workspace_dir=workspace_dir,
+            )
+
+        state = self.checkpoint.read()
+        slice_map = state.get("completed_implementation_slices_by_module") or {}
+        completed = {
+            str(item)
+            for item in (
+                slice_map.get(module.node_id, state.get("completed_implementation_slices", []))
+                if isinstance(slice_map, dict)
+                else state.get("completed_implementation_slices", [])
+            )
+            if str(item)
+        }
+        result: Any = None
+        total = len(slices)
+        log(
+            f"[hafleet]   large module split into {total} requirement-domain implementation slices: "
+            f"{module.node_id}",
+            flush=True,
+        )
+        for index, slice_subtree in enumerate(slices, 1):
+            slice_id = str(
+                slice_subtree.get("id")
+                or slice_subtree.get("req_id")
+                or slice_subtree.get("requirement_id")
+                or f"slice-{index}"
+            )
+            if slice_id in completed:
+                log(f"[hafleet]   skipping completed implementation slice {slice_id}", flush=True)
+                continue
+            self.checkpoint.record_implementation_slice(
+                module.node_id,
+                slice_id,
+                index,
+                total,
+                completed=False,
+            )
+            self._message(
+                "pipeline.state",
+                "orchestrator",
+                module=module,
+                phase="implement",
+                round_number=index,
+                payload={
+                    "status": "implementation_slice_started",
+                    "slice_id": slice_id,
+                    "slice_index": index,
+                    "slice_total": total,
+                },
+            )
+            focused_prompt, replaced = self._focus_prompt_on_slice(
+                prompt,
+                module,
+                slice_subtree,
+            )
+            fallback_subtree = (
+                ""
+                if replaced
+                else f"""
+
+Focused public requirement subtree:
+```json
+{json.dumps(slice_subtree, ensure_ascii=False, indent=2)}
+```
+"""
+            )
+            slice_prompt = focused_prompt + f"""
+
+The coordinator is staging this large module by its author-defined requirement tree
+so one turn is not consumed by unrelated workflows. This is implementation slice
+{index}/{total}: {slice_id}. Implement every requirement and scenario in the focused
+subtree below now, including its real domain state, API/UI behavior, persistence,
+validation, navigation, and executable public-boundary tests. Read the full module plan
+and scenario contract for shared decisions, preserve all behavior already implemented
+by earlier slices, and build reusable foundations needed by later slices. Do not limit
+your work to planning or placeholders, and do not implement later slices merely by
+guessing their details. Return a structured completion summary for this slice.
+{fallback_subtree}
+"""
+            result = self._run_implementation_with_continuations(
+                module,
+                textwrap.dedent(slice_prompt).strip(),
+                phase="implement-slice",
+                workspace_dir=workspace_dir,
+            )
+            completed.add(slice_id)
+            self.checkpoint.record_implementation_slice(
+                module.node_id,
+                slice_id,
+                index,
+                total,
+                completed=True,
+            )
+            self._message(
+                "pipeline.state",
+                "orchestrator",
+                module=module,
+                phase="implement",
+                round_number=index,
+                payload={
+                    "status": "implementation_slice_completed",
+                    "slice_id": slice_id,
+                    "slice_index": index,
+                    "slice_total": total,
+                },
+            )
+        self.checkpoint.update_pipeline(
+            module.node_id,
+            node="implement",
+            phase="implement",
+            loop_status="implemented",
+            implementation_slice_index=total,
+            implementation_slice_total=total,
+            implementation_slice_id="",
+            completed_implementation_slices=sorted(completed),
+        )
+        return result
+
+    def _deferred_quality_feedback(self) -> dict[str, list[dict[str, Any]]]:
+        """Recover each deferred module's latest structured quality findings."""
+
+        state = self.checkpoint.read()
+        deferred = {str(item) for item in state.get("deferred_modules", []) if str(item)}
+        if not deferred:
+            return {}
+        latest: dict[str, tuple[int, list[dict[str, Any]]]] = {}
+        for message in self.bus.replay():
+            module_id = str(message.get("module_id") or "")
+            if module_id not in deferred:
+                continue
+            if message.get("kind") not in {"review.feedback", "test.feedback", "test.failed"}:
+                continue
+            payload = message.get("payload")
+            findings = payload.get("findings", []) if isinstance(payload, dict) else []
+            normalized = [dict(item) for item in findings if isinstance(item, dict)]
+            if not normalized:
+                continue
+            sequence = int(message.get("sequence", 0) or 0)
+            if module_id not in latest or sequence >= latest[module_id][0]:
+                latest[module_id] = (sequence, normalized)
+
+        # Legacy/incomplete logs may only have the current checkpoint fields.
+        current = str(state.get("current_node_id") or "")
+        checkpoint_findings = state.get("review_findings", [])
+        if current in deferred and current not in latest and isinstance(checkpoint_findings, list):
+            normalized = [dict(item) for item in checkpoint_findings if isinstance(item, dict)]
+            if normalized:
+                latest[current] = (0, normalized)
+        return {module_id: findings for module_id, (_, findings) in sorted(latest.items())}
 
     @staticmethod
     def _tester_path_allowed(relative: str) -> bool:
@@ -2026,11 +2437,9 @@ Latest contract-review result (approved unless the finite unattended gate was de
                             if not planner_enabled
                             else "\n\nRead the coordinator plan, then implement the complete subtree, create or update requirement-derived executable tests, and run those tests plus focused build checks now."
                         )
-                    self._run_agent(
-                        self.pipeline.role_for("implementer", "implementer"),
+                    self._run_module_implementation(
+                        module,
                         implementer_prompt,
-                        module=module,
-                        phase="implement",
                     )
                     if not planner_enabled and not contract_enabled:
                         self._ensure_plan_artifact(plan_path, module)
@@ -2131,6 +2540,7 @@ Do not approve the module while any blocker/major obligation remains unresolved:
                 "0", "false", "no",
             } and final_review_enabled and leaf_count >= 4
             outstanding_contracts = self.checkpoint.all_contract_obligations()
+            deferred_feedback = self._deferred_quality_feedback()
             if integration_enabled and modules:
                 log("[hafleet] Final integration implementation pass started", flush=True)
                 integration_prompt = textwrap.dedent(
@@ -2160,6 +2570,14 @@ Do not approve the module while any blocker/major obligation remains unresolved:
                     {json.dumps(outstanding_contracts, ensure_ascii=False, indent=2)}
                     ```
 
+                    The following module-level quality findings exhausted their bounded
+                    review loops. They are not approved or optional. Reproduce and resolve
+                    each finding in the final integrated source and black-box regression
+                    tests, retaining its module and finding ID in your report:
+                    ```json
+                    {json.dumps(deferred_feedback, ensure_ascii=False, indent=2)}
+                    ```
+
                     Independently exercise high-fan-out prerequisites before downstream flows:
                     - activate every menu/dropdown entry through the rendered UI and assert its
                       history URL, direct-load behavior, refresh behavior, and protected redirect;
@@ -2177,8 +2595,15 @@ Do not approve the module while any blocker/major obligation remains unresolved:
                     changed_files, requirement_ids, checks, and unresolved risks.
                     """
                 ).strip()
-                self._run_agent(
-                    self.pipeline.role_for("implementer", "implementer"),
+                integration_module = RequirementModule(
+                    index=len(modules),
+                    total=len(modules),
+                    node_id="ROOT",
+                    name="Final Integration",
+                    subtree=self.requirement_tree or {"id": "ROOT"},
+                )
+                self._run_implementation_with_continuations(
+                    integration_module,
                     integration_prompt,
                     phase="integration",
                 )
@@ -2200,6 +2625,11 @@ Do not approve the module while any blocker/major obligation remains unresolved:
                         and black-box regression tests prove the promised behavior. Treat unresolved
                         module obligations, broken UI entry points, undocumented input prerequisites,
                         shared mutable test fixtures, and order-dependent tests as major findings.
+                        Re-check every deferred module finding below and list its finding ID in
+                        resolved_finding_ids only when source and executable tests prove it fixed:
+                        ```json
+                        {json.dumps(deferred_feedback, ensure_ascii=False, indent=2)}
+                        ```
                         """
                     ).strip(),
                     final_review=True,
@@ -2365,11 +2795,9 @@ Latest contract-review result:
                 if not planner_enabled
                 else "\n\nRead the coordinator plan, then implement the complete subtree, create or update requirement-derived executable tests, and run those tests plus focused build checks now."
             )
-        self._run_agent(
-            self.pipeline.role_for("implementer", "implementer"),
+        self._run_module_implementation(
+            module,
             textwrap.dedent(implementer_prompt).strip(),
-            module=module,
-            phase="implement",
             workspace_dir=workspace,
         )
         if not planner_enabled and not contract_enabled:

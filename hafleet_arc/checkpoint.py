@@ -56,6 +56,13 @@ class CheckpointStore:
             "tester_write_violation": False,
             "quality_deferred": False,
             "quality_exhaustion_reason": "",
+            "implementation_continuation_attempt": 0,
+            "implementation_incomplete_response": "",
+            "implementation_slice_index": 0,
+            "implementation_slice_total": 0,
+            "implementation_slice_id": "",
+            "completed_implementation_slices": [],
+            "completed_implementation_slices_by_module": {},
         }
         if not self.path.is_file():
             return default
@@ -103,6 +110,22 @@ class CheckpointStore:
         payload.setdefault("tester_write_violation", False)
         payload.setdefault("quality_deferred", False)
         payload.setdefault("quality_exhaustion_reason", "")
+        payload.setdefault("implementation_continuation_attempt", 0)
+        payload.setdefault("implementation_incomplete_response", "")
+        payload.setdefault("implementation_slice_index", 0)
+        payload.setdefault("implementation_slice_total", 0)
+        payload.setdefault("implementation_slice_id", "")
+        payload.setdefault("completed_implementation_slices", [])
+        slice_map = payload.get("completed_implementation_slices_by_module")
+        payload["completed_implementation_slices_by_module"] = (
+            {
+                str(module_id): [str(item) for item in values]
+                for module_id, values in slice_map.items()
+                if isinstance(values, list)
+            }
+            if isinstance(slice_map, dict)
+            else {}
+        )
         return payload
 
     def write(self, payload: dict[str, Any]) -> None:
@@ -113,21 +136,63 @@ class CheckpointStore:
             temporary.replace(self.path)
 
     def mark_module_started(self, module_id: str, phase: str) -> dict[str, Any]:
-        payload = self.read()
-        payload.update({"paused": False, "current_node_id": module_id, "current_phase": phase, "current_pipeline_node": phase, "current_round": 0, "current_review_round": 0, "current_verification_attempt": 0, "loop_status": "", "quality_deferred": False, "quality_exhaustion_reason": ""})
-        if phase == "design":
+        with self._write_lock:
+            payload = self.read()
+            payload.update({"paused": False, "current_node_id": module_id, "current_phase": phase, "current_pipeline_node": phase, "current_round": 0, "current_review_round": 0, "current_verification_attempt": 0, "loop_status": "", "quality_deferred": False, "quality_exhaustion_reason": "", "implementation_continuation_attempt": 0, "implementation_incomplete_response": ""})
+            if phase == "design":
+                slice_map = dict(payload.get("completed_implementation_slices_by_module") or {})
+                slice_map.pop(module_id, None)
+                payload.update({"implementation_slice_index": 0, "implementation_slice_total": 0, "implementation_slice_id": "", "completed_implementation_slices": [], "completed_implementation_slices_by_module": slice_map})
+                payload.update(
+                    {
+                        "contract_review_status": "",
+                        "contract_review_round": 0,
+                        "last_contract_feedback_message_id": "",
+                        "last_contract_feedback_hash": "",
+                        "contract_findings": [],
+                        "carried_contract_findings": [],
+                    }
+                )
+            self.write(payload)
+            return payload
+
+    def record_implementation_slice(
+        self,
+        module_id: str,
+        slice_id: str,
+        index: int,
+        total: int,
+        *,
+        completed: bool,
+    ) -> dict[str, Any]:
+        """Atomically retain per-module slice progress across parallel workers."""
+
+        with self._write_lock:
+            payload = self.read()
+            slice_map = dict(payload.get("completed_implementation_slices_by_module") or {})
+            module_slices = {
+                str(item) for item in slice_map.get(module_id, []) if str(item)
+            }
+            if completed and slice_id:
+                module_slices.add(slice_id)
+            slice_map[module_id] = sorted(module_slices)
             payload.update(
                 {
-                    "contract_review_status": "",
-                    "contract_review_round": 0,
-                    "last_contract_feedback_message_id": "",
-                    "last_contract_feedback_hash": "",
-                    "contract_findings": [],
-                    "carried_contract_findings": [],
+                    "current_node_id": module_id,
+                    "current_pipeline_node": "implementation_slice",
+                    "phase": "implement",
+                    "loop_status": (
+                        "implementation_slice_completed" if completed else "implementing_slice"
+                    ),
+                    "implementation_slice_index": index,
+                    "implementation_slice_total": total,
+                    "implementation_slice_id": slice_id,
+                    "completed_implementation_slices": sorted(module_slices),
+                    "completed_implementation_slices_by_module": slice_map,
                 }
             )
-        self.write(payload)
-        return payload
+            self.write(payload)
+            return payload
 
     def update_pipeline(self, module_id: str, **updates: Any) -> dict[str, Any]:
         # Keep read/modify/write under the same lock. Parallel module workers
